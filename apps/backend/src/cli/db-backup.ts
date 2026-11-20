@@ -1,19 +1,25 @@
 /**
  * Oracle database backup CLI (#104). See docs/oracle-db-recovery.md.
  *
- *   tsx src/cli/db-backup.ts backup  <database> <backup-dir>
+ *   tsx src/cli/db-backup.ts backup  <database> [backup-dir]
  *   tsx src/cli/db-backup.ts verify  <backup-file>
  *   tsx src/cli/db-backup.ts restore <backup-file> <database>   # service stopped
  *   tsx src/cli/db-backup.ts prune   <database> <backup-dir> [retention-days]
+ *   tsx src/cli/db-backup.ts encrypt <backup-file>
  *
  * `backup` also verifies the new file and prunes old ones, so one scheduled
  * command covers the whole routine. Exits non-zero on any failure, so a
  * scheduler or monitor sees a missed backup.
+ *
+ * When the backup directory argument is omitted, `backup` falls back to the
+ * BACKUP_DIR environment variable. When BACKUP_ENCRYPTION_KEY is set, the new
+ * backup is encrypted at rest (see `encrypt`).
  */
 import path from 'path';
 import {
   backupFileName,
   backupSqliteDatabase,
+  encryptBackupFile,
   pruneBackups,
   restoreSqliteDatabase,
   verifySqliteBackup,
@@ -33,16 +39,32 @@ export async function main(argv: string[]): Promise<number> {
   const [command, a, b, c] = argv;
   switch (command) {
     case 'backup': {
-      if (!a || !b) break;
-      const target = path.join(b, backupFileName(a));
+      const dir = b ?? process.env.BACKUP_DIR;
+      if (!a || !dir) break;
+      const target = path.join(dir, backupFileName(a));
       await backupSqliteDatabase(a, target);
       const check = await verifySqliteBackup(target);
       if (!check.ok) {
         console.error(`backup written but failed verification: ${check.integrity.join('; ')}`);
         return 1;
       }
-      const pruned = pruneBackups(b, a, retentionMs(c));
-      console.log(JSON.stringify({ backup: target, tables: check.tables, pruned }));
+      const encryptionKey = process.env.BACKUP_ENCRYPTION_KEY;
+      const encrypted = encryptionKey ? await encryptBackupFile(target, encryptionKey) : undefined;
+      const pruned = pruneBackups(dir, a, retentionMs(c));
+      console.log(
+        JSON.stringify({ backup: target, encrypted, tables: check.tables, pruned }),
+      );
+      return 0;
+    }
+    case 'encrypt': {
+      if (!a) break;
+      const encryptionKey = process.env.BACKUP_ENCRYPTION_KEY;
+      if (!encryptionKey) {
+        console.error('BACKUP_ENCRYPTION_KEY is not set');
+        return 1;
+      }
+      const encrypted = await encryptBackupFile(a, encryptionKey);
+      console.log(JSON.stringify({ encrypted }));
       return 0;
     }
     case 'verify': {
@@ -64,7 +86,7 @@ export async function main(argv: string[]): Promise<number> {
     }
   }
   console.error(
-    'usage: db-backup <backup|verify|restore|prune> ... (see docs/oracle-db-recovery.md)',
+    'usage: db-backup <backup|verify|restore|prune|encrypt> ... (see docs/oracle-db-recovery.md)',
   );
   return 2;
 }

@@ -52,6 +52,25 @@ function getRetryBaseDelayMs(): number {
   );
 }
 
+/** Default number of jobs processed per batch transaction. Overridable via SQLITE_BATCH_SIZE. */
+const DEFAULT_BATCH_SIZE = 100;
+
+/** Configurable batch size (#2192). */
+function getBatchSize(): number {
+  return readPositiveInt(process.env.SQLITE_BATCH_SIZE, DEFAULT_BATCH_SIZE);
+}
+
+/** Result of a single batch transaction (#2192). */
+export interface BatchResult<T> {
+  /** Number of jobs in the batch. */
+  batchSize: number;
+  /** Per-job results, in the same order as the input entries. */
+  results: T[];
+}
+
+/** Per-job handler invoked inside the batch transaction. */
+export type BatchJobHandler<T> = (entry: DlqEntry) => Promise<T>;
+
 export interface SqliteError extends Error {
   code?: string;
   errno?: number;
@@ -285,6 +304,97 @@ export class SQLiteQueueStore implements PersistentQueueStore {
         cb(err),
       ),
     );
+  }
+
+  /**
+   * Processes multiple jobs in a single database transaction (#2192).
+   *
+   * Entries are chunked into groups of at most `batchSize` (defaults to
+   * SQLITE_BATCH_SIZE, or DEFAULT_BATCH_SIZE). Each chunk runs inside a
+   * `BEGIN IMMEDIATE` / `COMMIT` transaction: if any job's handler throws,
+   * the whole chunk is rolled back and the error is re-thrown, so no partial
+   * batch is ever persisted. Every chunk emits a structured
+   * `batch_processed` / `batch_failed` log line with the batch size and
+   * outcome.
+   *
+   * The per-job methods (add/update/remove) remain available for callers
+   * that do not batch.
+   */
+  async processBatch<T>(
+    entries: DlqEntry[],
+    handler: BatchJobHandler<T>,
+    batchSize?: number,
+  ): Promise<BatchResult<T>> {
+    const size = batchSize ?? getBatchSize();
+    const results: T[] = [];
+
+    for (let offset = 0; offset < entries.length; offset += size) {
+      const chunk = entries.slice(offset, offset + size);
+      const startedAt = Date.now();
+      const chunkResults: T[] = [];
+
+      try {
+        await withRetry<void>("processBatch:begin", (cb) =>
+          this.getDb().run(`BEGIN IMMEDIATE`, (err: Error | null) =>
+            cb(err),
+          ),
+        );
+
+        for (const entry of chunk) {
+          chunkResults.push(await handler(entry));
+        }
+
+        await withRetry<void>("processBatch:commit", (cb) =>
+          this.getDb().run(`COMMIT`, (err: Error | null) => cb(err)),
+        );
+
+        results.push(...chunkResults);
+        logger.info(
+          {
+            batch_size: chunk.length,
+            batch_offset: offset,
+            duration_ms: Date.now() - startedAt,
+            outcome: "committed",
+          },
+          "batch_processed",
+        );
+      } catch (err) {
+        try {
+          await withRetry<void>("processBatch:rollback", (cb) =>
+            this.getDb().run(`ROLLBACK`, (rollbackErr: Error | null) =>
+              cb(rollbackErr),
+            ),
+          );
+        } catch (rollbackErr) {
+          logger.error(
+            {
+              batch_size: chunk.length,
+              batch_offset: offset,
+              rollback_error:
+                rollbackErr instanceof Error
+                  ? rollbackErr.message
+                  : String(rollbackErr),
+            },
+            "batch_rollback_failed",
+          );
+        }
+
+        logger.error(
+          {
+            batch_size: chunk.length,
+            batch_offset: offset,
+            duration_ms: Date.now() - startedAt,
+            outcome: "rolled_back",
+            error: err instanceof Error ? err.message : String(err),
+          },
+          "batch_failed",
+        );
+
+        throw err;
+      }
+    }
+
+    return { batchSize: entries.length, results };
   }
 
   async close(): Promise<void> {
