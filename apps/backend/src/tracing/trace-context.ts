@@ -229,6 +229,8 @@ export function traceLogFields(
   const fields: Record<string, string> = {
     trace_id: ctx.traceId,
     span_id: ctx.spanId,
+    correlation_id: ctx.traceId,
+    request_id: ctx.spanId,
   };
   if (ctx.parentSpanId) fields.parent_span_id = ctx.parentSpanId;
   return fields;

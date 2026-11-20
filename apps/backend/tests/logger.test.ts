@@ -26,6 +26,7 @@ describe('Structured JSON Logger', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.useRealTimers();
     delete process.env.NODE_ENV;
   });
 
@@ -191,6 +192,39 @@ describe('Structured JSON Logger', () => {
       process.env.LOG_LEVEL = 'not-a-real-level';
       expect(() => logger.info({}, 'still_works')).not.toThrow();
       expect(logger.isLevelEnabled('info')).toBe(true); // production default
+    });
+
+    it('suppresses repeat errors for one minute and records duplicate counts', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-11-20T22:00:00.000Z'));
+
+      logger.error({ status: 598, error_code: 'INTERNAL_ERROR' }, 'http_error');
+      vi.advanceTimersByTime(10_000);
+      logger.error({ status: 598, error_code: 'INTERNAL_ERROR' }, 'http_error');
+      logger.error({ status: 598, error_code: 'INTERNAL_ERROR' }, 'http_error');
+
+      const beforeWindowEnds = logOutput.map((line) => JSON.parse(line));
+      expect(beforeWindowEnds).toHaveLength(2);
+      expect(beforeWindowEnds[1]).toMatchObject({
+        message: 'error_deduplicated',
+        duplicate_count: 1,
+        error_event: 'http_error',
+      });
+
+      vi.advanceTimersByTime(50_001);
+      logger.error({ status: 598, error_code: 'INTERNAL_ERROR' }, 'http_error');
+
+      const logs = logOutput.map((line) => JSON.parse(line));
+      expect(logs).toHaveLength(4);
+      expect(logs[2]).toMatchObject({
+        message: 'error_deduplicated',
+        duplicate_count: 2,
+        error_event: 'http_error',
+      });
+      expect(logs[3]).toMatchObject({
+        message: 'http_error',
+        status: 598,
+      });
     });
   });
 });
