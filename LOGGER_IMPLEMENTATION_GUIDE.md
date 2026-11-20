@@ -63,6 +63,38 @@ logger.error({ tx_hash: 'abc123', error: 'TIMEOUT' }, 'submission_failed');
 | `service` | string | ✓ | `"smile4money-backend"` |
 | Context fields | any | ✗ | `match_id`, `tx_hash`, `dlqId`, etc. |
 
+## Error Deduplication
+
+To avoid spamming logs with repeated identical errors, the logger deduplicates error-level entries within a short time window.
+
+### Behavior
+
+- **Duplicate detection**: Errors are keyed by their identity — the message plus a stable serialization of the context (e.g. `error`, `tx_hash`, `dlqId`). Two errors with the same key are considered duplicates.
+- **Suppression window**: The first occurrence of an error is logged normally. Subsequent identical errors within the window (default **60 seconds**) are suppressed.
+- **Duplicate count**: The number of suppressed duplicates is tracked per key.
+- **Deduplication logging**: When a duplicate is suppressed, a `logger.debug` entry records the suppression. When the window expires and the error is logged again, a `logger.warn` entry reports how many duplicates were suppressed during the previous window.
+
+### Configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `LOG_DEDUP_WINDOW_MS` | `60000` | Time window (ms) during which identical errors are suppressed |
+
+### Example
+
+```typescript
+// First call — logged normally
+logger.error({ tx_hash: 'abc123', error: 'TIMEOUT' }, 'submission_failed');
+
+// Repeated calls within the window — suppressed, count incremented
+logger.error({ tx_hash: 'abc123', error: 'TIMEOUT' }, 'submission_failed');
+logger.error({ tx_hash: 'abc123', error: 'TIMEOUT' }, 'submission_failed');
+
+// After the window expires, the next identical error is logged again
+// and a summary of suppressed duplicates is emitted:
+// logger.warn({ message: 'submission_failed', suppressed: 2 }, 'error_dedup: window expired')
+```
+
 ## Usage in Backend
 
 ### Existing Code Using Logger
@@ -101,6 +133,7 @@ logger.info({ port }, 'smile4money-backend started');
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `LOG_LEVEL` | `info` | Minimum log level to emit: `debug`, `info`, `warn`, `error` |
+| `LOG_DEDUP_WINDOW_MS` | `60000` | Window (ms) for suppressing duplicate errors |
 | `NODE_ENV` | (unset) | If `production`, outputs JSON; otherwise pretty-prints for development |
 
 ### Examples
@@ -111,6 +144,9 @@ NODE_ENV=production LOG_LEVEL=info npm run dev
 
 # Development mode — pretty-printed text output
 LOG_LEVEL=debug npm run dev
+
+# Custom dedup window (30 seconds)
+LOG_DEDUP_WINDOW_MS=30000 npm run dev
 ```
 
 ## Verification

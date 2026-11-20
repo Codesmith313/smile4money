@@ -17,6 +17,7 @@ const NUMERIC_FIELDS = new Set([
   'cooldown',
   'failureCount',
   'durationMs',
+  'suppressed_count',
 ]);
 const ENUM_FIELDS: Record<string, readonly string[]> = {
   method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
@@ -77,7 +78,22 @@ function configuredLevel(): LogLevel {
   return process.env.NODE_ENV === 'production' ? 'info' : 'debug';
 }
 
+/** Default suppression window for duplicate errors (1 minute). */
+const DEFAULT_DEDUP_WINDOW_MS = 60_000;
+
+function configuredDedupWindowMs(): number {
+  const raw = Number(process.env.LOG_DEDUP_WINDOW_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_DEDUP_WINDOW_MS;
+}
+
+interface DedupEntry {
+  firstSeen: number;
+  suppressed: number;
+}
+
 class Logger {
+  private dedupEntries = new Map<string, DedupEntry>();
+
   /** Exposed so callers can skip building an expensive log payload entirely when it won't be emitted. */
   isLevelEnabled(level: LogLevel): boolean {
     return LEVEL_ORDER[level] >= LEVEL_ORDER[configuredLevel()];
@@ -95,6 +111,52 @@ class Logger {
       ...safeLogContext(context),
     };
     console.log(JSON.stringify(logEntry));
+  }
+
+  /**
+   * Builds a stable identity for an error so identical errors can be deduplicated.
+   * Uses the message plus the first stack frame (when available) to distinguish
+   * errors that share a message but originate from different call sites.
+   */
+  private errorIdentity(context: LogContext, message: string): string {
+    const err = context?.error ?? context?.err;
+    const errMessage =
+      typeof err === 'string'
+        ? err
+        : err && typeof err.message === 'string'
+          ? err.message
+          : '';
+    const stack =
+      err && typeof err.stack === 'string' ? err.stack.split('\n')[1]?.trim() : '';
+    return `${message}|${errMessage}|${stack ?? ''}`;
+  }
+
+  /**
+   * Returns true when the error should be suppressed as a duplicate within the
+   * configured window. When a window expires, the accumulated suppressed count
+   * is logged so operators can see how many duplicates were dropped.
+   */
+  private shouldSuppressError(identity: string): boolean {
+    const now = Date.now();
+    const windowMs = configuredDedupWindowMs();
+    const entry = this.dedupEntries.get(identity);
+
+    if (!entry) {
+      this.dedupEntries.set(identity, { firstSeen: now, suppressed: 0 });
+      return false;
+    }
+
+    if (now - entry.firstSeen < windowMs) {
+      entry.suppressed += 1;
+      return true;
+    }
+
+    // Window expired: report how many duplicates were suppressed, then reset.
+    if (entry.suppressed > 0) {
+      this.log('info', { suppressed_count: entry.suppressed }, 'error_deduplicated');
+    }
+    this.dedupEntries.set(identity, { firstSeen: now, suppressed: 0 });
+    return false;
   }
 
   debug(context: LogContext | string, message?: string): void {
@@ -123,9 +185,16 @@ class Logger {
 
   error(context: LogContext | string, message?: string): void {
     if (typeof context === 'string') {
+      if (this.shouldSuppressError(this.errorIdentity({}, context))) {
+        return;
+      }
       this.log('error', {}, context);
     } else {
-      this.log('error', context, message || '');
+      const msg = message || '';
+      if (this.shouldSuppressError(this.errorIdentity(context, msg))) {
+        return;
+      }
+      this.log('error', context, msg);
     }
   }
 }
