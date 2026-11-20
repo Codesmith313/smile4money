@@ -26,6 +26,7 @@ const ENUM_FIELDS: Record<string, readonly string[]> = {
   store: ['sqlite', 'memory', 'mongodb'],
   sqlite_error_code: ['SQLITE_BUSY', 'SQLITE_LOCKED'],
   metric: ['oracle_dlq_depth'],
+  severity: ['critical', 'error', 'warning', 'info'],
 };
 
 /** Unknown fields and all arbitrary strings/errors are masked at the sink. */
@@ -70,6 +71,30 @@ const LEVEL_ORDER: Record<LogLevel, number> = {
   error: 3,
 };
 
+/**
+ * Error severity classification, ordered from most to least severe.
+ * Used to categorize errors for filtering and severity-based alerting.
+ */
+export type Severity = 'critical' | 'error' | 'warning' | 'info';
+
+const SEVERITY_ORDER: Record<Severity, number> = {
+  critical: 0,
+  error: 1,
+  warning: 2,
+  info: 3,
+};
+
+/** Severities at or above this threshold raise an alert. */
+const ALERT_SEVERITIES: ReadonlySet<Severity> = new Set(['critical', 'error']);
+
+function configuredMinSeverity(): Severity {
+  const raw = (process.env.LOG_MIN_SEVERITY || '').toLowerCase();
+  if (raw === 'critical' || raw === 'error' || raw === 'warning' || raw === 'info') {
+    return raw;
+  }
+  return 'info';
+}
+
 function configuredLevel(): LogLevel {
   const raw = (process.env.LOG_LEVEL || '').toLowerCase();
   if (raw === 'debug' || raw === 'info' || raw === 'warn' || raw === 'error') {
@@ -99,6 +124,11 @@ class Logger {
     return LEVEL_ORDER[level] >= LEVEL_ORDER[configuredLevel()];
   }
 
+  /** Returns true when an error of the given severity passes the configured severity filter. */
+  isSeverityEnabled(severity: Severity): boolean {
+    return SEVERITY_ORDER[severity] <= SEVERITY_ORDER[configuredMinSeverity()];
+  }
+
   private log(level: LogLevel, context: LogContext, message: string): void {
     if (!this.isLevelEnabled(level)) {
       return;
@@ -111,6 +141,17 @@ class Logger {
       ...safeLogContext(context),
     };
     console.log(JSON.stringify(logEntry));
+  }
+
+  /**
+   * Emits an alert for errors whose severity warrants operator attention.
+   * Alerts are logged as a distinct event so downstream alerting can key on it.
+   */
+  private maybeAlert(severity: Severity, context: LogContext, message: string): void {
+    if (!ALERT_SEVERITIES.has(severity)) {
+      return;
+    }
+    this.log('error', { ...context, severity }, 'error_alert');
   }
 
   /**
@@ -196,6 +237,28 @@ class Logger {
       }
       this.log('error', context, msg);
     }
+  }
+
+  /**
+   * Logs an error with an explicit severity classification. The severity is
+   * attached to the entry for filtering, and severities at or above the alert
+   * threshold additionally raise an alert.
+   */
+  classifiedError(
+    severity: Severity,
+    context: LogContext | string,
+    message?: string,
+  ): void {
+    if (!this.isSeverityEnabled(severity)) {
+      return;
+    }
+    const ctx: LogContext = typeof context === 'string' ? {} : context;
+    const msg = typeof context === 'string' ? context : message || '';
+    if (this.shouldSuppressError(this.errorIdentity(ctx, msg))) {
+      return;
+    }
+    this.log('error', { ...ctx, severity }, msg);
+    this.maybeAlert(severity, ctx, msg);
   }
 }
 

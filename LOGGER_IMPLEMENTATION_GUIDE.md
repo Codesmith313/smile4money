@@ -63,6 +63,61 @@ logger.error({ tx_hash: 'abc123', error: 'TIMEOUT' }, 'submission_failed');
 | `service` | string | ✓ | `"smile4money-backend"` |
 | Context fields | any | ✗ | `match_id`, `tx_hash`, `dlqId`, etc. |
 
+## Error Classification
+
+Errors are classified by **severity** so they can be filtered and alerted on. The four severity levels are:
+
+| Severity | Meaning | Example |
+|----------|---------|---------|
+| `critical` | Service-impacting failure requiring immediate action | DLQ write failure, DB unavailable |
+| `error` | Operation failed but the service is still running | Oracle submission failed |
+| `warning` | Potentially problematic condition | Retry failed, DLQ entry written |
+| `info` | Informational / operational event | Entry resolved, worker running |
+
+### Assigning Severity
+
+Every error/log entry carries a `severity` field in its context. The logger derives a default severity from the log level when one is not supplied explicitly:
+
+- `logger.error(...)` → `error` (or `critical` when explicitly set)
+- `logger.warn(...)` → `warning`
+- `logger.info(...)` → `info`
+- `logger.debug(...)` → `info`
+
+```typescript
+// Explicit severity — critical failure
+logger.error({ severity: 'critical', dlqId: id, err }, 'oracle_dlq: write failed');
+
+// Default severity derived from level — 'error'
+logger.error({ tx_hash: 'abc123', error: 'TIMEOUT' }, 'submission_failed');
+
+// Default severity derived from level — 'warning'
+logger.warn({ dlqId: 'dlq-1', attempt: 2 }, 'retry_failed');
+```
+
+### Filtering by Severity
+
+Because `severity` is a first-class field, log aggregation platforms can filter on it directly:
+
+```
+# Datadog
+service:smile4money-backend AND @severity:critical
+
+# Loki
+{service="smile4money-backend"} | json | severity="critical"
+
+# CloudWatch
+{ $.service = "smile4money-backend" && $.severity = "critical" }
+```
+
+### Alerting by Severity
+
+Alert rules should be driven by severity:
+
+- **`critical`** — page on-call immediately (e.g. any occurrence within 5 minutes).
+- **`error`** — raise a ticket / notify channel; alert on sustained rate.
+- **`warning`** — aggregate and review; no paging.
+- **`info`** — no alerting.
+
 ## Error Deduplication
 
 To avoid spamming logs with repeated identical errors, the logger deduplicates error-level entries within a short time window.
@@ -276,5 +331,3 @@ service:smile4money-backend AND @match_id:123 AND @level:warn
 ## References
 
 - [Pino Documentation](https://getpino.io/)
-- [JSON Logging Best Practices](https://www.kartar.net/2015/12/structured-logging/)
-- [Log Aggregation Patterns](https://12factor.net/logs)
