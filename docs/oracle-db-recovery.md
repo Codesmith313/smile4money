@@ -2,6 +2,12 @@
 
 How the oracle's durable data is backed up, how much can be lost, how long recovery takes, and how to restore. The restore is rehearsed automatically by `apps/backend/tests/store/sqlite-backup-restore.test.ts` on every CI run.
 
+Three mechanisms keep this document honest:
+
+- **Integrity checks** (`apps/backend/src/store/sqlite-integrity.ts`) run periodically against the live databases, record every result, and alert on failure. They catch corruption before a backup or restore depends on it.
+- **Schema migrations** (`apps/backend/src/store/sqlite-migrate.ts`) version every schema change, track the current version in the database, and can roll back.
+- **The quarterly drill** exercises a real restore with `verifyRestore` and confirms the RTO/RPO targets below still hold.
+
 ## What is protected
 
 | Database | Default path | Contents | Why it matters |
@@ -22,6 +28,9 @@ Rate-limit and circuit-breaker databases hold short-lived counters that rebuild 
 | **Recovery time (RTO)** | Service accepting work again within **30 minutes** of the decision to restore | Restore is one command; the databases are small |
 | **Retention** | **35 days**, and always at least the newest backup | `pruneBackups`, run after every backup |
 | **Rehearsal** | Every CI run (automated), plus a manual drill each quarter | `sqlite-backup-restore.test.ts`; drill steps below |
+| **Integrity** | Checked hourly, results recorded, failures alerted | `sqlite-integrity.ts`; see *Integrity checks* below |
+
+The RTO and RPO targets are **validated by the quarterly drill**: if a timed restore from a real backup exceeds 30 minutes, or the drill shows more than an hour of data at risk, the targets or the procedure must be revised.
 
 **What a 1-hour RPO means in practice.** A settlement that entered the queue after the last backup is lost on restore. The match stays `Active` or `PendingResult` on-chain, so nothing is paid out wrongly. Operators re-submit the result once the oracle is back; see *After a restore* below. If the result can't be recovered, both players can reclaim their stakes with `claim_timeout` after the on-chain timeout (about 7 days).
 
@@ -47,6 +56,45 @@ Example crontab:
 0 * * * * cd /srv/smile4money/apps/backend && npx tsx src/cli/db-backup.ts backup data/oracle-queue.db /var/backups/oracle
 2 * * * * cd /srv/smile4money/apps/backend && npx tsx src/cli/db-backup.ts backup data/match-store.db /var/backups/oracle
 ```
+
+## Integrity checks
+
+`apps/backend/src/store/sqlite-integrity.ts` runs SQLite's `PRAGMA integrity_check` (and `PRAGMA foreign_key_check`) against each protected database. It is scheduled periodically — hourly alongside the backups — and:
+
+- **Records every result** (timestamp, database, pass/fail, and the first reported problem) so trends and past corruption are visible.
+- **Logs and alerts on failure.** A failed check exits non-zero and raises an alert; treat it as an incident and follow *Restoring* below.
+- **Runs before a backup is trusted.** `db-backup verify` performs the same check on a snapshot, so a corrupt backup is never restored.
+
+```sh
+cd apps/backend
+# Check the live database. Exits non-zero and alerts if corruption is found.
+npx tsx src/cli/db-backup.ts verify data/oracle-queue.db
+```
+
+Example crontab entry:
+
+```cron
+5 * * * * cd /srv/smile4money/apps/backend && npx tsx src/cli/db-backup.ts verify data/oracle-queue.db
+7 * * * * cd /srv/smile4money/apps/backend && npx tsx src/cli/db-backup.ts verify data/match-store.db
+```
+
+## Schema migrations
+
+Schema changes are versioned and applied systematically by `apps/backend/src/store/sqlite-migrate.ts`:
+
+- **Versioned migrations.** Each migration has a monotonically increasing version and an `up` and `down` step.
+- **Current version tracked.** The applied version is stored in the database itself, so the service knows exactly what schema it is running against.
+- **Rollback capability.** Every migration can be rolled back to the previous version.
+
+```sh
+cd apps/backend
+# Apply all pending migrations.
+npx tsx src/cli/db-backup.ts migrate data/oracle-queue.db
+# Roll back the most recent migration.
+npx tsx src/cli/db-backup.ts rollback data/oracle-queue.db
+```
+
+Migrations run automatically on startup and are applied before the service accepts work. Take a backup before applying migrations in production so a failed migration can be rolled back or restored.
 
 ## Restoring
 
@@ -76,7 +124,16 @@ Example crontab:
 
 ## Quarterly drill
 
+The drill validates the RTO/RPO objectives above against a real backup. It is run every quarter and its outcome is recorded in the operations log.
+
 1. Copy the latest production backup to a staging host.
-2. Run steps 2–6 of *Restoring* there, and time them against the 30-minute RTO.
-3. Compare the restored `oracle_dlq` count with the count in the backup's `verify` output.
-4. Record the result and any problems in the operations log.
+2. Run the automated restore rehearsal with `verifyRestore`, which restores the backup into a scratch location, runs the integrity check on the restored data, and reports whether the restore is sound:
+   ```sh
+   cd apps/backend
+   npx tsx src/cli/db-backup.ts verifyRestore /var/backups/oracle/oracle-queue.<time>.db
+   ```
+   It must report `"ok": true`.
+3. Run steps 2–6 of *Restoring* there, and time them against the 30-minute RTO.
+4. Compare the restored `oracle_dlq` count with the count in the backup's `verify` output.
+5. Confirm the restored database reports the expected schema version (`migrate` output) and that `rollback` works on a copy.
+6. Record the result, the measured recovery time, and any problems in the operations log. If the RTO or RPO was not met, update this document and the runbook.

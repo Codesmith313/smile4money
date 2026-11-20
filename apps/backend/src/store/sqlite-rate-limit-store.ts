@@ -27,6 +27,9 @@ import { applySqliteMigrations } from './sqlite-migrations.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+/** Queries slower than this are logged as `db_slow_query` (#2203). */
+const SLOW_QUERY_THRESHOLD_MS = 100;
+
 export class SqliteRateLimitStore implements RateLimitBackend {
   private db: sqlite3.Database | null = null;
   private dbPath: string;
@@ -76,11 +79,19 @@ export class SqliteRateLimitStore implements RateLimitBackend {
         statements: [
           `CREATE TABLE IF NOT EXISTS rate_limit_buckets (clientId TEXT PRIMARY KEY NOT NULL, tokens REAL NOT NULL, lastRefill INTEGER NOT NULL)`,
         ],
+        down: [`DROP TABLE IF EXISTS rate_limit_buckets`],
       },
       {
         version: 2,
         name: 'rate-limit-refill-index',
         statements: [`CREATE INDEX IF NOT EXISTS idx_rate_limit_last_refill ON rate_limit_buckets(lastRefill)`],
+        down: [`DROP INDEX IF EXISTS idx_rate_limit_last_refill`],
+      },
+      {
+        version: 3,
+        name: 'rate-limit-tokens-index',
+        statements: [`CREATE INDEX IF NOT EXISTS idx_rate_limit_tokens ON rate_limit_buckets(tokens)`],
+        down: [`DROP INDEX IF EXISTS idx_rate_limit_tokens`],
       },
     ]);
   }
@@ -126,6 +137,7 @@ export class SqliteRateLimitStore implements RateLimitBackend {
     // there is no separate "did a whole interval pass?" branch to get out of
     // sync with what was just written.
     const refillExpr = `MIN(${this.capacity}, tokens + (CAST((? - lastRefill) AS REAL) / ${this.refillIntervalMs}) * ${this.refillAmount})`;
+    const startedAt = Date.now();
     const result = await withRetry<{ changes: number }>('rate_limit:isAllowed:consume', (cb) =>
       this.getDb().run(
         `UPDATE rate_limit_buckets
@@ -139,6 +151,17 @@ export class SqliteRateLimitStore implements RateLimitBackend {
         },
       ),
     );
+    const durationMs = Date.now() - startedAt;
+    if (durationMs > SLOW_QUERY_THRESHOLD_MS) {
+      console.warn(
+        JSON.stringify({
+          event: 'db_slow_query',
+          query: 'rate_limit:isAllowed:consume',
+          durationMs,
+          thresholdMs: SLOW_QUERY_THRESHOLD_MS,
+        }),
+      );
+    }
 
     if (result.changes > 0) {
       return { allowed: true };

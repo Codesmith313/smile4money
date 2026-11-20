@@ -36,6 +36,9 @@ const DEFAULT_MAX_RETRIES = 5;
 /** Base delay for exponential backoff (doubles each attempt: 50ms, 100ms, 200ms, ...). Overridable via SQLITE_RETRY_BASE_DELAY_MS. */
 const DEFAULT_BASE_DELAY_MS = 50;
 
+/** Queries slower than this (ms) are logged as `db_slow_query` (#2203). Overridable via SQLITE_SLOW_QUERY_MS. */
+const DEFAULT_SLOW_QUERY_MS = 100;
+
 function readPositiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(value ?? "", 10);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
@@ -50,6 +53,10 @@ function getRetryBaseDelayMs(): number {
     process.env.SQLITE_RETRY_BASE_DELAY_MS,
     DEFAULT_BASE_DELAY_MS,
   );
+}
+
+function getSlowQueryMs(): number {
+  return readPositiveInt(process.env.SQLITE_SLOW_QUERY_MS, DEFAULT_SLOW_QUERY_MS);
 }
 
 export interface SqliteError extends Error {
@@ -70,6 +77,33 @@ export function isRetryableSqliteError(err: unknown): err is SqliteError {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Runs `operation` and logs a `db_slow_query` warning when it takes longer
+ * than SQLITE_SLOW_QUERY_MS (#2203). Exported for direct unit testing.
+ */
+export async function withQueryTiming<T>(
+  queryName: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const start = Date.now();
+  try {
+    return await operation();
+  } finally {
+    const durationMs = Date.now() - start;
+    const thresholdMs = getSlowQueryMs();
+    if (durationMs > thresholdMs) {
+      logger.warn(
+        {
+          query: queryName,
+          query_duration_ms: durationMs,
+          slow_query_threshold_ms: thresholdMs,
+        },
+        "db_slow_query",
+      );
+    }
+  }
 }
 
 /**
@@ -178,6 +212,15 @@ export class SQLiteQueueStore implements PersistentQueueStore {
       ),
     );
 
+    // Indexes on frequently queried columns (#2203): expireAt is used by
+    // deleteExpired/count, createdAt by the getAll ordering.
+    await withRetry<void>("initialize:createIndexCreatedAt", (cb) =>
+      this.getDb().run(
+        `CREATE INDEX IF NOT EXISTS idx_oracle_dlq_created_at ON oracle_dlq(createdAt)`,
+        (err: Error | null) => cb(err),
+      ),
+    );
+
     this.initialized = true;
   }
 
@@ -205,18 +248,22 @@ export class SQLiteQueueStore implements PersistentQueueStore {
 
   async getAll(): Promise<DlqEntry[]> {
     // Delete expired entries first.
-    await withRetry<void>("getAll:deleteExpired", (cb) =>
-      this.getDb().run(
-        `DELETE FROM oracle_dlq WHERE expireAt < ?`,
-        [Date.now()],
-        (err: Error | null) => cb(err),
+    await withQueryTiming("getAll:deleteExpired", () =>
+      withRetry<void>("getAll:deleteExpired", (cb) =>
+        this.getDb().run(
+          `DELETE FROM oracle_dlq WHERE expireAt < ?`,
+          [Date.now()],
+          (err: Error | null) => cb(err),
+        ),
       ),
     );
 
-    const rows = await withRetry<any[]>("getAll:select", (cb) =>
-      this.getDb().all(
-        `SELECT * FROM oracle_dlq ORDER BY createdAt ASC`,
-        (err: Error | null, result: any[]) => cb(err, result),
+    const rows = await withQueryTiming("getAll:select", () =>
+      withRetry<any[]>("getAll:select", (cb) =>
+        this.getDb().all(
+          `SELECT * FROM oracle_dlq ORDER BY createdAt ASC`,
+          (err: Error | null, result: any[]) => cb(err, result),
+        ),
       ),
     );
 
@@ -269,11 +316,13 @@ export class SQLiteQueueStore implements PersistentQueueStore {
   }
 
   async count(): Promise<number> {
-    const row = await withRetry<any>("count", (cb) =>
-      this.getDb().get(
-        `SELECT COUNT(*) as count FROM oracle_dlq WHERE expireAt > ?`,
-        [Date.now()],
-        (err: Error | null, result: any) => cb(err, result),
+    const row = await withQueryTiming("count", () =>
+      withRetry<any>("count", (cb) =>
+        this.getDb().get(
+          `SELECT COUNT(*) as count FROM oracle_dlq WHERE expireAt > ?`,
+          [Date.now()],
+          (err: Error | null, result: any) => cb(err, result),
+        ),
       ),
     );
     return row?.count || 0;

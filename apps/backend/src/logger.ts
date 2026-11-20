@@ -17,6 +17,11 @@ const NUMERIC_FIELDS = new Set([
   'cooldown',
   'failureCount',
   'durationMs',
+  'integrity_check_ms',
+  'schema_version',
+  'migration_version',
+  'query_duration_ms',
+  'slow_query_threshold_ms',
 ]);
 const ENUM_FIELDS: Record<string, readonly string[]> = {
   method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
@@ -25,6 +30,7 @@ const ENUM_FIELDS: Record<string, readonly string[]> = {
   store: ['sqlite', 'memory', 'mongodb'],
   sqlite_error_code: ['SQLITE_BUSY', 'SQLITE_LOCKED'],
   metric: ['oracle_dlq_depth'],
+  integrity_status: ['ok', 'failed'],
 };
 
 /** Unknown fields and all arbitrary strings/errors are masked at the sink. */
