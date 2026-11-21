@@ -17,6 +17,7 @@
  * - `pruneBackups` enforces the retention window.
  */
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import sqlite3 from 'sqlite3';
 
@@ -126,6 +127,51 @@ export async function restoreSqliteDatabase(
   for (const suffix of ['-wal', '-shm']) fs.rmSync(`${targetPath}${suffix}`, { force: true });
   fs.renameSync(staging, targetPath);
   return verification;
+}
+
+export interface RestoreRehearsal {
+  ok: boolean;
+  /** Verification of the backup taken from the source database. */
+  backup: BackupVerification;
+  /** Verification of the database after restoring the backup into a temp file. */
+  restored: BackupVerification;
+  /** Human-readable failure reason when `ok` is false. */
+  error?: string;
+}
+
+/**
+ * Rehearse the full recovery procedure against `sourcePath` without touching
+ * it: take a backup, verify it, restore it into a temporary file, and run
+ * `PRAGMA integrity_check` on the restored copy. Everything is written under
+ * a temporary directory that is removed afterwards. Used by the quarterly
+ * recovery drill and by `tests/store/sqlite-backup-restore.test.ts`.
+ */
+export async function verifyRestore(sourcePath: string): Promise<RestoreRehearsal> {
+  const empty: BackupVerification = { ok: false, integrity: ['not run'], tables: {} };
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-restore-drill-'));
+  const backupPath = path.join(workDir, backupFileName(sourcePath));
+  const restoredPath = path.join(workDir, `restored-${path.basename(sourcePath)}`);
+  try {
+    await backupSqliteDatabase(sourcePath, backupPath);
+    const backup = await verifySqliteBackup(backupPath);
+    if (!backup.ok) {
+      return { ok: false, backup, restored: empty, error: 'backup failed verification' };
+    }
+    const restored = await restoreSqliteDatabase(backupPath, restoredPath);
+    if (!restored.ok) {
+      return { ok: false, backup, restored, error: 'restored database failed verification' };
+    }
+    return { ok: true, backup, restored };
+  } catch (err) {
+    return {
+      ok: false,
+      backup: empty,
+      restored: empty,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  } finally {
+    fs.rmSync(workDir, { recursive: true, force: true });
+  }
 }
 
 /** File name for a backup taken at `at`, e.g. `oracle-queue.2026-10-22T14-00-00Z.db`. */
