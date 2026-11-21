@@ -7,7 +7,15 @@ import reviewRouter from './routes/oracle-review.js';
 import oracleRouter from './routes/oracle.js';
 import playerIdentityRouter from './routes/player-identity.js';
 import { errorToHttpStatus } from './errors/errorToHttpStatus.js';
+import {
+  ErrorCode,
+  errorEnvelope,
+  statusToErrorCode,
+  userFacingErrorMessage,
+} from './errors/errorResponse.js';
 import { requestLogging } from './middleware/request-logging.js';
+import { traceContext } from './middleware/trace-context.js';
+import logger from './logger.js';
 
 /**
  * Parse the ALLOWED_ORIGINS environment variable into an array of origin strings.
@@ -27,6 +35,7 @@ function getAllowedOrigins(): string[] {
 
 export const app = express();
 
+app.use(traceContext());
 app.use(
   cors({
     origin: (origin, callback) => {
@@ -55,18 +64,30 @@ app.use('/api/oracle/reviews', reviewRouter);
 app.use('/api/oracle', oracleRouter);
 app.use('/api/player-identity', playerIdentityRouter);
 
-// Fallback for any error a route handler doesn't catch itself, so every
-// route ends up with the same JSON error shape and the same centralized
-// status-code mapping (#47) rather than Express's default HTML error page.
-app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  const status = errorToHttpStatus(err);
-  const message = err instanceof Error ? err.message : 'Unknown error';
-  res.status(status).json({ error: message });
-});
-
 // Public service status (#115). Mounted here, after the other routes, so the
 // route list above stays untouched; the handler never throws.
 import statusRouter from './routes/status.js';
 app.use('/status', statusRouter);
+
+app.use((_req, res) => {
+  res
+    .status(404)
+    .json(errorEnvelope(ErrorCode.NOT_FOUND, userFacingErrorMessage(404)));
+});
+
+// Keep internal exception details in neither the response nor the logs.
+app.use(
+  (
+    err: unknown,
+    _req: express.Request,
+    res: express.Response,
+    _next: express.NextFunction,
+  ) => {
+    const status = errorToHttpStatus(err);
+    const code = statusToErrorCode(status);
+    logger.error({ status, error_code: code }, 'http_error');
+    res.status(status).json(errorEnvelope(code, userFacingErrorMessage(status)));
+  },
+);
 
 export default app;

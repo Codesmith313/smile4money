@@ -1556,13 +1556,19 @@ Every error response from the backend API follows the same envelope:
 {
   "error": {
     "code": "VALIDATION_ERROR",
-    "message": "gameId is required"
+    "message": "gameId is required",
+    "requestId": "8b7c7638f9ea9b31",
+    "correlationId": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "timestamp": "2026-11-20T22:00:00.000Z"
   }
 }
 ```
 
 - `error.code` — a stable, machine-readable string. API consumers should branch on this, not on `error.message` (which is meant for humans and may be reworded).
 - `error.message` — a human-readable description of what went wrong.
+- `error.requestId` — the request span ID, which can be shared with support.
+- `error.correlationId` — the trace ID included in related structured logs.
+- `error.timestamp` — the UTC time when the error response was created.
 
 Some error responses include additional fields inside `error` (e.g. `error.hint`) for extra machine-readable context, but `code` and `message` are always present.
 
@@ -1574,6 +1580,7 @@ Some error responses include additional fields inside `error` (e.g. `error.hint`
 |---|---|---|
 | `VALIDATION_ERROR` | 400 | The request body or its fields are missing, malformed, or fail a business rule. |
 | `UNAUTHORIZED` | 401 | The `Authorization` header is missing, malformed, or the JWT is invalid/expired. |
+| `FORBIDDEN` | 403 | The caller is authenticated but is not allowed to perform the action. |
 | `NOT_FOUND` | 404 | The referenced resource (a match, a game on the upstream chess platform) does not exist. |
 | `CONFLICT` | 409 | The request conflicts with existing state (e.g. a duplicate `gameId`). |
 | `RATE_LIMITED` | 429 | The caller has exceeded the endpoint's rate limit. |
