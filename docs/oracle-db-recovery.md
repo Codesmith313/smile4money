@@ -1,6 +1,30 @@
 # Oracle Database Recovery
 
-How the oracle's durable data is backed up, how much can be lost, how long recovery takes, and how to restore. The restore is rehearsed automatically by `apps/backend/tests/store/sqlite-backup-restore.test.ts` on every CI run.
+How the oracle's durable data is backed up, how much can be lost, how long recovery takes, and how to restore. The restore is rehearsed automatically by `apps/backend/tests/store/sqlite-backup-restore.test.ts` on every CI run, including restoring from an encrypted backup.
+
+## Automated backup service
+
+`apps/backend/src/store/backup-scheduler.ts` runs the backups on a schedule inside the backend process. It snapshots every protected database, encrypts each snapshot at rest, prunes past the retention window, and alerts (logs an error and increments the failure counter) when a run fails. The manual CLI below remains available for ad-hoc backups and restores.
+
+### Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BACKUP_ENABLED` | `true` | Set to `false` to disable the scheduler (e.g. in local dev). |
+| `BACKUP_DIR` | `apps/backend/data/backups` | **Backup location.** Directory where encrypted snapshots are written. Point this at a mounted volume or synced directory. |
+| `BACKUP_INTERVAL_MS` | `3600000` (1 hour) | How often the scheduled backup runs. |
+| `BACKUP_RETENTION_DAYS` | `35` | Backups older than this are pruned after each run. |
+| `BACKUP_ENCRYPTION_KEY` | *(none)* | Secret used to encrypt backups at rest (AES-256-GCM). **Required** when `BACKUP_ENABLED` is true; the scheduler refuses to start without it. |
+
+The scheduler backs up both `oracle-queue.db` and `match-store.db` on each run.
+
+### Encryption at rest
+
+- Each snapshot is encrypted with AES-256-GCM using a key derived from `BACKUP_ENCRYPTION_KEY`.
+- Encrypted files are named `<database>.<UTC time>.db.enc` and carry the IV and auth tag alongside the ciphertext. A tampered or truncated file fails authentication on decrypt.
+- Store `BACKUP_ENCRYPTION_KEY` in the platform's secret manager, **not** in the repo or the backup directory. Losing the key means the backups cannot be restored.
+- Because files are already encrypted, the off-host copy step does not need to add its own encryption (though it may).
+=======
 
 Three mechanisms keep this document honest:
 
@@ -47,10 +71,10 @@ npx tsx src/cli/db-backup.ts backup data/match-store.db  /var/backups/oracle
 
 - **Safe while running.** Backups use SQLite's `VACUUM INTO`, which takes a consistent snapshot while the service keeps writing (WAL mode). Each backup is a single self-contained file.
 - **Never overwrites.** Files are named `<database>.<UTC time>.db`, and an existing file is never overwritten.
-- **Store off-host.** Keep backups off the host: copy the backup directory to object storage with server-side encryption after each run. The tables hold usernames and wallet addresses, so restrict access to operators.
-- **Alert on failure.** Schedule both commands hourly (cron, a systemd timer, or the platform's scheduler) and alert when one exits non-zero.
+- **Store off-host.** Keep backups off the host: copy `BACKUP_DIR` to object storage after each run. The files are already encrypted at rest; the tables hold usernames and wallet addresses, so restrict access to operators.
+- **Alert on failure.** The scheduler logs an error and increments a failure counter when a run fails; wire that counter to your alerting. If you run the CLI manually instead, alert when it exits non-zero.
 
-Example crontab:
+The scheduler replaces the need for a crontab. If you prefer an external scheduler, disable `BACKUP_ENABLED` and keep the cron entries below:
 
 ```cron
 0 * * * * cd /srv/smile4money/apps/backend && npx tsx src/cli/db-backup.ts backup data/oracle-queue.db /var/backups/oracle
@@ -99,18 +123,21 @@ Migrations run automatically on startup and are applied before the service accep
 ## Restoring
 
 1. **Stop the backend** so nothing writes during the restore.
-2. **Pick the newest backup** taken before the incident, and check it:
+2. **Pick the newest backup** taken before the incident. Scheduled backups are encrypted (`*.db.enc`); decrypt one first, then check it:
    ```sh
-   npx tsx src/cli/db-backup.ts verify /var/backups/oracle/oracle-queue.<time>.db
+   # Decrypt using the same BACKUP_ENCRYPTION_KEY the scheduler used.
+   npx tsx src/cli/db-backup.ts decrypt \
+     "$BACKUP_DIR/oracle-queue.<time>.db.enc" /tmp/oracle-queue.<time>.db
+   npx tsx src/cli/db-backup.ts verify /tmp/oracle-queue.<time>.db
    ```
-   It must report `"ok": true`. The `tables` field shows the row counts.
+   `decrypt` fails if the file was tampered with or the key is wrong. `verify` must report `"ok": true`; the `tables` field shows the row counts. (Backups taken with the manual CLI are unencrypted and can be verified directly.)
 3. **Keep the damaged database**, if it exists, for the post-incident report:
    ```sh
    mv data/oracle-queue.db data/oracle-queue.db.broken
    ```
-4. **Restore:**
+4. **Restore** from the decrypted file:
    ```sh
-   npx tsx src/cli/db-backup.ts restore /var/backups/oracle/oracle-queue.<time>.db data/oracle-queue.db
+   npx tsx src/cli/db-backup.ts restore /tmp/oracle-queue.<time>.db data/oracle-queue.db
    ```
    The backup is verified again first; an unhealthy backup is refused and the target is not touched. The target's stale `-wal`/`-shm` files are removed, so they can't be replayed onto the restored data.
 5. **Repeat for `match-store.db`** if it was affected.

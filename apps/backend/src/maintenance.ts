@@ -22,7 +22,34 @@ export interface MaintenanceOptions {
   isSettled?: (entry: DlqEntry) => Promise<boolean>;
   /** Signal that triggers a restore. Default SIGUSR2. */
   signal?: NodeJS.Signals;
+  /** Retention period in days. Defaults to RETENTION_DAYS or 30. */
+  retentionDays?: number;
+  /** Archive job interval in ms. Defaults to ARCHIVE_INTERVAL_MS or 24h. */
+  archiveIntervalMs?: number;
 }
+
+const DEFAULT_RETENTION_DAYS = 30;
+const DEFAULT_ARCHIVE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+function envNumber(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/** Resolve archival settings from options, falling back to env vars and defaults. */
+export function resolveArchivalOptions(options: MaintenanceOptions): ArchivalOptions {
+  return {
+    retentionDays:
+      options.retentionDays ?? envNumber('RETENTION_DAYS', DEFAULT_RETENTION_DAYS),
+    intervalMs:
+      options.archiveIntervalMs ?? envNumber('ARCHIVE_INTERVAL_MS', DEFAULT_ARCHIVE_INTERVAL_MS),
+  };
+}
+
+/** Query archived records separately from live data. */
+export { queryArchived };
 
 /** All SQLite databases in the queue database's directory. */
 export function listDatabases(dir: string): string[] {
@@ -74,7 +101,7 @@ export async function handleRestoreRequest(
   return result;
 }
 
-/** Start the capacity monitor and register the restore signal. Returns a stop function. */
+/** Start the capacity monitor, the archival job and register the restore signal. */
 export function installMaintenance(options: MaintenanceOptions): () => void {
   const store = getMaintainableQueueStore();
   const databasePath = store?.databasePath();
@@ -85,6 +112,35 @@ export function installMaintenance(options: MaintenanceOptions): () => void {
   const stopIntegrityCheck = databasePath
     ? startIntegrityCheckJob(databases, options.logger)
     : () => {};
+
+  const archival = resolveArchivalOptions(options);
+  let archiving = false;
+  const runArchiveJob = () => {
+    if (archiving) {
+      options.logger.warn({}, 'archival_already_running');
+      return;
+    }
+    archiving = true;
+    options.logger.info(
+      { retentionDays: archival.retentionDays },
+      'archival_started',
+    );
+    void runArchival({ ...archival, log: options.logger })
+      .then((report) => {
+        options.logger.info({ ...report }, 'archival_completed');
+      })
+      .catch((err) => {
+        options.logger.error(
+          { error: err instanceof Error ? err.message : String(err) },
+          'archival_failed',
+        );
+      })
+      .finally(() => {
+        archiving = false;
+      });
+  };
+  const archiveTimer = setInterval(runArchiveJob, archival.intervalMs);
+  if (typeof archiveTimer.unref === 'function') archiveTimer.unref();
 
   const signal = options.signal ?? 'SIGUSR2';
   let running = false;

@@ -11,6 +11,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import type { CanonicalSettlementEvidence, MatchRecord } from './match-store.js';
 import { computeIdentityHash } from '../services/player-identity.js';
+import { SqliteConnectionPool } from './sqlite-connection-pool.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -70,7 +71,7 @@ interface CreateMatchPayload {
 }
 
 export class SqliteMatchStore {
-  private db: sqlite3.Database | null = null;
+  private pool: SqliteConnectionPool | null = null;
   private dbPath: string;
   private nextId = 0;
   private initialized = false;
@@ -80,11 +81,26 @@ export class SqliteMatchStore {
     this.dbPath = dbPath || path.join(__dirname, '../../data/match-store.db');
   }
 
-  private getDb(): sqlite3.Database {
-    if (!this.db) {
+  private getPool(): SqliteConnectionPool {
+    if (!this.pool) {
       throw new Error('SqliteMatchStore not initialized. Call initialize() first.');
     }
-    return this.db;
+    return this.pool;
+  }
+
+  /**
+   * Acquire a pooled connection, run `fn` against it, and always release it
+   * back to the pool afterwards (even if `fn` throws).
+   */
+  private async withConnection<T>(
+    fn: (db: sqlite3.Database) => Promise<T>,
+  ): Promise<T> {
+    const db = await this.getPool().acquire();
+    try {
+      return await fn(db);
+    } finally {
+      this.getPool().release(db);
+    }
   }
 
   async initialize(): Promise<void> {
@@ -94,36 +110,32 @@ export class SqliteMatchStore {
       fs.mkdirSync(dir, { recursive: true });
     }
 
-    return new Promise((resolve, reject) => {
-      this.db = new sqlite3.Database(this.dbPath, (err: Error | null) => {
-        if (err) {
-          reject(err);
-          return;
-        }
+    this.pool = new SqliteConnectionPool({ dbPath: this.dbPath });
 
-        try { fs.chmodSync(this.dbPath, 0o600); } catch { /* POSIX file modes may be unavailable. */ }
+    return this.withConnection((db) => new Promise<void>((resolve, reject) => {
+      try { fs.chmodSync(this.dbPath, 0o600); } catch { /* POSIX file modes may be unavailable. */ }
 
-        this.db!.run(
-          `
-          CREATE TABLE IF NOT EXISTS matches (
-            matchId INTEGER PRIMARY KEY AUTOINCREMENT,
-            player1 TEXT NOT NULL,
-            player2 TEXT NOT NULL,
-            player1Username TEXT,
-            player2Username TEXT,
-            stakeAmount REAL NOT NULL,
-            token TEXT NOT NULL,
-            gameId TEXT NOT NULL UNIQUE,
-            platform TEXT NOT NULL,
-            state TEXT NOT NULL DEFAULT 'Pending',
-            identityHash TEXT
-          )
-          `,
-          (err: Error | null) => {
-            if (err) {
-              reject(err);
-              return;
-            }
+      db.run(
+        `
+        CREATE TABLE IF NOT EXISTS matches (
+          matchId INTEGER PRIMARY KEY AUTOINCREMENT,
+          player1 TEXT NOT NULL,
+          player2 TEXT NOT NULL,
+          player1Username TEXT,
+          player2Username TEXT,
+          stakeAmount REAL NOT NULL,
+          token TEXT NOT NULL,
+          gameId TEXT NOT NULL UNIQUE,
+          platform TEXT NOT NULL,
+          state TEXT NOT NULL DEFAULT 'Pending',
+          identityHash TEXT
+        )
+        `,
+        (err: Error | null) => {
+          if (err) {
+            reject(err);
+            return;
+          }
 
             this.db!.run(`CREATE TABLE IF NOT EXISTS settlement_evidence (
               evidenceId INTEGER PRIMARY KEY AUTOINCREMENT, matchId INTEGER NOT NULL, parserVersion TEXT NOT NULL, evaluatedAt TEXT NOT NULL,
@@ -155,10 +167,10 @@ export class SqliteMatchStore {
                 });
               }).catch(reject);
             });
-          },
-        );
-      });
-    });
+          });
+        },
+      );
+    }));
   }
 
   async createMatch(payload: CreateMatchPayload): Promise<MatchRecord> {
@@ -174,8 +186,8 @@ export class SqliteMatchStore {
           )
         : null;
 
-    return new Promise((resolve, reject) => {
-      const stmt = this.getDb().prepare(
+    return this.withConnection((db) => new Promise((resolve, reject) => {
+      const stmt = db.prepare(
         `INSERT INTO matches (matchId, player1, player2, player1Username, player2Username, stakeAmount, token, gameId, platform, state, identityHash)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?)`,
       );
@@ -213,7 +225,7 @@ export class SqliteMatchStore {
         },
       );
       stmt.finalize();
-    });
+    }));
   }
 
   async findByGameId(gameId: string): Promise<MatchRecord | null> {
@@ -248,56 +260,58 @@ export class SqliteMatchStore {
           });
         },
       );
-    });
+    }));
   }
 
   async saveSettlementEvidence(evidence: CanonicalSettlementEvidence): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
-      this.getDb().run(`INSERT INTO settlement_evidence
+    await this.withConnection((db) => new Promise<void>((resolve, reject) => {
+      db.run(`INSERT INTO settlement_evidence
         (matchId, parserVersion, evaluatedAt, gameId, platform, whitePlayer, blackPlayer, result, status, decision)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [evidence.matchId, evidence.parserVersion, evidence.evaluatedAt, evidence.gameId, evidence.platform,
         evidence.whitePlayer, evidence.blackPlayer, evidence.result, evidence.status, evidence.decision],
       (err: Error | null) => err ? reject(err) : resolve());
-    });
+    }));
   }
 
   async getSettlementEvidence(matchId: number): Promise<CanonicalSettlementEvidence | null> {
-    return new Promise((resolve, reject) => this.getDb().get(
+    return this.withConnection((db) => new Promise((resolve, reject) => db.get(
       'SELECT * FROM settlement_evidence WHERE matchId = ? ORDER BY evidenceId DESC LIMIT 1', [matchId], (err: Error | null, row: any) => {
         if (err) { reject(err); return; }
         if (!row) { resolve(null); return; }
         resolve({ parserVersion: row.parserVersion, evaluatedAt: row.evaluatedAt, matchId,
           gameId: row.gameId, platform: row.platform, whitePlayer: row.whitePlayer,
           blackPlayer: row.blackPlayer, result: row.result ?? null, status: row.status, decision: row.decision });
-      }));
+      })));
   }
 
   async getSettlementEvidenceHistory(matchId: number): Promise<CanonicalSettlementEvidence[]> {
-    return new Promise((resolve, reject) => this.getDb().all(
+    return this.withConnection((db) => new Promise((resolve, reject) => db.all(
       'SELECT * FROM settlement_evidence WHERE matchId = ? ORDER BY evidenceId ASC', [matchId],
       (err: Error | null, rows: any[]) => {
         if (err) { reject(err); return; }
         resolve(rows.map((row) => ({ parserVersion: row.parserVersion, evaluatedAt: row.evaluatedAt,
           matchId, gameId: row.gameId, platform: row.platform, whitePlayer: row.whitePlayer,
           blackPlayer: row.blackPlayer, result: row.result ?? null, status: row.status, decision: row.decision })));
-      }));
+      })));
   }
 
   async count(): Promise<number> {
-    return new Promise((resolve, reject) => {
-      this.getDb().get(
+    return this.withConnection((db) => new Promise((resolve, reject) => {
+      db.get(
         'SELECT COUNT(*) AS count FROM matches',
         (err: Error | null, row: any) => {
           if (err) reject(err);
           else resolve(row?.count ?? 0);
         },
       );
-    });
+    }));
   }
 
   clear(): void {
-    this.getDb().run('DELETE FROM matches');
+    this.withConnection((db) => new Promise<void>((resolve, reject) => {
+      db.run('DELETE FROM matches', (err: Error | null) => err ? reject(err) : resolve());
+    })).catch(() => { /* best-effort clear */ });
     this.nextId = 0;
   }
 
@@ -306,18 +320,10 @@ export class SqliteMatchStore {
       clearInterval(this.evidenceCleanupTimer);
       this.evidenceCleanupTimer = undefined;
     }
-    return new Promise((resolve, reject) => {
-      if (this.db) {
-        this.db.close((err: Error | null) => {
-          if (err) reject(err);
-          else {
-            this.db = null;
-            resolve();
-          }
-        });
-      } else {
-        resolve();
-      }
-    });
+    if (this.pool) {
+      const pool = this.pool;
+      this.pool = null;
+      await pool.close();
+    }
   }
 }

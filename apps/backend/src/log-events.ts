@@ -2,6 +2,14 @@
 export const LOG_EVENTS = new Set([
   "Chess.com API archive fetch failed",
   "Circuit breaker initialized",
+  "archival_completed",
+  "archival_failed",
+  "archival_started",
+  "backup_completed",
+  "backup_failed",
+  "backup_started",
+  "batch_failed",
+  "batch_processed",
   "Failed to start server",
   "Lichess API request failed",
   "Lichess ELO lookup failed; falling back",
@@ -76,4 +84,6 @@ export const LOG_EVENTS = new Set([
   "rate_limit: store initialized",
   "rate_limit_backend_error_failing_open",
   "sqlite_operation_retrying",
+  "sqlite_pool_evicted",
+  "sqlite_pool_exhausted",
 ]);

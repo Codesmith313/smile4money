@@ -336,6 +336,97 @@ export class SQLiteQueueStore implements PersistentQueueStore {
     );
   }
 
+  /**
+   * Processes multiple jobs in a single database transaction (#2192).
+   *
+   * Entries are chunked into groups of at most `batchSize` (defaults to
+   * SQLITE_BATCH_SIZE, or DEFAULT_BATCH_SIZE). Each chunk runs inside a
+   * `BEGIN IMMEDIATE` / `COMMIT` transaction: if any job's handler throws,
+   * the whole chunk is rolled back and the error is re-thrown, so no partial
+   * batch is ever persisted. Every chunk emits a structured
+   * `batch_processed` / `batch_failed` log line with the batch size and
+   * outcome.
+   *
+   * The per-job methods (add/update/remove) remain available for callers
+   * that do not batch.
+   */
+  async processBatch<T>(
+    entries: DlqEntry[],
+    handler: BatchJobHandler<T>,
+    batchSize?: number,
+  ): Promise<BatchResult<T>> {
+    const size = batchSize ?? getBatchSize();
+    const results: T[] = [];
+
+    for (let offset = 0; offset < entries.length; offset += size) {
+      const chunk = entries.slice(offset, offset + size);
+      const startedAt = Date.now();
+      const chunkResults: T[] = [];
+
+      try {
+        await withRetry<void>("processBatch:begin", (cb) =>
+          this.getDb().run(`BEGIN IMMEDIATE`, (err: Error | null) =>
+            cb(err),
+          ),
+        );
+
+        for (const entry of chunk) {
+          chunkResults.push(await handler(entry));
+        }
+
+        await withRetry<void>("processBatch:commit", (cb) =>
+          this.getDb().run(`COMMIT`, (err: Error | null) => cb(err)),
+        );
+
+        results.push(...chunkResults);
+        logger.info(
+          {
+            batch_size: chunk.length,
+            batch_offset: offset,
+            duration_ms: Date.now() - startedAt,
+            outcome: "committed",
+          },
+          "batch_processed",
+        );
+      } catch (err) {
+        try {
+          await withRetry<void>("processBatch:rollback", (cb) =>
+            this.getDb().run(`ROLLBACK`, (rollbackErr: Error | null) =>
+              cb(rollbackErr),
+            ),
+          );
+        } catch (rollbackErr) {
+          logger.error(
+            {
+              batch_size: chunk.length,
+              batch_offset: offset,
+              rollback_error:
+                rollbackErr instanceof Error
+                  ? rollbackErr.message
+                  : String(rollbackErr),
+            },
+            "batch_rollback_failed",
+          );
+        }
+
+        logger.error(
+          {
+            batch_size: chunk.length,
+            batch_offset: offset,
+            duration_ms: Date.now() - startedAt,
+            outcome: "rolled_back",
+            error: err instanceof Error ? err.message : String(err),
+          },
+          "batch_failed",
+        );
+
+        throw err;
+      }
+    }
+
+    return { batchSize: entries.length, results };
+  }
+
   async close(): Promise<void> {
     return new Promise((resolve, reject) => {
       if (this.db) {
