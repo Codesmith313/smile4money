@@ -4,6 +4,8 @@ export interface SqliteMigration {
   version: number;
   name: string;
   statements: string[];
+  /** Statements that undo this migration, applied in reverse order on rollback. */
+  down?: string[];
 }
 
 function run(db: sqlite3.Database, sql: string): Promise<void> {
@@ -17,13 +19,19 @@ function getVersion(db: sqlite3.Database): Promise<number> {
   );
 }
 
+const CREATE_SCHEMA_VERSION_TABLE =
+  'CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)';
+
+/** Returns the highest applied migration version, or 0 if none have been applied. */
+export async function getCurrentSchemaVersion(db: sqlite3.Database): Promise<number> {
+  await run(db, CREATE_SCHEMA_VERSION_TABLE);
+  return getVersion(db);
+}
+
 /** Apply ordered schema changes one transaction at a time. A failed migration
  * rolls back both its DDL and version marker, so startup can safely retry. */
 export async function applySqliteMigrations(db: sqlite3.Database, migrations: SqliteMigration[]): Promise<void> {
-  await run(
-    db,
-    'CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)',
-  );
+  await run(db, CREATE_SCHEMA_VERSION_TABLE);
   const ordered = [...migrations].sort((a, b) => a.version - b.version);
   const current = await getVersion(db);
   if (current > (ordered[ordered.length - 1]?.version ?? 0)) {
@@ -49,67 +57,41 @@ export async function applySqliteMigrations(db: sqlite3.Database, migrations: Sq
   }
 }
 
-/** Data retention migrations: archive tables mirror live tables so records
- * older than the configured retention period can be moved out of the live
- * tables (reducing database size) while remaining queryable separately. */
-export const retentionMigrations: SqliteMigration[] = [
-  {
-    version: 100,
-    name: 'create_archive_tables',
-    statements: [
-      // Archived oracle dead-letter queue entries.
-      `CREATE TABLE IF NOT EXISTS archived_oracle_dlq (
-        id INTEGER PRIMARY KEY,
-        original_id INTEGER NOT NULL,
-        payload TEXT,
-        reason TEXT,
-        created_at INTEGER NOT NULL,
-        archived_at INTEGER NOT NULL
-      )`,
-      `CREATE INDEX IF NOT EXISTS idx_archived_oracle_dlq_created_at ON archived_oracle_dlq(created_at)`,
-      `CREATE INDEX IF NOT EXISTS idx_archived_oracle_dlq_archived_at ON archived_oracle_dlq(archived_at)`,
-      `CREATE INDEX IF NOT EXISTS idx_archived_oracle_dlq_original_id ON archived_oracle_dlq(original_id)`,
-
-      // Archived matches.
-      `CREATE TABLE IF NOT EXISTS archived_matches (
-        id INTEGER PRIMARY KEY,
-        original_id INTEGER NOT NULL,
-        payload TEXT,
-        status TEXT,
-        created_at INTEGER NOT NULL,
-        archived_at INTEGER NOT NULL
-      )`,
-      `CREATE INDEX IF NOT EXISTS idx_archived_matches_created_at ON archived_matches(created_at)`,
-      `CREATE INDEX IF NOT EXISTS idx_archived_matches_archived_at ON archived_matches(archived_at)`,
-      `CREATE INDEX IF NOT EXISTS idx_archived_matches_original_id ON archived_matches(original_id)`,
-
-      // Archived settlement evidence.
-      `CREATE TABLE IF NOT EXISTS archived_settlement_evidence (
-        id INTEGER PRIMARY KEY,
-        original_id INTEGER NOT NULL,
-        payload TEXT,
-        settlement_id TEXT,
-        created_at INTEGER NOT NULL,
-        archived_at INTEGER NOT NULL
-      )`,
-      `CREATE INDEX IF NOT EXISTS idx_archived_settlement_evidence_created_at ON archived_settlement_evidence(created_at)`,
-      `CREATE INDEX IF NOT EXISTS idx_archived_settlement_evidence_archived_at ON archived_settlement_evidence(archived_at)`,
-      `CREATE INDEX IF NOT EXISTS idx_archived_settlement_evidence_original_id ON archived_settlement_evidence(original_id)`,
-
-      // Log of archival runs/events for auditing.
-      `CREATE TABLE IF NOT EXISTS archival_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        table_name TEXT NOT NULL,
-        records_archived INTEGER NOT NULL,
-        retention_days INTEGER NOT NULL,
-        cutoff_at INTEGER NOT NULL,
-        started_at INTEGER NOT NULL,
-        finished_at INTEGER NOT NULL,
-        status TEXT NOT NULL,
-        error TEXT
-      )`,
-      `CREATE INDEX IF NOT EXISTS idx_archival_events_table_name ON archival_events(table_name)`,
-      `CREATE INDEX IF NOT EXISTS idx_archival_events_started_at ON archival_events(started_at)`,
-    ],
-  },
-];
+/** Roll back applied migrations down to (but not including) `targetVersion`.
+ * Each migration's `down` statements run in reverse order within a transaction
+ * that also removes its `schema_version` marker, so a failure leaves the
+ * database at the previous consistent version. */
+export async function rollbackSqliteMigrations(
+  db: sqlite3.Database,
+  migrations: SqliteMigration[],
+  targetVersion: number,
+): Promise<void> {
+  await run(db, CREATE_SCHEMA_VERSION_TABLE);
+  const ordered = [...migrations].sort((a, b) => b.version - a.version);
+  const current = await getVersion(db);
+  if (targetVersion < 0) {
+    throw new Error(`Invalid target schema version ${targetVersion}`);
+  }
+  if (targetVersion > current) {
+    throw new Error(`Cannot roll back to schema version ${targetVersion}: current version is ${current}`);
+  }
+  for (const migration of ordered) {
+    if (migration.version <= targetVersion || migration.version > current) continue;
+    if (!migration.down || migration.down.length === 0) {
+      throw new Error(`Migration ${migration.version} (${migration.name}) has no down statements to roll back`);
+    }
+    await run(db, 'BEGIN IMMEDIATE');
+    try {
+      for (const statement of [...migration.down].reverse()) await run(db, statement);
+      await new Promise<void>((resolve, reject) =>
+        db.run('DELETE FROM schema_version WHERE version = ?', [migration.version], (error) =>
+          error ? reject(error) : resolve(),
+        ),
+      );
+      await run(db, 'COMMIT');
+    } catch (error) {
+      await run(db, 'ROLLBACK').catch(() => undefined);
+      throw error;
+    }
+  }
+}

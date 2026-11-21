@@ -14,7 +14,7 @@ import { getMaintainableQueueStore } from './queue.js';
 import { performLiveRestore, defaultRestoreRequestPath } from './store/live-restore.js';
 import type { DlqEntry } from './store/persistent-queue-store.js';
 import { startStorageCapacityMonitor, type CapacityLogger } from './store/storage-capacity.js';
-import { runArchival, queryArchived, type ArchivalOptions } from './store/archival.js';
+import { startIntegrityCheckJob } from './store/integrity-check.js';
 
 export interface MaintenanceOptions {
   logger: CapacityLogger;
@@ -105,8 +105,12 @@ export async function handleRestoreRequest(
 export function installMaintenance(options: MaintenanceOptions): () => void {
   const store = getMaintainableQueueStore();
   const databasePath = store?.databasePath();
+  const databases = databasePath ? listDatabases(path.dirname(databasePath)) : [];
   const stopMonitor = databasePath
-    ? startStorageCapacityMonitor(listDatabases(path.dirname(databasePath)), options.logger)
+    ? startStorageCapacityMonitor(databases, options.logger)
+    : () => {};
+  const stopIntegrityCheck = databasePath
+    ? startIntegrityCheckJob(databases, options.logger)
     : () => {};
 
   const archival = resolveArchivalOptions(options);
@@ -154,7 +158,7 @@ export function installMaintenance(options: MaintenanceOptions): () => void {
 
   return () => {
     stopMonitor();
-    clearInterval(archiveTimer);
+    stopIntegrityCheck();
     process.off(signal, onSignal);
   };
 }
