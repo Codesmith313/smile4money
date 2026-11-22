@@ -6,6 +6,7 @@ import validateGameRouter from './routes/validate-game.js';
 import reviewRouter from './routes/oracle-review.js';
 import oracleRouter from './routes/oracle.js';
 import playerIdentityRouter from './routes/player-identity.js';
+import metricsRouter from './routes/metrics.js';
 import { errorToHttpStatus } from './errors/errorToHttpStatus.js';
 import {
   ErrorCode,
@@ -64,6 +65,7 @@ app.use('/api/validate-game', validateGameRouter);
 app.use('/api/oracle/reviews', reviewRouter);
 app.use('/api/oracle', oracleRouter);
 app.use('/api/player-identity', playerIdentityRouter);
+app.use('/metrics', metricsRouter);
 
 // Public service status (#115). Mounted here, after the other routes, so the
 // route list above stays untouched; the handler never throws.

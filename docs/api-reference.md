@@ -1591,6 +1591,16 @@ The existing `/health` 503 payload keeps its `status`, `error`, and `dependencie
 
 This mapping lives in `apps/backend/src/errors/errorResponse.ts` (`ErrorCode`, `errorEnvelope`, `statusToErrorCode`) — that module is the source of truth if this table and the code ever disagree.
 
+### DLQ Metrics
+
+`GET /metrics` is an unauthenticated Prometheus text-format endpoint (`text/plain; version=0.0.4`) for monitoring the dead-letter queue. It returns:
+
+- `oracle_dlq_depth` — number of pending entries.
+- `oracle_dlq_oldest_entry_age_seconds` — age of the oldest pending entry; `0` when the queue is empty.
+- `oracle_dlq_retry_attempts` — histogram of retry attempts recorded on pending entries, with cumulative buckets, sum, and count.
+
+The retry histogram describes the current pending queue, not the history of completed retries. The response contains aggregate values only. Restrict endpoint access at the network layer if metrics should not be publicly reachable.
+
 ### Example
 
 ```bash
@@ -1610,6 +1620,12 @@ curl -s -X POST http://localhost:4000/api/matches \
     "timestamp": "2026-11-20T22:00:00.000Z"
   }
 }
+```
+
+Scrape metrics with:
+
+```bash
+curl -s http://localhost:4000/metrics
 ```
 
 # Settlement evidence retention

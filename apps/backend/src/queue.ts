@@ -206,10 +206,9 @@ export interface BatchResult {
 /**
  * Process a batch of DLQ entries in a single atomic unit of work.
  *
- * All retry-state updates are staged and only committed once every entry in
- * the batch has been processed successfully. If any handler throws, the batch
- * is rolled back: no entry is removed and no retry state is persisted, so the
- * entries remain pending for the next cycle.
+ * Entries are removed only after every handler succeeds. If a handler throws,
+ * the batch is rolled back and remains pending, while attempts already made
+ * are persisted for retry monitoring and backoff decisions.
  */
 export async function processBatch(
   entries: DlqEntry[],
@@ -235,7 +234,10 @@ export async function processBatch(
       resolved.push(entry.id);
     }
   } catch (err) {
-    // Roll back: discard staged updates and leave every entry untouched.
+    // Keep attempted retry counts even though no entries are removed.
+    for (const { id, updates } of staged) {
+      await store.update(id, updates);
+    }
     logger.error(
       {
         batchSize: entries.length,

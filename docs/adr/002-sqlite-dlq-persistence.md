@@ -157,6 +157,7 @@ writes internally). The limitation is strictly *cross-process* writers.
 - Selection logic: `QUEUE_STORE` (`auto` | `mongodb` | `sqlite` | `memory`) in
   `apps/backend/src/queue.ts`; `auto` → MongoDB if `MONGODB_URL` is set, else SQLite.
 - TTL: 30 days, purged on read.
+- Monitoring: `GET /metrics` exposes DLQ depth, oldest-entry age, and the retry-attempt histogram.
 - See `PERSISTENT_QUEUE.md` for full operational/usage details and the
   troubleshooting note on "SQLite database locked".
 
@@ -167,8 +168,9 @@ writes internally). The limitation is strictly *cross-process* writers.
 2. **WAL mode** — enable `PRAGMA journal_mode=WAL` to improve concurrent
    read/write behaviour within the single owning process.
 3. **Configurable TTL** — allow per-entry or environment-driven DLQ retention.
-4. **DLQ metrics / alerts** — expose `oracle_dlq_depth` to monitoring so a growing
-   queue pages on-call before the 7-day `TIMEOUT_LEDGERS` window is approached.
+4. **DLQ alert thresholds** — configure monitoring to alert on sustained nonzero
+   depth or increasing oldest-entry age before the 7-day `TIMEOUT_LEDGERS` window
+   is approached.
 
 ## Conclusion
 
