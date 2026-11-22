@@ -115,6 +115,30 @@ const LEVEL_ORDER: Record<LogLevel, number> = {
   error: 3,
 };
 
+/**
+ * Error severity classification, ordered from most to least severe.
+ * Used to categorize errors for filtering and severity-based alerting.
+ */
+export type Severity = 'critical' | 'error' | 'warning' | 'info';
+
+const SEVERITY_ORDER: Record<Severity, number> = {
+  critical: 0,
+  error: 1,
+  warning: 2,
+  info: 3,
+};
+
+/** Severities at or above this threshold raise an alert. */
+const ALERT_SEVERITIES: ReadonlySet<Severity> = new Set(['critical', 'error']);
+
+function configuredMinSeverity(): Severity {
+  const raw = (process.env.LOG_MIN_SEVERITY || '').toLowerCase();
+  if (raw === 'critical' || raw === 'error' || raw === 'warning' || raw === 'info') {
+    return raw;
+  }
+  return 'info';
+}
+
 function configuredLevel(): LogLevel {
   const raw = (process.env.LOG_LEVEL || '').toLowerCase();
   if (raw === 'debug' || raw === 'info' || raw === 'warn' || raw === 'error') {
@@ -123,12 +147,30 @@ function configuredLevel(): LogLevel {
   return process.env.NODE_ENV === 'production' ? 'info' : 'debug';
 }
 
+/** Default suppression window for duplicate errors (1 minute). */
+const DEFAULT_DEDUP_WINDOW_MS = 60_000;
+
+function configuredDedupWindowMs(): number {
+  const raw = Number(process.env.LOG_DEDUP_WINDOW_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_DEDUP_WINDOW_MS;
+}
+
+interface DedupEntry {
+  firstSeen: number;
+  suppressed: number;
+}
+
 class Logger {
   private readonly recentErrors = new Map<string, RecentError>();
 
   /** Exposed so callers can skip building an expensive log payload entirely when it won't be emitted. */
   isLevelEnabled(level: LogLevel): boolean {
     return LEVEL_ORDER[level] >= LEVEL_ORDER[configuredLevel()];
+  }
+
+  /** Returns true when an error of the given severity passes the configured severity filter. */
+  isSeverityEnabled(severity: Severity): boolean {
+    return SEVERITY_ORDER[severity] <= SEVERITY_ORDER[configuredMinSeverity()];
   }
 
   private log(level: LogLevel, context: LogContext, message: string): void {
@@ -250,6 +292,8 @@ class Logger {
     } else {
       this.errorWithDeduplication(context, message || '');
     }
+    this.log('error', { ...ctx, severity }, msg);
+    this.maybeAlert(severity, ctx, msg);
   }
 }
 
