@@ -18,6 +18,7 @@ describe('errorEnvelope (#50)', () => {
           'https://github.com/obajecollinsmicheal-cmd/smile4money/blob/master/docs/api-reference.md#recovering-from-errors',
       },
     });
+    expect(Number.isNaN(Date.parse(body.error.timestamp as string))).toBe(false);
   });
 
   it('merges extra fields into the error object, not the top level', () => {
@@ -82,6 +83,11 @@ describe('statusToErrorCode (#50)', () => {
 
   it('maps 429 to RATE_LIMITED', () => {
     expect(statusToErrorCode(429)).toBe(ErrorCode.RATE_LIMITED);
+  });
+
+  it('maps 503 and 504 to their service error codes', () => {
+    expect(statusToErrorCode(503)).toBe(ErrorCode.SERVICE_UNAVAILABLE);
+    expect(statusToErrorCode(504)).toBe(ErrorCode.UPSTREAM_TIMEOUT);
   });
 
   it('maps any other status to INTERNAL_ERROR', () => {

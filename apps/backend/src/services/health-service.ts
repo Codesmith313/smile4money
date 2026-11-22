@@ -11,7 +11,7 @@ import { getAllLimiterStats } from './bottleneck-limiters.js';
 import { getSettlementAgeMonitor, type SettlementSnapshot } from './settlement-age-monitor.js';
 import { getQueueMetrics, type QueueMetricsSnapshot } from './queue-metrics.js';
 import { getLatestIntegrityStatus } from '../store/db-maintenance.js';
-import { getCurrentSchemaVersion } from '../store/sqlite-migrations.js';
+import { matchStore } from '../store/index.js';
 
 export interface HealthCheckOptions {
   /** When true, performs a live connectivity check against the Stellar RPC. */
@@ -115,7 +115,7 @@ export async function runHealthCheck(options: HealthCheckOptions): Promise<Healt
   if (includeDatabase) {
     payload.database = {
       integrity: getLatestIntegrityStatus(),
-      schemaVersion: getCurrentSchemaVersion(),
+      schemaVersion: await matchStore.getSchemaVersion(),
     };
   }
 

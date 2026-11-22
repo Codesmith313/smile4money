@@ -170,10 +170,26 @@ describe('POST /api/validate-game', () => {
       expect(response.body.message).toBe(
         'The service is temporarily unavailable. Please try again shortly.',
       );
-      expect(response.body.error.code).toBe('INTERNAL_ERROR');
+      expect(response.body.error.code).toBe('SERVICE_UNAVAILABLE');
+      expect(response.body.error.details).toEqual({});
       expect(response.body.error.message).toBe(
         'The service is temporarily unavailable. Please try again shortly.',
       );
+    });
+
+    it('returns a service-unavailable envelope when the provider request fails', async () => {
+      mockedAxios.get = vi.fn().mockRejectedValue(new Error('private network error'));
+
+      const response = await request(app)
+        .post('/api/validate-game')
+        .send({ gameId: 'abc123', platform: 'lichess' });
+
+      expect(response.status).toBe(503);
+      expect(response.body.error).toMatchObject({
+        code: 'SERVICE_UNAVAILABLE',
+        message: 'The service is temporarily unavailable. Please try again shortly.',
+        details: {},
+      });
     });
   });
 

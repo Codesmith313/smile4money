@@ -14,12 +14,11 @@ import { errorToHttpStatus } from './errors/errorToHttpStatus.js';
 import {
   ErrorCode,
   errorEnvelope,
-  statusToErrorCode,
   userFacingErrorMessage,
 } from './errors/errorResponse.js';
 import { requestLogging } from './middleware/request-logging.js';
 import { traceContext } from './middleware/trace-context.js';
-import logger from './logger.js';
+import errorHandler from './middleware/error-handler.js';
 
 /**
  * Parse the ALLOWED_ORIGINS environment variable into an array of origin strings.
@@ -48,11 +47,17 @@ app.use(
       if (!origin || allowed.includes(origin)) {
         callback(null, true);
       } else {
-        callback(new Error(`CORS: origin '${origin}' is not allowed`));
+        callback(
+          Object.assign(
+            new Error(`CORS: origin '${origin}' is not allowed`),
+            { status: 403 },
+          ),
+        );
       }
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
+    exposedHeaders: ['traceparent', 'x-request-id', 'x-correlation-id'],
     credentials: true,
   })
 );
@@ -92,19 +97,6 @@ app.use((_req, res) => {
     .json(errorEnvelope(ErrorCode.NOT_FOUND, userFacingErrorMessage(404)));
 });
 
-// Keep internal exception details in neither the response nor the logs.
-app.use(
-  (
-    err: unknown,
-    _req: express.Request,
-    res: express.Response,
-    _next: express.NextFunction,
-  ) => {
-    const status = errorToHttpStatus(err);
-    const code = statusToErrorCode(status);
-    logger.error({ status, error_code: code }, 'http_error');
-    res.status(status).json(errorEnvelope(code, userFacingErrorMessage(status)));
-  },
-);
+app.use(errorHandler);
 
 export default app;

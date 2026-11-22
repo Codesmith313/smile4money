@@ -1,4 +1,4 @@
-import { currentTraceContext } from '../tracing/trace-context.js';
+import { currentTraceContext, newTraceContext } from '../tracing/trace-context.js';
 
 /**
  * Standard API error envelope (#50).
@@ -25,6 +25,8 @@ export const ErrorCode = {
   NOT_FOUND: 'NOT_FOUND',
   CONFLICT: 'CONFLICT',
   RATE_LIMITED: 'RATE_LIMITED',
+  SERVICE_UNAVAILABLE: 'SERVICE_UNAVAILABLE',
+  UPSTREAM_TIMEOUT: 'UPSTREAM_TIMEOUT',
   INTERNAL_ERROR: 'INTERNAL_ERROR',
 } as const;
 
@@ -116,8 +118,8 @@ export function getRecoverySuggestion(key: string): RecoverySuggestion {
  * Builds the standard `{ error: { code, message, suggestion, documentation } }` body.
  *
  * `extra` merges additional diagnostic fields (e.g. a machine-readable
- * `hint`) into the `error` object, never onto the top-level response body —
- * every error response must have exactly one top-level key, `error`.
+ * `hint`) into the `error` object. The returned envelope has one top-level
+ * key, `error`.
  */
 export function errorEnvelope(
   code: ErrorCode | string,
@@ -128,6 +130,7 @@ export function errorEnvelope(
   const context = currentTraceContext();
   return {
     error: {
+      ...extra,
       code,
       message,
       suggestion: recovery.suggestion,
@@ -157,6 +160,8 @@ export function errorEnvelope(
 export function statusToErrorCode(status: number): ErrorCode {
   switch (status) {
     case 400:
+    case 413:
+    case 415:
       return ErrorCode.VALIDATION_ERROR;
     case 401:
       return ErrorCode.UNAUTHORIZED;
@@ -170,6 +175,10 @@ export function statusToErrorCode(status: number): ErrorCode {
       return ErrorCode.VALIDATION_ERROR;
     case 429:
       return ErrorCode.RATE_LIMITED;
+    case 503:
+      return ErrorCode.SERVICE_UNAVAILABLE;
+    case 504:
+      return ErrorCode.UPSTREAM_TIMEOUT;
     default:
       return ErrorCode.INTERNAL_ERROR;
   }
@@ -180,6 +189,10 @@ export function userFacingErrorMessage(status: number): string {
   switch (status) {
     case 400:
       return 'Check the request details and try again.';
+    case 413:
+      return 'The request is too large. Reduce its size and try again.';
+    case 415:
+      return 'The request format is not supported.';
     case 401:
       return 'Sign in with a valid account and try again.';
     case 403:

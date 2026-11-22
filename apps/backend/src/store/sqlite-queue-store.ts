@@ -26,6 +26,8 @@ import type {
 } from "./persistent-queue-store.js";
 import { PRIORITY_ORDER } from "./persistent-queue-store.js";
 import logger from "../logger.js";
+import { applySqliteMigrations } from "./sqlite-migrations.js";
+import { SQLITE_SCHEMA_MIGRATIONS } from "./sqlite-schema-migrations.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 

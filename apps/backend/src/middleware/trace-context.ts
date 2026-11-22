@@ -22,6 +22,8 @@ export function traceContext() {
       req.header("tracestate"),
     );
     res.setHeader("traceparent", formatTraceparent(ctx));
+    res.setHeader("x-request-id", ctx.spanId);
+    res.setHeader("x-correlation-id", ctx.traceId);
     runWithTraceContext(ctx, () => next());
   };
 }

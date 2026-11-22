@@ -12,6 +12,8 @@ import { fileURLToPath } from 'url';
 import type { CanonicalSettlementEvidence, MatchRecord } from './match-store.js';
 import { computeIdentityHash } from '../services/player-identity.js';
 import { SqliteConnectionPool } from './sqlite-connection-pool.js';
+import { getCurrentSchemaVersion, applySqliteMigrations } from './sqlite-migrations.js';
+import { SQLITE_SCHEMA_MIGRATIONS } from './sqlite-schema-migrations.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -31,22 +33,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // `db_slow_query` with `query_duration_ms` for ongoing monitoring.
 const SQLITE_SLOW_QUERY_MS = Number(process.env.SQLITE_SLOW_QUERY_MS ?? 100);
 
-const MATCH_STORE_INDEXES = [
-  'CREATE INDEX IF NOT EXISTS idx_matches_gameId ON matches(gameId)',
-  'CREATE INDEX IF NOT EXISTS idx_matches_state ON matches(state)',
-  'CREATE INDEX IF NOT EXISTS idx_settlement_evidence_matchId ON settlement_evidence(matchId)',
-];
-
 function runAsync(db: sqlite3.Database, sql: string): Promise<void> {
   return new Promise((resolve, reject) => {
     db.run(sql, (err: Error | null) => (err ? reject(err) : resolve()));
   });
-}
-
-async function applySqliteMigrations(db: sqlite3.Database): Promise<void> {
-  for (const statement of MATCH_STORE_INDEXES) {
-    await runAsync(db, statement);
-  }
 }
 
 function logSlowQuery(query: string, durationMs: number): void {
@@ -104,73 +94,48 @@ export class SqliteMatchStore {
   }
 
   async initialize(): Promise<void> {
-    // Ensure the data directory exists
     const dir = path.dirname(this.dbPath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
 
     this.pool = new SqliteConnectionPool({ dbPath: this.dbPath });
+    try {
+      await this.withConnection(async (db) => {
+        try {
+          fs.chmodSync(this.dbPath, 0o600);
+        } catch {
+          // POSIX file modes may be unavailable.
+        }
 
-    return this.withConnection((db) => new Promise<void>((resolve, reject) => {
-      try { fs.chmodSync(this.dbPath, 0o600); } catch { /* POSIX file modes may be unavailable. */ }
+        await applySqliteMigrations(db, SQLITE_SCHEMA_MIGRATIONS['match-store']);
+        await runAsync(db, "DELETE FROM settlement_evidence WHERE evaluatedAt < datetime('now', '-30 days')");
+        const row = await new Promise<{ nextId: number }>((resolve, reject) =>
+          db.get(
+            'SELECT COALESCE(MAX(matchId), -1) + 1 AS nextId FROM matches',
+            (error, result: { nextId: number } | undefined) =>
+              error ? reject(error) : resolve(result ?? { nextId: 0 }),
+          ),
+        );
+        this.nextId = row.nextId;
+      });
+      this.initialized = true;
+      this.evidenceCleanupTimer = setInterval(() => {
+        void this.withConnection((db) =>
+          runAsync(db, "DELETE FROM settlement_evidence WHERE evaluatedAt < datetime('now', '-30 days')"),
+        ).catch((error) => console.warn('settlement_evidence_cleanup_failed', error));
+      }, 24 * 60 * 60 * 1000);
+      this.evidenceCleanupTimer.unref();
+    } catch (error) {
+      const pool = this.pool;
+      this.pool = null;
+      await pool.close();
+      throw error;
+    }
+  }
 
-      db.run(
-        `
-        CREATE TABLE IF NOT EXISTS matches (
-          matchId INTEGER PRIMARY KEY AUTOINCREMENT,
-          player1 TEXT NOT NULL,
-          player2 TEXT NOT NULL,
-          player1Username TEXT,
-          player2Username TEXT,
-          stakeAmount REAL NOT NULL,
-          token TEXT NOT NULL,
-          gameId TEXT NOT NULL UNIQUE,
-          platform TEXT NOT NULL,
-          state TEXT NOT NULL DEFAULT 'Pending',
-          identityHash TEXT
-        )
-        `,
-        (err: Error | null) => {
-          if (err) {
-            reject(err);
-            return;
-          }
-
-            this.db!.run(`CREATE TABLE IF NOT EXISTS settlement_evidence (
-              evidenceId INTEGER PRIMARY KEY AUTOINCREMENT, matchId INTEGER NOT NULL, parserVersion TEXT NOT NULL, evaluatedAt TEXT NOT NULL,
-              gameId TEXT NOT NULL, platform TEXT NOT NULL, whitePlayer TEXT NOT NULL,
-              blackPlayer TEXT NOT NULL, result TEXT, status TEXT NOT NULL, decision TEXT NOT NULL
-            )`, (evidenceErr: Error | null) => {
-              if (evidenceErr) { reject(evidenceErr); return; }
-              // #2203 — apply index migrations before serving queries.
-              applySqliteMigrations(this.db!).then(() => {
-                this.db!.run("DELETE FROM settlement_evidence WHERE evaluatedAt < datetime('now', '-30 days')", (retentionErr: Error | null) => {
-                  if (retentionErr) { reject(retentionErr); return; }
-                  // Load nextId from the max existing matchId
-                  this.db!.get(
-                'SELECT COALESCE(MAX(matchId), -1) + 1 AS nextId FROM matches',
-                (err: Error | null, row: any) => {
-                  if (err) {
-                    reject(err);
-                    return;
-                  }
-                  this.nextId = row?.nextId ?? 0;
-                  this.initialized = true;
-                  this.evidenceCleanupTimer = setInterval(() => {
-                    this.db?.run("DELETE FROM settlement_evidence WHERE evaluatedAt < datetime('now', '-30 days')");
-                  }, 24 * 60 * 60 * 1000);
-                  this.evidenceCleanupTimer.unref();
-                  resolve();
-                },
-                  );
-                });
-              }).catch(reject);
-            });
-          });
-        },
-      );
-    }));
+  async getSchemaVersion(): Promise<number> {
+    return this.withConnection((db) => getCurrentSchemaVersion(db));
   }
 
   async createMatch(payload: CreateMatchPayload): Promise<MatchRecord> {
@@ -231,8 +196,8 @@ export class SqliteMatchStore {
   async findByGameId(gameId: string): Promise<MatchRecord | null> {
     const query = 'SELECT * FROM matches WHERE gameId = ?';
     const startedAt = performance.now();
-    return new Promise((resolve, reject) => {
-      this.getDb().get(
+    return this.withConnection((db) => new Promise((resolve, reject) => {
+      db.get(
         query,
         [gameId],
         (err: Error | null, row: any) => {

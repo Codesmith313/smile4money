@@ -1550,7 +1550,7 @@ The off-chain backend (`apps/backend`) exposes `POST /api/matches`, `POST /api/o
 
 ### Error Response Schema
 
-Every error response from the backend API follows the same envelope:
+Errors from API endpoints use the following envelope:
 
 ```json
 {
@@ -1573,6 +1573,7 @@ Every error response from the backend API follows the same envelope:
 - `error.requestId` — the request span ID, which can be shared with support.
 - `error.correlationId` — the trace ID included in related structured logs.
 - `error.timestamp` — the UTC time when the error response was created.
+- `X-Request-ID` and `X-Correlation-ID` response headers expose the same identifiers; `traceparent` also carries the W3C trace context.
 
 `code`, `message`, `suggestion`, and `docsUrl` are always present. Some error responses include additional fields inside `error` (e.g. `error.hint`) for extra machine-readable context.
 
@@ -1589,18 +1590,20 @@ Each error code carries a fixed, actionable recovery suggestion and a documentat
 | `RATE_LIMITED` | Wait for the period indicated by the `Retry-After` response header, then retry the request. | `#error-rate-limited` |
 | `INTERNAL_ERROR` | Retry the request after a short backoff; if it keeps failing, contact support with the request timestamp. | `#error-internal-error` |
 
-`/api/validate-game`'s failure responses are the one exception: because that endpoint's job is to report on a game's validity as a normal (non-exceptional) outcome, its `valid`/`platform`/`gameId`/`message` fields are also present at the top level alongside `error`, for backward compatibility with existing consumers of that specific endpoint.
+`/api/validate-game` also retains its `valid`/`platform`/`gameId`/`message` fields at the top level for backward compatibility. A failed `/health` response uses the same error envelope; health status and dependency diagnostics are included in `error.details`.
 
 ### Error Codes
 
 | Code | HTTP Status | Meaning |
 |---|---|---|
-| `VALIDATION_ERROR` | 400 | The request body or its fields are missing, malformed, or fail a business rule. |
+| `VALIDATION_ERROR` | 400, 422 | The request body or its fields are missing, malformed, or fail a business rule. |
 | `UNAUTHORIZED` | 401 | The `Authorization` header is missing, malformed, or the JWT is invalid/expired. |
 | `FORBIDDEN` | 403 | The caller is authenticated but is not allowed to perform the action. |
 | `NOT_FOUND` | 404 | The referenced resource (a match, a game on the upstream chess platform) does not exist. |
 | `CONFLICT` | 409 | The request conflicts with existing state (e.g. a duplicate `gameId`). |
 | `RATE_LIMITED` | 429 | The caller has exceeded the endpoint's rate limit. |
+| `SERVICE_UNAVAILABLE` | 503 | The service or a required dependency is temporarily unavailable. |
+| `UPSTREAM_TIMEOUT` | 504 | A required upstream service did not respond in time. |
 | `INTERNAL_ERROR` | 500 | An unexpected server-side failure. |
 
 This mapping lives in `apps/backend/src/errors/errorResponse.ts` (`ErrorCode`, `errorEnvelope`, `statusToErrorCode`) — that module is the source of truth if this table and the code ever disagree.
@@ -1647,6 +1650,12 @@ curl -s -X POST http://localhost:4000/api/matches \
     "docsUrl": "https://docs.smile4money.example/api-reference#error-validation-error"
   }
 }
+```
+
+Scrape metrics with:
+
+```bash
+curl -s http://localhost:4000/metrics
 ```
 
 # Settlement evidence retention
