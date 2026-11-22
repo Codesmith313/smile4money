@@ -812,6 +812,28 @@ describe('Persistent Queue System', () => {
       const deletedCount = await evictExpiredDlqEntries();
       expect(deletedCount).toBe(1);
     });
+
+    it('evicts multiple expired entries in a single pass', async () => {
+      const e1 = await writeToDlq({ matchId: 1 }, 'old 1');
+      const e2 = await writeToDlq({ matchId: 2 }, 'old 2');
+      const e3 = await writeToDlq({ matchId: 3 }, 'recent');
+
+      await updateDlqEntry(e1.id, { createdAt: Date.now() - 10 * DAY_MS });
+      await updateDlqEntry(e2.id, { createdAt: Date.now() - 9 * DAY_MS });
+      await updateDlqEntry(e3.id, { createdAt: Date.now() - 1 * DAY_MS });
+
+      const deletedCount = await evictExpiredDlqEntries(7);
+      expect(deletedCount).toBe(2);
+
+      const remaining = await listDlqEntries();
+      expect(remaining).toHaveLength(1);
+      expect(remaining[0].id).toBe(e3.id);
+    });
+
+    it('returns 0 when the queue is empty', async () => {
+      const deletedCount = await evictExpiredDlqEntries(7);
+      expect(deletedCount).toBe(0);
+    });
   });
 });
 

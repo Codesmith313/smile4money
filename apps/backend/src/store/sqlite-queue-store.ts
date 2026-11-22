@@ -1,4 +1,5 @@
 import { sqliteSettings, configureSqlite } from "./sqlite-config.js";
+import { applySqliteMigrations } from "./sqlite-migrations.js";
 /**
  * SQLite Persistent Queue Store
  *
@@ -262,7 +263,6 @@ export class SQLiteQueueStore implements PersistentQueueStore {
   }
 
   async add(entry: DlqEntry): Promise<void> {
-    const expireAt = Date.now() + 30 * 24 * 60 * 60 * 1000; // 30 days
     await withRetry<void>("add", (cb) =>
       this.getDb().run(
         `
@@ -287,6 +287,10 @@ export class SQLiteQueueStore implements PersistentQueueStore {
   }
 
   async getAll(): Promise<DlqEntry[]> {
+    const rows = await withRetry<any[]>("getAll:select", (cb) =>
+      this.getDb().all(
+        `SELECT * FROM dlq_entries ORDER BY created_at ASC, id ASC`,
+        (err: Error | null, result: any[]) => cb(err, result),
     // Delete expired entries first.
     await withQueryTiming("getAll:deleteExpired", () =>
       withRetry<void>("getAll:deleteExpired", (cb) =>
@@ -328,7 +332,7 @@ export class SQLiteQueueStore implements PersistentQueueStore {
   async remove(id: string): Promise<void> {
     await withRetry<void>("remove", (cb) =>
       this.getDb().run(
-        `DELETE FROM oracle_dlq WHERE id = ?`,
+        `DELETE FROM dlq_entries WHERE id = ?`,
         [id],
         (err: Error | null) => cb(err),
       ),
@@ -344,7 +348,7 @@ export class SQLiteQueueStore implements PersistentQueueStore {
       values.push(updates.attempts);
     }
     if (updates.lastAttemptAt !== undefined) {
-      setClauses.push("lastAttemptAt = ?");
+      setClauses.push("last_attempt_at = ?");
       values.push(updates.lastAttemptAt);
     }
     if (updates.replayedAt !== undefined) {
@@ -364,7 +368,7 @@ export class SQLiteQueueStore implements PersistentQueueStore {
 
     await withRetry<void>("update", (cb) =>
       this.getDb().run(
-        `UPDATE oracle_dlq SET ${setClauses.join(", ")} WHERE id = ?`,
+        `UPDATE dlq_entries SET ${setClauses.join(", ")} WHERE id = ?`,
         values,
         (err: Error | null) => cb(err),
       ),
@@ -372,6 +376,10 @@ export class SQLiteQueueStore implements PersistentQueueStore {
   }
 
   async count(): Promise<number> {
+    const row = await withRetry<any>("count", (cb) =>
+      this.getDb().get(
+        `SELECT COUNT(*) as count FROM dlq_entries`,
+        (err: Error | null, result: any) => cb(err, result),
     const row = await withQueryTiming("count", () =>
       withRetry<any>("count", (cb) =>
         this.getDb().get(
@@ -386,13 +394,41 @@ export class SQLiteQueueStore implements PersistentQueueStore {
 
   async clear(): Promise<void> {
     await withRetry<void>("clear", (cb) =>
-      this.getDb().run(`DELETE FROM oracle_dlq`, (err: Error | null) =>
+      this.getDb().run(`DELETE FROM dlq_entries`, (err: Error | null) =>
         cb(err),
       ),
     );
   }
 
   /**
+   * Deletes entries created before `olderThanMs` (epoch millis) and returns
+   * the number of rows removed. Used by the periodic DLQ expiration job.
+   */
+  async deleteExpired(olderThanMs: number): Promise<number> {
+    const deleted = await withRetry<number>("deleteExpired", (cb) =>
+      this.getDb().run(
+        `DELETE FROM dlq_entries WHERE created_at < ?`,
+        [olderThanMs],
+        function (this: sqlite3.RunResult, err: Error | null) {
+          cb(err, this?.changes);
+        },
+      ),
+    );
+    return deleted ?? 0;
+  }
+
+  private rowToEntry(row: any): DlqEntry {
+    return {
+      id: row.id,
+      payload: JSON.parse(row.payload),
+      failureReason: row.failure_reason,
+      attempts: row.attempts,
+      createdAt: row.created_at,
+      lastAttemptAt: row.last_attempt_at ?? null,
+      ...(row.trace_context
+        ? { traceContext: JSON.parse(row.trace_context) }
+        : {}),
+    };
    * Processes multiple jobs in a single database transaction (#2192).
    *
    * Entries are chunked into groups of at most `batchSize` (defaults to

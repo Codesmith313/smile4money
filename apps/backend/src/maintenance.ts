@@ -163,6 +163,30 @@ export function installMaintenance(options: MaintenanceOptions): () => void {
   };
   process.on(signal, onSignal);
 
+  const ttlDays = config.DLQ_TTL_DAYS;
+  const intervalMs = config.DLQ_EXPIRATION_INTERVAL_MS;
+  let expiring = false;
+  const runExpiration = () => {
+    if (expiring) {
+      options.logger.warn({}, 'dlq_expiration_already_running');
+      return;
+    }
+    expiring = true;
+    try {
+      const result = evictExpiredDlqEntries(ttlDays);
+      options.logger.info({ ...result, ttlDays }, 'dlq_expiration_run');
+    } catch (err) {
+      options.logger.error(
+        { error: err instanceof Error ? err.message : String(err), ttlDays },
+        'dlq_expiration_failed',
+      );
+    } finally {
+      expiring = false;
+    }
+  };
+  const expirationTimer = setInterval(runExpiration, intervalMs);
+  if (typeof expirationTimer.unref === 'function') expirationTimer.unref();
+
   return () => {
     stopMonitor();
     stopStallDetector();

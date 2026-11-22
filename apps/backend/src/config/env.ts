@@ -57,6 +57,30 @@ function parseString(name: string, defaultValue: string): string {
     return defaultValue;
   }
 
+  const parsed = parseInt(raw, 10);
+
+  if (isNaN(parsed) || !Number.isInteger(parsed)) {
+    throw new Error(`${name} must be a positive integer, got: "${raw}"`);
+  }
+
+  if (parsed <= 0) {
+    throw new Error(`${name} must be greater than zero, got: ${parsed}`);
+  }
+
+  return parsed;
+}
+
+/**
+ * Parses a required-positive-number environment variable (allows decimals).
+ *
+ * Rules:
+ *  - If the variable is absent or empty, `defaultValue` is used.
+ *  - If the variable is present but not a finite number, startup fails.
+ *  - If the parsed value is zero or negative, startup fails.
+ *
+ * @throws {Error} when the value is non-numeric, zero, or negative.
+ */
+function parsePositiveNumber(name: string, defaultValue: number): number {
   return raw;
 }
 
@@ -77,6 +101,10 @@ function parsePositiveInt(name: string, defaultValue: number): number {
     return defaultValue;
   }
 
+  const parsed = Number(raw);
+
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`${name} must be a positive number, got: "${raw}"`);
   const parsed = parseInt(raw, 10);
 
   if (isNaN(parsed) || !Number.isInteger(parsed)) {
@@ -88,6 +116,102 @@ function parsePositiveInt(name: string, defaultValue: number): number {
   }
 
   return parsed;
+}
+
+/**
+ * Parses DLQ_TTL_DAYS from the environment.
+ *
+ * @throws {Error} when the value is non-integer, zero, or negative.
+ */
+function parseDlqTtlDays(): number {
+  return parsePositiveInt('DLQ_TTL_DAYS', DEFAULT_DLQ_TTL_DAYS);
+}
+
+/**
+ * Parses DLQ_EXPIRATION_INTERVAL_MS from the environment.
+ *
+ * @throws {Error} when the value is non-integer, zero, or negative.
+ */
+function parseDlqExpirationIntervalMs(): number {
+  return parsePositiveInt(
+    'DLQ_EXPIRATION_INTERVAL_MS',
+    DEFAULT_DLQ_EXPIRATION_INTERVAL_MS
+  );
+}
+
+/** Per-job-type exponential backoff tuning. */
+export interface BackoffConfig {
+  /** Base delay before the first retry, in milliseconds. */
+  baseDelayMs: number;
+
+  /** Maximum delay cap between retries, in milliseconds. */
+  maxDelayMs: number;
+
+  /** Multiplier applied to the delay after each attempt. */
+  multiplier: number;
+}
+
+/**
+ * Normalises a job type into the env-var fragment used for overrides,
+ * e.g. "game-result" / "game_result" / "GameResult" => "GAME_RESULT".
+ */
+function jobTypeEnvKey(jobType: string): string {
+  return jobType
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[^a-zA-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .toUpperCase();
+}
+
+/**
+ * Parses per-job-type backoff overrides from BACKOFF_<JOBTYPE>_BASE_DELAY_MS,
+ * BACKOFF_<JOBTYPE>_MAX_DELAY_MS and BACKOFF_<JOBTYPE>_MULTIPLIER.
+ *
+ * Only job types with at least one override variable present are included;
+ * missing fields fall back to the global backoff defaults.
+ *
+ * @throws {Error} when any present override value is invalid.
+ */
+function parseBackoffOverrides(
+  defaults: BackoffConfig
+): Record<string, BackoffConfig> {
+  const prefix = 'BACKOFF_';
+  const suffixes = ['_BASE_DELAY_MS', '_MAX_DELAY_MS', '_MULTIPLIER'] as const;
+  const jobTypes = new Set<string>();
+
+  for (const key of Object.keys(process.env)) {
+    if (!key.startsWith(prefix)) {
+      continue;
+    }
+
+    for (const suffix of suffixes) {
+      if (key.endsWith(suffix) && key.length > prefix.length + suffix.length) {
+        jobTypes.add(key.slice(prefix.length, key.length - suffix.length));
+        break;
+      }
+    }
+  }
+
+  const overrides: Record<string, BackoffConfig> = {};
+
+  for (const jobType of jobTypes) {
+    overrides[jobType] = {
+      baseDelayMs: parsePositiveInt(
+        `${prefix}${jobType}_BASE_DELAY_MS`,
+        defaults.baseDelayMs
+      ),
+      maxDelayMs: parsePositiveInt(
+        `${prefix}${jobType}_MAX_DELAY_MS`,
+        defaults.maxDelayMs
+      ),
+      multiplier: parsePositiveNumber(
+        `${prefix}${jobType}_MULTIPLIER`,
+        defaults.multiplier
+      ),
+    };
+  }
+
+  return overrides;
 }
 
 /**
@@ -248,6 +372,20 @@ function loadEnv(): Env {
   // Network, RPC endpoint and contract ids come from the canonical table in
   // environments.toml; conflicting overrides throw here (#118).
   const network = resolveNetworkConfig(process.env);
+
+  const backoffBaseDelayMs = parsePositiveInt(
+    'BACKOFF_BASE_DELAY_MS',
+    DEFAULT_BACKOFF_BASE_DELAY_MS
+  );
+  const backoffMaxDelayMs = parsePositiveInt(
+    'BACKOFF_MAX_DELAY_MS',
+    DEFAULT_BACKOFF_MAX_DELAY_MS
+  );
+  const backoffMultiplier = parsePositiveNumber(
+    'BACKOFF_MULTIPLIER',
+    DEFAULT_BACKOFF_MULTIPLIER
+  );
+
   return {
     stellarNetwork: network.network,
     stellarRpcUrl: network.rpcUrl,

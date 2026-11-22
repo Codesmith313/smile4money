@@ -159,6 +159,47 @@ async function testQueueStore(createStore: () => any) {
       });
     });
 
+    describe("expiration", () => {
+      it("deletes only entries older than the cutoff and returns count", async () => {
+        const now = Date.now();
+        const day = 24 * 60 * 60 * 1000;
+
+        await store.add({
+          ...createEntry("old1"),
+          createdAt: now - 10 * day,
+        });
+        await store.add({
+          ...createEntry("old2"),
+          createdAt: now - 8 * day,
+        });
+        await store.add({
+          ...createEntry("fresh1"),
+          createdAt: now - 1 * day,
+        });
+        await store.add({
+          ...createEntry("fresh2"),
+          createdAt: now,
+        });
+
+        const cutoff = now - 7 * day;
+        const deleted = await store.deleteExpired(cutoff);
+        expect(deleted).toBe(2);
+
+        const remaining = await store.getAll();
+        expect(remaining.map((entry: DlqEntry) => entry.id)).toEqual([
+          "fresh1",
+          "fresh2",
+        ]);
+      });
+
+      it("returns zero when nothing is expired", async () => {
+        await store.add(createEntry("e1"));
+        const deleted = await store.deleteExpired(Date.now() - 1000);
+        expect(deleted).toBe(0);
+        expect(await store.count()).toBe(1);
+      });
+    });
+
     describe("data integrity", () => {
       it("preserves all fields", async () => {
         const now = Date.now();
