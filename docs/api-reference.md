@@ -1557,7 +1557,8 @@ Errors from API endpoints use the following envelope:
   "error": {
     "code": "VALIDATION_ERROR",
     "message": "gameId is required",
-    "details": {},
+    "suggestion": "Include a non-empty \"gameId\" string in the request body and retry.",
+    "docsUrl": "https://docs.smile4money.example/api-reference#error-validation-error"
     "requestId": "8b7c7638f9ea9b31",
     "correlationId": "4bf92f3577b34da6a3ce929d0e0e4736",
     "timestamp": "2026-11-20T22:00:00.000Z"
@@ -1567,13 +1568,27 @@ Errors from API endpoints use the following envelope:
 
 - `error.code` — a stable, machine-readable string. API consumers should branch on this, not on `error.message` (which is meant for humans and may be reworded).
 - `error.message` — a human-readable description of what went wrong.
-- `error.details` — an object with safe diagnostic context, or `{}` when none is available.
+- `error.suggestion` — an actionable next step that tells the caller how to recover from this specific error. It is always present, always relevant to `error.code`, and is written as an instruction the caller can act on directly (e.g. "re-authenticate and retry", "wait and retry after the `Retry-After` header"). Clients may display it verbatim to end users.
+- `error.docsUrl` — an absolute link to the documentation anchor for this error code (see the table below). Always present, so a client can render a "Learn more" link without hardcoding URLs.
 - `error.requestId` — the request span ID, which can be shared with support.
 - `error.correlationId` — the trace ID included in related structured logs.
 - `error.timestamp` — the UTC time when the error response was created.
 - `X-Request-ID` and `X-Correlation-ID` response headers expose the same identifiers; `traceparent` also carries the W3C trace context.
 
-Additional diagnostic fields such as `error.hint` may also be present for backward compatibility; `error.details` is the standard location for that context.
+`code`, `message`, `suggestion`, and `docsUrl` are always present. Some error responses include additional fields inside `error` (e.g. `error.hint`) for extra machine-readable context.
+
+### Recovery Suggestions
+
+Each error code carries a fixed, actionable recovery suggestion and a documentation link. The table below is the source of truth for what clients can expect; the backend builds these from the same definitions that produce `errorEnvelope`.
+
+| Code | Suggestion | Docs anchor |
+|---|---|---|
+| `VALIDATION_ERROR` | Correct the offending field(s) named in `error.message` and resend the request. | `#error-validation-error` |
+| `UNAUTHORIZED` | Obtain a fresh token (re-authenticate) and retry with a valid `Authorization: Bearer <token>` header. | `#error-unauthorized` |
+| `NOT_FOUND` | Verify the match ID or game ID is correct and that the resource exists on the platform, then retry. | `#error-not-found` |
+| `CONFLICT` | Fetch the existing resource (e.g. the match for this `gameId`) instead of creating a duplicate. | `#error-conflict` |
+| `RATE_LIMITED` | Wait for the period indicated by the `Retry-After` response header, then retry the request. | `#error-rate-limited` |
+| `INTERNAL_ERROR` | Retry the request after a short backoff; if it keeps failing, contact support with the request timestamp. | `#error-internal-error` |
 
 `/api/validate-game` also retains its `valid`/`platform`/`gameId`/`message` fields at the top level for backward compatibility. A failed `/health` response uses the same error envelope; health status and dependency diagnostics are included in `error.details`.
 
@@ -1593,15 +1608,29 @@ Additional diagnostic fields such as `error.hint` may also be present for backwa
 
 This mapping lives in `apps/backend/src/errors/errorResponse.ts` (`ErrorCode`, `errorEnvelope`, `statusToErrorCode`) — that module is the source of truth if this table and the code ever disagree.
 
-### DLQ Metrics
+### Recovering from errors
 
-`GET /metrics` is an unauthenticated Prometheus text-format endpoint (`text/plain; version=0.0.4`) for monitoring the dead-letter queue. It returns:
+| Error code | Suggested recovery |
+|---|---|
+| `VALIDATION_ERROR` | Correct missing or invalid fields, then submit the request again. |
+| `UNAUTHORIZED` | Provide a valid, unexpired bearer token with the required permissions. |
+| `FORBIDDEN` | Ask an administrator to grant the permissions required for the operation. |
+| `NOT_FOUND` | Verify the resource identifier and confirm the resource exists. |
+| `CONFLICT` | Refresh the resource state and retry without duplicating existing data. |
+| `RATE_LIMITED` | Wait before retrying and use exponential backoff. |
+| `INTERNAL_ERROR` | Retry once. If it persists, contact support with the request time; internal details are intentionally not returned. |
 
-- `oracle_dlq_depth` — number of pending entries.
-- `oracle_dlq_oldest_entry_age_seconds` — age of the oldest pending entry; `0` when the queue is empty.
-- `oracle_dlq_retry_attempts` — histogram of retry attempts recorded on pending entries, with cumulative buckets, sum, and count.
+### Error log severity
 
-The retry histogram describes the current pending queue, not the history of completed retries. The response contains aggregate values only. Restrict endpoint access at the network layer if metrics should not be publicly reachable.
+Backend logs are JSON records with a normalized `severity` field (`info`,
+`warning`, `error`, or `critical`) in addition to the logger `level`. Error
+records include the error type and stack frames but omit the exception message
+and unapproved context fields to avoid recording secrets or personal data.
+Email addresses, phone numbers, bearer credentials, Stellar keys, and
+credential-like URL parameters in stack frames are redacted before output.
+Set `LOG_LEVEL` to `info`, `warning` (or `warn`), `error`, or `critical` to
+filter records. Configure log-aggregator alerts on `severity=critical` for
+immediate operator attention and `severity=error` for application failures.
 
 ### Example
 
@@ -1617,10 +1646,8 @@ curl -s -X POST http://localhost:4000/api/matches \
   "error": {
     "code": "VALIDATION_ERROR",
     "message": "player2 is required",
-    "details": {},
-    "requestId": "8b7c7638f9ea9b31",
-    "correlationId": "4bf92f3577b34da6a3ce929d0e0e4736",
-    "timestamp": "2026-11-20T22:00:00.000Z"
+    "suggestion": "Include a non-empty \"player2\" string in the request body and retry.",
+    "docsUrl": "https://docs.smile4money.example/api-reference#error-validation-error"
   }
 }
 ```

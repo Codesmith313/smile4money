@@ -8,15 +8,15 @@ import {
 import { newTraceContext, runWithTraceContext } from '../../src/tracing/trace-context.js';
 
 describe('errorEnvelope (#50)', () => {
-  it('includes request and correlation metadata even without an active request context', () => {
-    const body = errorEnvelope(ErrorCode.VALIDATION_ERROR, 'bad input');
-    expect(body.error).toMatchObject({
-      code: 'VALIDATION_ERROR',
-      message: 'bad input',
-      details: {},
-      requestId: expect.stringMatching(/^[a-f0-9]{16}$/),
-      correlationId: expect.stringMatching(/^[a-f0-9]{32}$/),
-      timestamp: expect.any(String),
+  it('builds the standard { error: { code, message } } shape', () => {
+    expect(errorEnvelope(ErrorCode.VALIDATION_ERROR, 'bad input')).toMatchObject({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'bad input',
+        suggestion: 'Check the request fields and correct the invalid or missing values.',
+        documentation:
+          'https://github.com/obajecollinsmicheal-cmd/smile4money/blob/master/docs/api-reference.md#recovering-from-errors',
+      },
     });
     expect(Number.isNaN(Date.parse(body.error.timestamp as string))).toBe(false);
   });
@@ -27,23 +27,22 @@ describe('errorEnvelope (#50)', () => {
     expect(body.error).toMatchObject({
       code: 'NOT_FOUND',
       message: 'missing',
-      details: { hint: 'check the id' },
       hint: 'check the id',
-      requestId: expect.any(String),
-      correlationId: expect.any(String),
-      timestamp: expect.any(String),
+      suggestion: 'Verify the resource identifier and confirm that the resource exists.',
     });
   });
 
   it('accepts a plain string code for a code not in the standard set', () => {
-    expect(errorEnvelope('CUSTOM_CODE', 'x').error).toMatchObject({
-      code: 'CUSTOM_CODE',
-      message: 'x',
-      details: {},
-      requestId: expect.any(String),
-      correlationId: expect.any(String),
-      timestamp: expect.any(String),
-    });
+    expect(errorEnvelope('CUSTOM_CODE', 'x').error.suggestion).toContain(
+      'Review the error code and message',
+    );
+  });
+
+  it('allows an error-specific recovery suggestion', () => {
+    expect(
+      errorEnvelope('CUSTOM_CODE', 'x', { suggestion: 'Contact the operator.' })
+        .error.suggestion,
+    ).toBe('Contact the operator.');
   });
 
   it('includes request and correlation context when handling an HTTP request', () => {

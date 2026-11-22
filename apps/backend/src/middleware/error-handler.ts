@@ -1,17 +1,28 @@
 import type { ErrorRequestHandler } from "express";
 import { errorToHttpStatus } from "../errors/errorToHttpStatus.js";
-import {
-  errorEnvelope,
-  statusToErrorCode,
-  userFacingErrorMessage,
-} from "../errors/errorResponse.js";
+import { errorEnvelope, statusToErrorCode } from "../errors/errorResponse.js";
 import logger from "../logger.js";
 
-const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
-  const status = errorToHttpStatus(err);
-  const code = statusToErrorCode(status);
-  logger.error({ status, error_code: code }, "http_error");
-  res.status(status).json(errorEnvelope(code, userFacingErrorMessage(status)));
-};
+export const apiErrorHandler: ErrorRequestHandler = (
+  error,
+  req,
+  res,
+  _next,
+) => {
+  const status = errorToHttpStatus(error);
 
-export default errorHandler;
+  if (status >= 500) {
+    logger.error({ status, method: req.method, error }, "http_request_failed");
+  } else {
+    logger.warn({ status, method: req.method, error }, "http_request_failed");
+  }
+
+  const message =
+    status >= 500
+      ? "An unexpected server error occurred."
+      : error instanceof Error
+        ? error.message
+        : "The request could not be completed.";
+
+  res.status(status).json(errorEnvelope(statusToErrorCode(status), message));
+};
