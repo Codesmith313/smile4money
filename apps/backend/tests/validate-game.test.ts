@@ -167,9 +167,13 @@ describe('POST /api/validate-game', () => {
 
       expect(response.status).toBe(503);
       expect(response.body.valid).toBe(false);
-      expect(response.body.message).toContain('Validation failed');
+      expect(response.body.message).toBe(
+        'The service is temporarily unavailable. Please try again shortly.',
+      );
       expect(response.body.error.code).toBe('INTERNAL_ERROR');
-      expect(response.body.error.message).toContain('Validation failed');
+      expect(response.body.error.message).toBe(
+        'The service is temporarily unavailable. Please try again shortly.',
+      );
     });
   });
 
@@ -257,9 +261,13 @@ describe('POST /api/validate-game', () => {
 
       expect(response.status).toBe(503);
       expect(response.body.valid).toBe(false);
-      expect(response.body.message).toContain('Validation failed');
+      expect(response.body.message).toBe(
+        'Something went wrong. Please try again later.',
+      );
       expect(response.body.error.code).toBe('INTERNAL_ERROR');
-      expect(response.body.error.message).toContain('Validation failed');
+      expect(response.body.error.message).toBe(
+        'Something went wrong. Please try again later.',
+      );
     });
   });
 
