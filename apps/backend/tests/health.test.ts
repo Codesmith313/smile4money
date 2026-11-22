@@ -2,12 +2,14 @@ import request from 'supertest';
 import { describe, it, expect, beforeEach } from 'vitest';
 import express from 'express';
 import healthRouter from '../src/routes/health.js';
+import { traceContext } from '../src/middleware/trace-context.js';
 
 describe('/health endpoint', () => {
   let app: express.Express;
 
   beforeEach(() => {
     app = express();
+    app.use(traceContext());
     app.use('/health', healthRouter);
   });
 
@@ -31,6 +33,11 @@ describe('/health endpoint', () => {
     expect(response.body.status).toBe('error');
     expect(response.body.uptime).toBeGreaterThanOrEqual(0);
     expect(response.body.version).toBe('1.2.3');
+    expect(response.body.requestId).toMatch(/^[a-f0-9]{16}$/);
+    expect(response.body.correlationId).toMatch(/^[a-f0-9]{32}$/);
+    expect(Number.isNaN(Date.parse(response.body.timestamp))).toBe(false);
+    expect(response.headers['x-request-id']).toBe(response.body.requestId);
+    expect(response.headers['x-correlation-id']).toBe(response.body.correlationId);
     // #45 — unreachable RPC is reported via dependencies.stellar_rpc
     expect(response.body.dependencies).toEqual({ stellar_rpc: 'unreachable' });
   });

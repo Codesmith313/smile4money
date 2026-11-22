@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { runHealthCheck } from '../services/health-service.js';
+import { errorMetadata } from '../errors/errorResponse.js';
 
 const router = Router();
 const startTime = Date.now();
@@ -18,7 +19,10 @@ router.get('/', async (req, res) => {
   });
 
   if (!result.ok) {
-    return res.status(503).json(result.payload);
+    return res.status(503).json({
+      ...result.payload,
+      ...errorMetadata(),
+    });
   }
 
   return res.status(200).json(result.payload);

@@ -1,4 +1,4 @@
-import { currentTraceContext } from '../tracing/trace-context.js';
+import { currentTraceContext, newTraceContext } from '../tracing/trace-context.js';
 
 /**
  * Standard API error envelope (#50).
@@ -38,6 +38,22 @@ export interface ErrorEnvelope {
   };
 }
 
+export interface ErrorMetadata {
+  requestId: string;
+  correlationId: string;
+  timestamp: string;
+}
+
+/** Returns the public identifiers for an error, generating a context if needed. */
+export function errorMetadata(): ErrorMetadata {
+  const context = currentTraceContext() ?? newTraceContext();
+  return {
+    requestId: context.spanId,
+    correlationId: context.traceId,
+    timestamp: new Date().toISOString(),
+  };
+}
+
 /**
  * Builds the standard `{ error: { code, message } }` response body.
  *
@@ -50,19 +66,12 @@ export function errorEnvelope(
   message: string,
   extra?: Record<string, unknown>,
 ): ErrorEnvelope {
-  const context = currentTraceContext();
   return {
     error: {
       code,
       message,
       ...extra,
-      ...(context
-        ? {
-            requestId: context.spanId,
-            correlationId: context.traceId,
-            timestamp: new Date().toISOString(),
-          }
-        : {}),
+      ...errorMetadata(),
     },
   };
 }

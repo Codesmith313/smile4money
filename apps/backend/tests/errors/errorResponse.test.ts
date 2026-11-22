@@ -8,20 +8,39 @@ import {
 import { newTraceContext, runWithTraceContext } from '../../src/tracing/trace-context.js';
 
 describe('errorEnvelope (#50)', () => {
-  it('builds the standard { error: { code, message } } shape', () => {
-    expect(errorEnvelope(ErrorCode.VALIDATION_ERROR, 'bad input')).toEqual({
-      error: { code: 'VALIDATION_ERROR', message: 'bad input' },
+  it('includes request and correlation metadata even without an active request context', () => {
+    const body = errorEnvelope(ErrorCode.VALIDATION_ERROR, 'bad input');
+    expect(body.error).toMatchObject({
+      code: 'VALIDATION_ERROR',
+      message: 'bad input',
+      requestId: expect.stringMatching(/^[a-f0-9]{16}$/),
+      correlationId: expect.stringMatching(/^[a-f0-9]{32}$/),
+      timestamp: expect.any(String),
     });
+    expect(Number.isNaN(Date.parse(body.error.timestamp as string))).toBe(false);
   });
 
   it('merges extra fields into the error object, not the top level', () => {
     const body = errorEnvelope(ErrorCode.NOT_FOUND, 'missing', { hint: 'check the id' });
     expect(Object.keys(body)).toEqual(['error']);
-    expect(body.error).toEqual({ code: 'NOT_FOUND', message: 'missing', hint: 'check the id' });
+    expect(body.error).toMatchObject({
+      code: 'NOT_FOUND',
+      message: 'missing',
+      hint: 'check the id',
+      requestId: expect.any(String),
+      correlationId: expect.any(String),
+      timestamp: expect.any(String),
+    });
   });
 
   it('accepts a plain string code for a code not in the standard set', () => {
-    expect(errorEnvelope('CUSTOM_CODE', 'x')).toEqual({ error: { code: 'CUSTOM_CODE', message: 'x' } });
+    expect(errorEnvelope('CUSTOM_CODE', 'x').error).toMatchObject({
+      code: 'CUSTOM_CODE',
+      message: 'x',
+      requestId: expect.any(String),
+      correlationId: expect.any(String),
+      timestamp: expect.any(String),
+    });
   });
 
   it('includes request and correlation context when handling an HTTP request', () => {

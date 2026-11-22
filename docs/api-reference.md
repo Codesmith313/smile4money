@@ -1550,7 +1550,7 @@ The off-chain backend (`apps/backend`) exposes `POST /api/matches`, `POST /api/o
 
 ### Error Response Schema
 
-Every error response from the backend API follows the same envelope:
+Errors from API endpoints use the following envelope:
 
 ```json
 {
@@ -1569,10 +1569,13 @@ Every error response from the backend API follows the same envelope:
 - `error.requestId` — the request span ID, which can be shared with support.
 - `error.correlationId` — the trace ID included in related structured logs.
 - `error.timestamp` — the UTC time when the error response was created.
+- `X-Request-ID` and `X-Correlation-ID` response headers expose the same identifiers; `traceparent` also carries the W3C trace context.
 
 Some error responses include additional fields inside `error` (e.g. `error.hint`) for extra machine-readable context, but `code` and `message` are always present.
 
 `/api/validate-game`'s failure responses are the one exception: because that endpoint's job is to report on a game's validity as a normal (non-exceptional) outcome, its `valid`/`platform`/`gameId`/`message` fields are also present at the top level alongside `error`, for backward compatibility with existing consumers of that specific endpoint.
+
+The existing `/health` 503 payload keeps its `status`, `error`, and `dependencies` fields; it includes `requestId`, `correlationId`, and `timestamp` at the top level. These IDs match the response headers and structured logs.
 
 ### Error Codes
 
@@ -1601,7 +1604,10 @@ curl -s -X POST http://localhost:4000/api/matches \
 {
   "error": {
     "code": "VALIDATION_ERROR",
-    "message": "player2 is required"
+    "message": "player2 is required",
+    "requestId": "8b7c7638f9ea9b31",
+    "correlationId": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "timestamp": "2026-11-20T22:00:00.000Z"
   }
 }
 ```

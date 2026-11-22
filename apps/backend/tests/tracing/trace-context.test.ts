@@ -210,6 +210,8 @@ describe("HTTP middleware", () => {
     expect(res.headers.traceparent).toBe(
       `00-${TRACE_ID}-${res.body.spanId}-01`,
     );
+    expect(res.headers["x-request-id"]).toBe(res.body.spanId);
+    expect(res.headers["x-correlation-id"]).toBe(res.body.traceId);
   });
 
   it("starts a trace when the caller sends none", async () => {
