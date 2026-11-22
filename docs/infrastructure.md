@@ -211,6 +211,26 @@ CI suite before merging.
 
 ## 8. Observability
 
+Contract event indexing and Oracle health monitoring are not yet configured. This is acceptable for testnet but must be addressed before mainnet launch. Queue monitoring and stall detection are described below.
+
+### Queue monitoring metrics
+
+The queue worker exposes the following metrics for monitoring:
+
+| Metric | Description |
+|--------|-------------|
+| Queue depth | Number of entries currently waiting in the queue |
+| Oldest entry age | Age of the oldest entry still in the queue |
+| Success rate | Ratio of successfully processed entries to total processed entries |
+
+Metrics are refreshed continuously on a fixed interval so that dashboards and alerts always reflect near-current queue state.
+
+### Queue stall detection
+
+Progress is tracked per interval (entries processed in each interval). Stall detection compares consecutive intervals: if an interval shows no progress relative to the previous interval, the queue is considered stalled. On stall:
+
+- An alert is sent to the on-call channel.
+- The stall is logged with the interval details for later diagnosis.
 Monitoring and alerting are partially in place. The backend now runs a periodic SQLite integrity check, tracks its schema version through the migration framework, and has a documented disaster-recovery runbook with a quarterly recovery drill. Contract event indexing, Oracle uptime monitoring and post-deploy smoke tests remain outstanding and must be addressed before mainnet launch.
 
 ### Database integrity checks (#2202)

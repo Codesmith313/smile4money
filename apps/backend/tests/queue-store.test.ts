@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { InMemoryQueueStore } from "../src/store/in-memory-queue-store.js";
 import { SQLiteQueueStore } from "../src/store/sqlite-queue-store.js";
 import type { DlqEntry } from "../src/store/persistent-queue-store.js";

@@ -198,6 +198,8 @@ export class SQLiteQueueStore implements PersistentQueueStore {
           attempts INTEGER NOT NULL DEFAULT 0,
           createdAt INTEGER NOT NULL,
           lastAttemptAt INTEGER,
+          replayedAt INTEGER,
+          replayResult TEXT,
           expireAt INTEGER NOT NULL,
           priority TEXT NOT NULL DEFAULT 'medium',
           CONSTRAINT expireAt_check CHECK (expireAt > 0),
@@ -272,6 +274,8 @@ export class SQLiteQueueStore implements PersistentQueueStore {
           entry.attempts,
           entry.createdAt,
           entry.lastAttemptAt,
+          entry.replayedAt ?? null,
+          entry.replayResult ?? null,
           expireAt,
           entry.priority ?? "medium",
         ],
@@ -340,6 +344,14 @@ export class SQLiteQueueStore implements PersistentQueueStore {
     if (updates.lastAttemptAt !== undefined) {
       setClauses.push("lastAttemptAt = ?");
       values.push(updates.lastAttemptAt);
+    }
+    if (updates.replayedAt !== undefined) {
+      setClauses.push("replayedAt = ?");
+      values.push(updates.replayedAt);
+    }
+    if (updates.replayResult !== undefined) {
+      setClauses.push("replayResult = ?");
+      values.push(updates.replayResult);
     }
 
     if (setClauses.length === 0) {

@@ -23,6 +23,12 @@ const NUMERIC_FIELDS = new Set([
   'cooldown',
   'failureCount',
   'durationMs',
+  'queue_depth',
+  'oldest_entry_age_ms',
+  'success_rate',
+  'processed',
+  'failed',
+  'progress_delta',
   'integrity_check_ms',
   'schema_version',
   'migration_version',
@@ -36,6 +42,8 @@ const ENUM_FIELDS: Record<string, readonly string[]> = {
   store: ['sqlite', 'memory', 'mongodb'],
   sqlite_error_code: ['SQLITE_BUSY', 'SQLITE_LOCKED'],
   metric: ['oracle_dlq_depth'],
+  replay_result: ['success', 'failed'],
+  stall_state: ['stalled', 'progressing'],
   integrity_status: ['ok', 'failed'],
 };
 const STRING_FIELD_PATTERNS: Record<string, RegExp> = {
