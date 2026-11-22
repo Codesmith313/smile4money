@@ -1588,7 +1588,6 @@ Each error code carries a fixed, actionable recovery suggestion and a documentat
 | `CONFLICT` | Fetch the existing resource (e.g. the match for this `gameId`) instead of creating a duplicate. | `#error-conflict` |
 | `RATE_LIMITED` | Wait for the period indicated by the `Retry-After` response header, then retry the request. | `#error-rate-limited` |
 | `INTERNAL_ERROR` | Retry the request after a short backoff; if it keeps failing, contact support with the request timestamp. | `#error-internal-error` |
-=======
 
 `/api/validate-game`'s failure responses are the one exception: because that endpoint's job is to report on a game's validity as a normal (non-exceptional) outcome, its `valid`/`platform`/`gameId`/`message` fields are also present at the top level alongside `error`, for backward compatibility with existing consumers of that specific endpoint.
 
@@ -1605,6 +1604,30 @@ Each error code carries a fixed, actionable recovery suggestion and a documentat
 | `INTERNAL_ERROR` | 500 | An unexpected server-side failure. |
 
 This mapping lives in `apps/backend/src/errors/errorResponse.ts` (`ErrorCode`, `errorEnvelope`, `statusToErrorCode`) — that module is the source of truth if this table and the code ever disagree.
+
+### Recovering from errors
+
+| Error code | Suggested recovery |
+|---|---|
+| `VALIDATION_ERROR` | Correct missing or invalid fields, then submit the request again. |
+| `UNAUTHORIZED` | Provide a valid, unexpired bearer token with the required permissions. |
+| `FORBIDDEN` | Ask an administrator to grant the permissions required for the operation. |
+| `NOT_FOUND` | Verify the resource identifier and confirm the resource exists. |
+| `CONFLICT` | Refresh the resource state and retry without duplicating existing data. |
+| `RATE_LIMITED` | Wait before retrying and use exponential backoff. |
+| `INTERNAL_ERROR` | Retry once. If it persists, contact support with the request time; internal details are intentionally not returned. |
+
+### Error log severity
+
+Backend logs are JSON records with a normalized `severity` field (`info`,
+`warning`, `error`, or `critical`) in addition to the logger `level`. Error
+records include the error type and stack frames but omit the exception message
+and unapproved context fields to avoid recording secrets or personal data.
+Email addresses, phone numbers, bearer credentials, Stellar keys, and
+credential-like URL parameters in stack frames are redacted before output.
+Set `LOG_LEVEL` to `info`, `warning` (or `warn`), `error`, or `critical` to
+filter records. Configure log-aggregator alerts on `severity=critical` for
+immediate operator attention and `severity=error` for application failures.
 
 ### Example
 

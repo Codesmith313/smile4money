@@ -11,7 +11,7 @@ import { currentTraceContext } from '../tracing/trace-context.js';
  *
  * Every error response now follows one schema:
  *
- *   { "error": { "code": "SOME_CODE", "message": "human-readable text" } }
+ *   { "error": { "code", "message", "suggestion", "documentation" } }
  *
  * documented in docs/api-reference.md. Route handlers should build their
  * error body with `errorEnvelope()` below rather than hand-rolling one.
@@ -34,6 +34,8 @@ export interface ErrorEnvelope {
   error: {
     code: string;
     message: string;
+    suggestion: string;
+    documentation: string;
     [extra: string]: unknown;
   };
 }
@@ -111,7 +113,7 @@ export function getRecoverySuggestion(key: string): RecoverySuggestion {
 }
 
 /**
- * Builds the standard `{ error: { code, message } }` response body.
+ * Builds the standard `{ error: { code, message, suggestion, documentation } }` body.
  *
  * `extra` merges additional diagnostic fields (e.g. a machine-readable
  * `hint`) into the `error` object, never onto the top-level response body —
