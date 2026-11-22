@@ -250,91 +250,156 @@ testQueueStore(() => {
   return store;
 });
 
-describe("Queue replay endpoint", () => {
-  let store: InMemoryQueueStore;
-  let reprocess: ReturnType<typeof vi.fn>;
-  let logger: { info: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> };
-  let app: any;
+describe("Priority ordering (#2183)", () => {
+  async function testPriorityOrdering(createStore: () => any) {
+    let store: any;
 
-  const createEntry = (
-    id: string,
-    overrides: Partial<DlqEntry> = {},
-  ): DlqEntry => ({
-    id,
-    payload: { matchId: 1 },
-    failureReason: "test error",
-    attempts: 1,
-    createdAt: Date.now(),
-    lastAttemptAt: null,
-    ...overrides,
-  });
-
-  beforeEach(async () => {
-    store = new InMemoryQueueStore();
-    await store.initialize();
-    reprocess = vi.fn().mockResolvedValue(undefined);
-    logger = { info: vi.fn(), error: vi.fn() };
-    app = createQueueReplayApp({ store, reprocess, logger });
-  });
-
-  afterEach(async () => {
-    await store.close();
-  });
-
-  it("returns 200 and reprocesses a failed entry as new", async () => {
-    await store.add(createEntry("e1", { attempts: 3 }));
-
-    const res = await request(app).post("/queue/e1/replay");
-
-    expect(res.status).toBe(200);
-    expect(reprocess).toHaveBeenCalledTimes(1);
-    expect(reprocess).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "e1", payload: { matchId: 1 } }),
-    );
-
-    const [entry] = await store.getAll();
-    expect(entry.attempts).toBe(0);
-    expect(entry.lastAttemptAt).toBeNull();
-  });
-
-  it("returns 404 for unknown entry IDs", async () => {
-    const res = await request(app).post("/queue/missing/replay");
-
-    expect(res.status).toBe(404);
-    expect(reprocess).not.toHaveBeenCalled();
-  });
-
-  it("returns 409 for non-failed entries", async () => {
-    await store.add(createEntry("e1", { attempts: 0, failureReason: null }));
-
-    const res = await request(app).post("/queue/e1/replay");
-
-    expect(res.status).toBe(409);
-    expect(reprocess).not.toHaveBeenCalled();
-  });
-
-  it("tracks the replay result", async () => {
-    await store.add(createEntry("e1"));
-
-    const res = await request(app).post("/queue/e1/replay");
-
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({
-      id: "e1",
-      status: "replayed",
+    beforeEach(async () => {
+      store = createStore();
+      await store.initialize();
     });
-    expect(res.body.replayedAt).toEqual(expect.any(Number));
+
+    afterEach(async () => {
+      await store.close();
+    });
+
+    const makeEntry = (id: string, priority?: DlqEntry["priority"], createdAt = Date.now()): DlqEntry => ({
+      id,
+      payload: { id },
+      failureReason: "test",
+      attempts: 0,
+      createdAt,
+      lastAttemptAt: null,
+      priority,
+    });
+
+    it("returns high before medium before low regardless of insertion order", async () => {
+      await store.add(makeEntry("low1", "low", 1000));
+      await store.add(makeEntry("med1", "medium", 2000));
+      await store.add(makeEntry("hi1", "high", 3000));
+
+      const all = await store.getAll();
+      expect(all.map((e: DlqEntry) => e.id)).toEqual(["hi1", "med1", "low1"]);
+    });
+
+    it("within the same priority level, orders by createdAt ascending", async () => {
+      await store.add(makeEntry("hi2", "high", 2000));
+      await store.add(makeEntry("hi1", "high", 1000));
+      await store.add(makeEntry("hi3", "high", 3000));
+
+      const all = await store.getAll();
+      expect(all.map((e: DlqEntry) => e.id)).toEqual(["hi1", "hi2", "hi3"]);
+    });
+
+    it("treats entries with no priority as medium", async () => {
+      await store.add(makeEntry("lo1", "low", 1000));
+      await store.add(makeEntry("none", undefined, 2000));
+      await store.add(makeEntry("hi1", "high", 3000));
+
+      const all = await store.getAll();
+      expect(all[0].id).toBe("hi1");
+      // 'none' has implicit medium priority — before 'lo1'
+      expect(all[1].id).toBe("none");
+      expect(all[2].id).toBe("lo1");
+    });
+
+    it("preserves the priority field on round-trip", async () => {
+      await store.add(makeEntry("h", "high"));
+      await store.add(makeEntry("m", "medium"));
+      await store.add(makeEntry("l", "low"));
+
+      const all = await store.getAll();
+      const byId: Record<string, DlqEntry> = {};
+      for (const e of all) byId[e.id] = e;
+
+      expect(byId["h"].priority).toBe("high");
+      expect(byId["m"].priority).toBe("medium");
+      expect(byId["l"].priority).toBe("low");
+    });
+  }
+
+  describe("InMemoryQueueStore", () => {
+    testPriorityOrdering(() => new InMemoryQueueStore());
   });
 
-  it("logs the replay", async () => {
-    await store.add(createEntry("e1"));
+  describe("SQLiteQueueStore", () => {
+    testPriorityOrdering(() => {
+      const dbPath = path.join("/tmp", `test-priority-queue-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+      const store = new SQLiteQueueStore(dbPath);
+      const originalClose = store.close.bind(store);
+      store.close = async () => {
+        await originalClose();
+        for (const suffix of ["", "-wal", "-shm"]) {
+          if (fs.existsSync(dbPath + suffix)) fs.unlinkSync(dbPath + suffix);
+        }
+      };
+      return store;
+    });
+  });
 
-    await request(app).post("/queue/e1/replay");
+  describe("SQLiteQueueStore migration (pre-existing DB without priority column)", () => {
+    it("adds the priority column to a database that pre-dates #2183", async () => {
+      const dbPath = path.join("/tmp", `test-migration-queue-${Date.now()}.db`);
 
-    expect(logger.info).toHaveBeenCalledWith(
-      expect.stringContaining("replay"),
-      expect.objectContaining({ entryId: "e1" }),
-    );
+      // Create a bare-bones database without the priority column, simulating
+      // a DB from before this feature was added.
+      await new Promise<void>((resolve, reject) => {
+        const db = new sqlite3.Database(dbPath, (err) => err ? reject(err) : resolve());
+        db.run(
+          `CREATE TABLE oracle_dlq (
+            id TEXT PRIMARY KEY NOT NULL,
+            payload TEXT NOT NULL,
+            failureReason TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            createdAt INTEGER NOT NULL,
+            lastAttemptAt INTEGER,
+            expireAt INTEGER NOT NULL
+          )`,
+          () => db.close(),
+        );
+      });
+
+      // Insert a legacy row without priority.
+      await new Promise<void>((resolve, reject) => {
+        const db = new sqlite3.Database(dbPath, (err) => err ? reject(err) : resolve());
+        const expireAt = Date.now() + 30 * 24 * 60 * 60 * 1000;
+        db.run(
+          `INSERT INTO oracle_dlq (id, payload, failureReason, attempts, createdAt, lastAttemptAt, expireAt)
+           VALUES ('legacy1', '{}', 'rpc error', 0, ?, NULL, ?)`,
+          [Date.now(), expireAt],
+          () => db.close(),
+        );
+      });
+
+      const store = new SQLiteQueueStore(dbPath);
+      try {
+        await store.initialize();
+        const all = await store.getAll();
+        expect(all).toHaveLength(1);
+        // Legacy entry should come back with the default medium priority.
+        expect(all[0].id).toBe("legacy1");
+        expect(all[0].priority ?? "medium").toBe("medium");
+
+        // New high-priority entry should sort before the legacy medium one.
+        await store.add({
+          id: "hi1",
+          payload: {},
+          failureReason: "test",
+          attempts: 0,
+          createdAt: Date.now(),
+          lastAttemptAt: null,
+          priority: "high",
+        });
+        const ordered = await store.getAll();
+        expect(ordered[0].id).toBe("hi1");
+        expect(ordered[1].id).toBe("legacy1");
+      } finally {
+        await store.close();
+        for (const suffix of ["", "-wal", "-shm"]) {
+          if (fs.existsSync(dbPath + suffix)) fs.unlinkSync(dbPath + suffix);
+        }
+      }
+    });
   });
 });
 

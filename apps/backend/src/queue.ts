@@ -18,10 +18,11 @@ import { InMemoryQueueStore } from "./store/in-memory-queue-store.js";
 import { SQLiteQueueStore } from "./store/sqlite-queue-store.js";
 import type {
   DlqEntry,
+  JobPriority,
   PersistentQueueStore,
 } from "./store/persistent-queue-store.js";
 
-export type { DlqEntry };
+export type { DlqEntry, JobPriority };
 
 import logger from "./logger.js";
 
@@ -239,6 +240,7 @@ function getQueueStore(): PersistentQueueStore {
 export async function writeToDlq(
   payload: unknown,
   failureReason: string,
+  priority: JobPriority = "medium",
 ): Promise<DlqEntry> {
   const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const entry: DlqEntry = {
@@ -248,6 +250,7 @@ export async function writeToDlq(
     attempts: 0,
     createdAt: Date.now(),
     lastAttemptAt: null,
+    priority,
   };
 
   await getQueueStore().add(entry);

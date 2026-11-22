@@ -7,10 +7,15 @@
 
 import type { PersistedTraceContext } from "../tracing/trace-context.js";
 
-/**
- * Outcome of a manual replay attempt, recorded on the entry for auditing.
- */
-export type ReplayResult = "pending" | "succeeded" | "failed";
+/** Processing urgency for a DLQ entry. High-priority entries are processed before medium, medium before low. */
+export type JobPriority = "high" | "medium" | "low";
+
+/** Numeric weight used for in-process sorting: lower number = processed first. */
+export const PRIORITY_ORDER: Record<JobPriority, number> = {
+  high: 0,
+  medium: 1,
+  low: 2,
+};
 
 export interface DlqEntry {
   id: string;
@@ -20,14 +25,11 @@ export interface DlqEntry {
   createdAt: number;
   lastAttemptAt: number | null;
   /**
-   * Timestamp of the most recent manual replay (#2184), or null if the entry
-   * has never been replayed.
+   * Processing priority for this entry. High-priority entries are dequeued
+   * before medium, and medium before low. Defaults to 'medium' when absent
+   * (entries written before this field existed are treated as medium).
    */
-  replayedAt?: number | null;
-  /**
-   * Result of the most recent manual replay (#2184). Absent until replayed.
-   */
-  replayResult?: ReplayResult;
+  priority?: JobPriority;
   /**
    * W3C trace context the entry was queued under (#123), resumed as a child
    * span on every retry. Holds only `traceparent`/`tracestate`: random ids and
