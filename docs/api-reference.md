@@ -1556,15 +1556,39 @@ Every error response from the backend API follows the same envelope:
 {
   "error": {
     "code": "VALIDATION_ERROR",
-    "message": "gameId is required"
+    "message": "gameId is required",
+    "suggestion": "Include a non-empty \"gameId\" string in the request body and retry.",
+    "docsUrl": "https://docs.smile4money.example/api-reference#error-validation-error"
+    "requestId": "8b7c7638f9ea9b31",
+    "correlationId": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "timestamp": "2026-11-20T22:00:00.000Z"
   }
 }
 ```
 
 - `error.code` — a stable, machine-readable string. API consumers should branch on this, not on `error.message` (which is meant for humans and may be reworded).
 - `error.message` — a human-readable description of what went wrong.
+- `error.suggestion` — an actionable next step that tells the caller how to recover from this specific error. It is always present, always relevant to `error.code`, and is written as an instruction the caller can act on directly (e.g. "re-authenticate and retry", "wait and retry after the `Retry-After` header"). Clients may display it verbatim to end users.
+- `error.docsUrl` — an absolute link to the documentation anchor for this error code (see the table below). Always present, so a client can render a "Learn more" link without hardcoding URLs.
+- `error.requestId` — the request span ID, which can be shared with support.
+- `error.correlationId` — the trace ID included in related structured logs.
+- `error.timestamp` — the UTC time when the error response was created.
 
-Some error responses include additional fields inside `error` (e.g. `error.hint`) for extra machine-readable context, but `code` and `message` are always present.
+`code`, `message`, `suggestion`, and `docsUrl` are always present. Some error responses include additional fields inside `error` (e.g. `error.hint`) for extra machine-readable context.
+
+### Recovery Suggestions
+
+Each error code carries a fixed, actionable recovery suggestion and a documentation link. The table below is the source of truth for what clients can expect; the backend builds these from the same definitions that produce `errorEnvelope`.
+
+| Code | Suggestion | Docs anchor |
+|---|---|---|
+| `VALIDATION_ERROR` | Correct the offending field(s) named in `error.message` and resend the request. | `#error-validation-error` |
+| `UNAUTHORIZED` | Obtain a fresh token (re-authenticate) and retry with a valid `Authorization: Bearer <token>` header. | `#error-unauthorized` |
+| `NOT_FOUND` | Verify the match ID or game ID is correct and that the resource exists on the platform, then retry. | `#error-not-found` |
+| `CONFLICT` | Fetch the existing resource (e.g. the match for this `gameId`) instead of creating a duplicate. | `#error-conflict` |
+| `RATE_LIMITED` | Wait for the period indicated by the `Retry-After` response header, then retry the request. | `#error-rate-limited` |
+| `INTERNAL_ERROR` | Retry the request after a short backoff; if it keeps failing, contact support with the request timestamp. | `#error-internal-error` |
+=======
 
 `/api/validate-game`'s failure responses are the one exception: because that endpoint's job is to report on a game's validity as a normal (non-exceptional) outcome, its `valid`/`platform`/`gameId`/`message` fields are also present at the top level alongside `error`, for backward compatibility with existing consumers of that specific endpoint.
 
@@ -1574,6 +1598,7 @@ Some error responses include additional fields inside `error` (e.g. `error.hint`
 |---|---|---|
 | `VALIDATION_ERROR` | 400 | The request body or its fields are missing, malformed, or fail a business rule. |
 | `UNAUTHORIZED` | 401 | The `Authorization` header is missing, malformed, or the JWT is invalid/expired. |
+| `FORBIDDEN` | 403 | The caller is authenticated but is not allowed to perform the action. |
 | `NOT_FOUND` | 404 | The referenced resource (a match, a game on the upstream chess platform) does not exist. |
 | `CONFLICT` | 409 | The request conflicts with existing state (e.g. a duplicate `gameId`). |
 | `RATE_LIMITED` | 429 | The caller has exceeded the endpoint's rate limit. |
@@ -1594,7 +1619,9 @@ curl -s -X POST http://localhost:4000/api/matches \
 {
   "error": {
     "code": "VALIDATION_ERROR",
-    "message": "player2 is required"
+    "message": "player2 is required",
+    "suggestion": "Include a non-empty \"player2\" string in the request body and retry.",
+    "docsUrl": "https://docs.smile4money.example/api-reference#error-validation-error"
   }
 }
 ```

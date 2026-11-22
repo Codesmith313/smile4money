@@ -17,6 +17,7 @@
 6. [Post-Incident Report Template](#6-post-incident-report-template)
 7. [Contact Escalation List](#7-contact-escalation-list)
 8. [Production Readiness Gates](#8-production-readiness-gates)
+9. [Database Recovery](#9-database-recovery)
 
 ---
 
@@ -334,6 +335,97 @@ See [§5 Unpausing the Contract](#5-unpausing-the-contract) for the unpause comm
 
 ---
 
+## 3a. Queue Monitoring, Replay and Stall Detection
+
+The backend queue (oracle polling jobs and result submissions) exposes metrics, a manual replay
+endpoint for failed entries, and automatic stall detection. Use this section when a queue alert
+fires or when you need to recover a failed entry.
+
+### 3a.1 Queue metrics
+
+Metrics are exposed on the backend's Prometheus endpoint (`GET /metrics`, default port from
+`METRICS_PORT`) and are updated continuously as the queue is processed:
+
+| Metric | Meaning | Typical use |
+|---|---|---|
+| `queue_depth` | Number of entries currently waiting to be processed | Rising depth = backlog building |
+| `queue_oldest_entry_age_seconds` | Age of the oldest entry still in the queue | Directly measures how stale the backlog is |
+| `queue_success_rate` | Ratio of successful to total processing attempts over the rolling window | Falling rate = processing is failing |
+
+Quick checks:
+
+```bash
+# Scrape the queue metrics from the running backend
+curl -s "http://localhost:${METRICS_PORT:-9464}/metrics" | grep '^queue_'
+```
+
+Alert thresholds (align with the G3 gate in [§8.1](#81-gates)):
+
+- `queue_depth` > 0 sustained for 1 h → page the oracle service owner.
+- `queue_oldest_entry_age_seconds` > 24 h → treat as a G3 breach; escalate.
+- `queue_success_rate` dropping below 0.95 over 1 h → investigate provider/RPC errors.
+
+### 3a.2 Replaying a failed queue entry
+
+Failed entries are retained in the DLQ with their entry ID (see `oracle_dlq:` log lines and the
+`oracle_dlq_depth` metric). To reprocess one manually:
+
+```bash
+curl -s -X POST "http://localhost:${BACKEND_PORT:-3000}/queue/${ENTRY_ID}/replay" \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}"
+```
+
+Expected responses:
+
+| Status | Body | Meaning |
+|---|---|---|
+| `200` | `{"status":"replayed","entryId":"<id>"}` | Entry re-enqueued and reprocessed as if new |
+| `404` | `{"error":"not_found"}` | No failed entry with that ID (already replayed or evicted) |
+| `409` | `{"error":"not_failed"}` | Entry is not in a failed state; nothing to replay |
+| `401`/`403` | `{"error":"unauthorized"}` | Missing or invalid admin credentials |
+
+Behaviour and audit trail:
+
+- The entry is reprocessed **as if new**: it goes through the normal fetch → validate → submit
+  path, so a successful replay produces a fresh `submit_result` attempt.
+- The replay result (success or failure) is tracked on the entry and reflected in
+  `queue_success_rate`.
+- Every replay is logged with the entry ID, operator identity and outcome. Confirm it with:
+
+```bash
+journalctl -u smile4money-backend -f | grep 'queue_replay'
+```
+
+Record the entry ID, timestamp and outcome in the incident log.
+
+### 3a.3 Stall detection
+
+The backend tracks queue progress per interval and compares consecutive intervals. If an interval
+makes no progress (no entries processed) while entries are waiting, the queue is considered
+stalled and an alert is sent.
+
+Relevant environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `QUEUE_STALL_INTERVAL_MS` | `60000` | Length of each progress-tracking interval |
+| `QUEUE_STALL_THRESHOLD` | `3` | Consecutive no-progress intervals before a stall alert fires |
+
+When a stall is detected:
+
+- An alert is sent through the configured alert channel (same path as the G3 alerts).
+- A `queue_stall` log event is emitted with the interval count, queue depth and oldest entry age:
+
+```bash
+journalctl -u smile4money-backend -f | grep 'queue_stall'
+```
+
+First response: check `queue_depth` and `queue_oldest_entry_age_seconds` (§3a.1), inspect the
+oracle `/health` endpoint, and replay any stuck failed entries (§3a.2). If processing cannot be
+restored, follow the G3 rollback triggers in [§8.3](#83-rollback-authority).
+
+---
+
 ## 4. Emergency Fund Drain
 
 **When to use:** Active exploit with no time for match-by-match resolution. Transfers the
@@ -600,6 +692,48 @@ It fails when:
 
 `Deploy to Mainnet` runs this check first. A tag push checks the record named after the tag; a
 manual run asks for the record's path. Merge the record (and so the decision) before deploying.
+
+---
+
+## 9. Database Recovery
+
+**When to use:** The oracle database is lost, corrupted, or unreachable and must be restored from
+backup. The full backup schedule, storage layout and step-by-step restore commands live in
+[Oracle Database Recovery](oracle-db-recovery.md); this section defines the objectives, the
+quarterly drill and the owner.
+
+### 9.1 Recovery objectives
+
+| Objective | Target | Meaning |
+|---|---|---|
+| **RTO** (recovery time objective) | **30 minutes** | From the decision to restore until the backend is serving traffic again with the restored database. |
+| **RPO** (recovery point objective) | **1 hour** | At most one hour of data may be lost; backups are taken at least hourly. |
+
+If a restore is projected to exceed the RTO, escalate per [§7](#7-contact-escalation-list) and
+record the overrun in the drill log and the post-incident report ([§6](#6-post-incident-report-template)).
+
+### 9.2 Quarterly recovery drill
+
+Run this drill **every quarter** on a non-production copy of the newest backup. Record the result
+in the drill log below.
+
+- [ ] Run `db-backup verify` on the newest backup and confirm it passes integrity checks.
+- [ ] Run the `verifyRestore` rehearsal against a scratch database and confirm it completes.
+- [ ] Confirm restored row counts match the source (matches, results, DLQ entries).
+- [ ] Confirm the backend starts against the restored database and the retry worker drains the DLQ.
+- [ ] Record the drill date, duration (against the 30-minute RTO) and outcome in the drill log.
+
+### 9.3 Drill log
+
+| Date (UTC) | Backup used | Duration | RTO met | Outcome / notes | Run by |
+|---|---|---|---|---|---|
+| _YYYY-MM-DD_ | _backup id_ | _mm:ss_ | _yes/no_ | _notes_ | _name_ |
+
+### 9.4 Runbook owner
+
+The **Backend owner** (see [§7](#7-contact-escalation-list)) maintains this runbook, keeps the
+drill log current, and schedules the quarterly recovery drill. Any gap found during a drill or an
+incident must be turned into a runbook update by that owner.
 
 ---
 

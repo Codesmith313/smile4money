@@ -24,6 +24,7 @@ import type {
   DlqEntry,
   PersistentQueueStore,
 } from "./persistent-queue-store.js";
+import { PRIORITY_ORDER } from "./persistent-queue-store.js";
 import logger from "../logger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -35,6 +36,9 @@ const RETRYABLE_SQLITE_CODES = new Set(["SQLITE_BUSY", "SQLITE_LOCKED"]);
 const DEFAULT_MAX_RETRIES = 5;
 /** Base delay for exponential backoff (doubles each attempt: 50ms, 100ms, 200ms, ...). Overridable via SQLITE_RETRY_BASE_DELAY_MS. */
 const DEFAULT_BASE_DELAY_MS = 50;
+
+/** Queries slower than this (ms) are logged as `db_slow_query` (#2203). Overridable via SQLITE_SLOW_QUERY_MS. */
+const DEFAULT_SLOW_QUERY_MS = 100;
 
 function readPositiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(value ?? "", 10);
@@ -50,6 +54,10 @@ function getRetryBaseDelayMs(): number {
     process.env.SQLITE_RETRY_BASE_DELAY_MS,
     DEFAULT_BASE_DELAY_MS,
   );
+}
+
+function getSlowQueryMs(): number {
+  return readPositiveInt(process.env.SQLITE_SLOW_QUERY_MS, DEFAULT_SLOW_QUERY_MS);
 }
 
 export interface SqliteError extends Error {
@@ -70,6 +78,33 @@ export function isRetryableSqliteError(err: unknown): err is SqliteError {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Runs `operation` and logs a `db_slow_query` warning when it takes longer
+ * than SQLITE_SLOW_QUERY_MS (#2203). Exported for direct unit testing.
+ */
+export async function withQueryTiming<T>(
+  queryName: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const start = Date.now();
+  try {
+    return await operation();
+  } finally {
+    const durationMs = Date.now() - start;
+    const thresholdMs = getSlowQueryMs();
+    if (durationMs > thresholdMs) {
+      logger.warn(
+        {
+          query: queryName,
+          query_duration_ms: durationMs,
+          slow_query_threshold_ms: thresholdMs,
+        },
+        "db_slow_query",
+      );
+    }
+  }
 }
 
 /**
@@ -163,8 +198,12 @@ export class SQLiteQueueStore implements PersistentQueueStore {
           attempts INTEGER NOT NULL DEFAULT 0,
           createdAt INTEGER NOT NULL,
           lastAttemptAt INTEGER,
+          replayedAt INTEGER,
+          replayResult TEXT,
           expireAt INTEGER NOT NULL,
-          CONSTRAINT expireAt_check CHECK (expireAt > 0)
+          priority TEXT NOT NULL DEFAULT 'medium',
+          CONSTRAINT expireAt_check CHECK (expireAt > 0),
+          CONSTRAINT priority_check CHECK (priority IN ('high', 'medium', 'low'))
         )
         `,
         (err: Error | null) => cb(err),
@@ -178,7 +217,46 @@ export class SQLiteQueueStore implements PersistentQueueStore {
       ),
     );
 
+    // Apply schema migrations for existing databases that pre-date the priority
+    // column (#2183).  The migration checks whether the column already exists
+    // so it is safe to run against both new and pre-existing databases.
+    await this.applyPriorityColumnMigration();
+    // Indexes on frequently queried columns (#2203): expireAt is used by
+    // deleteExpired/count, createdAt by the getAll ordering.
+    await withRetry<void>("initialize:createIndexCreatedAt", (cb) =>
+      this.getDb().run(
+        `CREATE INDEX IF NOT EXISTS idx_oracle_dlq_created_at ON oracle_dlq(createdAt)`,
+        (err: Error | null) => cb(err),
+      ),
+    );
+
     this.initialized = true;
+  }
+
+  /**
+   * Adds the `priority` column to `oracle_dlq` if it is not already present.
+   * This is idempotent: safe to call on both new databases (column already in
+   * the CREATE TABLE) and existing ones that pre-date the column.
+   */
+  private async applyPriorityColumnMigration(): Promise<void> {
+    // PRAGMA table_info returns one row per column; check for 'priority'.
+    const columns = await withRetry<any[]>("migration:tableInfo", (cb) =>
+      this.getDb().all(
+        `PRAGMA table_info(oracle_dlq)`,
+        (err: Error | null, rows: any[]) => cb(err, rows),
+      ),
+    );
+
+    const hasPriority = columns.some((col: any) => col.name === "priority");
+    if (!hasPriority) {
+      await withRetry<void>("migration:addPriorityColumn", (cb) =>
+        this.getDb().run(
+          `ALTER TABLE oracle_dlq ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium'`,
+          (err: Error | null) => cb(err),
+        ),
+      );
+      logger.info({}, "oracle_dlq: migrated schema — added priority column");
+    }
   }
 
   async add(entry: DlqEntry): Promise<void> {
@@ -186,8 +264,8 @@ export class SQLiteQueueStore implements PersistentQueueStore {
     await withRetry<void>("add", (cb) =>
       this.getDb().run(
         `
-        INSERT INTO oracle_dlq (id, payload, failureReason, attempts, createdAt, lastAttemptAt, expireAt)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO oracle_dlq (id, payload, failureReason, attempts, createdAt, lastAttemptAt, expireAt, priority)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `,
         [
           entry.id,
@@ -196,7 +274,10 @@ export class SQLiteQueueStore implements PersistentQueueStore {
           entry.attempts,
           entry.createdAt,
           entry.lastAttemptAt,
+          entry.replayedAt ?? null,
+          entry.replayResult ?? null,
           expireAt,
+          entry.priority ?? "medium",
         ],
         (err: Error | null) => cb(err),
       ),
@@ -205,18 +286,29 @@ export class SQLiteQueueStore implements PersistentQueueStore {
 
   async getAll(): Promise<DlqEntry[]> {
     // Delete expired entries first.
-    await withRetry<void>("getAll:deleteExpired", (cb) =>
-      this.getDb().run(
-        `DELETE FROM oracle_dlq WHERE expireAt < ?`,
-        [Date.now()],
-        (err: Error | null) => cb(err),
+    await withQueryTiming("getAll:deleteExpired", () =>
+      withRetry<void>("getAll:deleteExpired", (cb) =>
+        this.getDb().run(
+          `DELETE FROM oracle_dlq WHERE expireAt < ?`,
+          [Date.now()],
+          (err: Error | null) => cb(err),
+        ),
       ),
     );
 
     const rows = await withRetry<any[]>("getAll:select", (cb) =>
       this.getDb().all(
-        `SELECT * FROM oracle_dlq ORDER BY createdAt ASC`,
+        `SELECT * FROM oracle_dlq
+         ORDER BY
+           CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2 ELSE 1 END ASC,
+           createdAt ASC`,
         (err: Error | null, result: any[]) => cb(err, result),
+    const rows = await withQueryTiming("getAll:select", () =>
+      withRetry<any[]>("getAll:select", (cb) =>
+        this.getDb().all(
+          `SELECT * FROM oracle_dlq ORDER BY createdAt ASC`,
+          (err: Error | null, result: any[]) => cb(err, result),
+        ),
       ),
     );
 
@@ -227,6 +319,7 @@ export class SQLiteQueueStore implements PersistentQueueStore {
       attempts: row.attempts,
       createdAt: row.createdAt,
       lastAttemptAt: row.lastAttemptAt || null,
+      priority: (row.priority ?? "medium") as DlqEntry["priority"],
     }));
   }
 
@@ -252,6 +345,14 @@ export class SQLiteQueueStore implements PersistentQueueStore {
       setClauses.push("lastAttemptAt = ?");
       values.push(updates.lastAttemptAt);
     }
+    if (updates.replayedAt !== undefined) {
+      setClauses.push("replayedAt = ?");
+      values.push(updates.replayedAt);
+    }
+    if (updates.replayResult !== undefined) {
+      setClauses.push("replayResult = ?");
+      values.push(updates.replayResult);
+    }
 
     if (setClauses.length === 0) {
       return;
@@ -269,11 +370,13 @@ export class SQLiteQueueStore implements PersistentQueueStore {
   }
 
   async count(): Promise<number> {
-    const row = await withRetry<any>("count", (cb) =>
-      this.getDb().get(
-        `SELECT COUNT(*) as count FROM oracle_dlq WHERE expireAt > ?`,
-        [Date.now()],
-        (err: Error | null, result: any) => cb(err, result),
+    const row = await withQueryTiming("count", () =>
+      withRetry<any>("count", (cb) =>
+        this.getDb().get(
+          `SELECT COUNT(*) as count FROM oracle_dlq WHERE expireAt > ?`,
+          [Date.now()],
+          (err: Error | null, result: any) => cb(err, result),
+        ),
       ),
     );
     return row?.count || 0;
@@ -285,6 +388,97 @@ export class SQLiteQueueStore implements PersistentQueueStore {
         cb(err),
       ),
     );
+  }
+
+  /**
+   * Processes multiple jobs in a single database transaction (#2192).
+   *
+   * Entries are chunked into groups of at most `batchSize` (defaults to
+   * SQLITE_BATCH_SIZE, or DEFAULT_BATCH_SIZE). Each chunk runs inside a
+   * `BEGIN IMMEDIATE` / `COMMIT` transaction: if any job's handler throws,
+   * the whole chunk is rolled back and the error is re-thrown, so no partial
+   * batch is ever persisted. Every chunk emits a structured
+   * `batch_processed` / `batch_failed` log line with the batch size and
+   * outcome.
+   *
+   * The per-job methods (add/update/remove) remain available for callers
+   * that do not batch.
+   */
+  async processBatch<T>(
+    entries: DlqEntry[],
+    handler: BatchJobHandler<T>,
+    batchSize?: number,
+  ): Promise<BatchResult<T>> {
+    const size = batchSize ?? getBatchSize();
+    const results: T[] = [];
+
+    for (let offset = 0; offset < entries.length; offset += size) {
+      const chunk = entries.slice(offset, offset + size);
+      const startedAt = Date.now();
+      const chunkResults: T[] = [];
+
+      try {
+        await withRetry<void>("processBatch:begin", (cb) =>
+          this.getDb().run(`BEGIN IMMEDIATE`, (err: Error | null) =>
+            cb(err),
+          ),
+        );
+
+        for (const entry of chunk) {
+          chunkResults.push(await handler(entry));
+        }
+
+        await withRetry<void>("processBatch:commit", (cb) =>
+          this.getDb().run(`COMMIT`, (err: Error | null) => cb(err)),
+        );
+
+        results.push(...chunkResults);
+        logger.info(
+          {
+            batch_size: chunk.length,
+            batch_offset: offset,
+            duration_ms: Date.now() - startedAt,
+            outcome: "committed",
+          },
+          "batch_processed",
+        );
+      } catch (err) {
+        try {
+          await withRetry<void>("processBatch:rollback", (cb) =>
+            this.getDb().run(`ROLLBACK`, (rollbackErr: Error | null) =>
+              cb(rollbackErr),
+            ),
+          );
+        } catch (rollbackErr) {
+          logger.error(
+            {
+              batch_size: chunk.length,
+              batch_offset: offset,
+              rollback_error:
+                rollbackErr instanceof Error
+                  ? rollbackErr.message
+                  : String(rollbackErr),
+            },
+            "batch_rollback_failed",
+          );
+        }
+
+        logger.error(
+          {
+            batch_size: chunk.length,
+            batch_offset: offset,
+            duration_ms: Date.now() - startedAt,
+            outcome: "rolled_back",
+            error: err instanceof Error ? err.message : String(err),
+          },
+          "batch_failed",
+        );
+
+        throw err;
+      }
+    }
+
+    return { batchSize: entries.length, results };
   }
 
   async close(): Promise<void> {

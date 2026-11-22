@@ -18,14 +18,125 @@ import { InMemoryQueueStore } from "./store/in-memory-queue-store.js";
 import { SQLiteQueueStore } from "./store/sqlite-queue-store.js";
 import type {
   DlqEntry,
+  JobPriority,
   PersistentQueueStore,
 } from "./store/persistent-queue-store.js";
 
-export type { DlqEntry };
+export type { DlqEntry, JobPriority };
 
 import logger from "./logger.js";
 
 let queueStore: PersistentQueueStore | null = null;
+
+/**
+ * Queue monitoring metrics (#2179).
+ *
+ * Tracks queue depth, age of the oldest pending entry, and success rate.
+ * Counters are process-local and reset on restart; the depth/age gauges are
+ * refreshed from the store on every queue operation and by a periodic timer.
+ */
+export interface QueueMetricsSnapshot {
+  /** Number of entries currently pending in the queue. */
+  depth: number;
+  /** Age in milliseconds of the oldest pending entry (0 when empty). */
+  oldestEntryAgeMs: number;
+  /** Successfully processed entries. */
+  processed: number;
+  /** Failed processing attempts. */
+  failed: number;
+  /** processed / (processed + failed); 1 when nothing has been attempted. */
+  successRate: number;
+  /** Timestamp of the last metrics refresh. */
+  updatedAt: number;
+}
+
+const queueMetrics = {
+  depth: 0,
+  oldestEntryAgeMs: 0,
+  processed: 0,
+  failed: 0,
+  updatedAt: Date.now(),
+};
+
+function computeSuccessRate(): number {
+  const total = queueMetrics.processed + queueMetrics.failed;
+  return total === 0 ? 1 : queueMetrics.processed / total;
+}
+
+/** Record that an entry was added to the queue. */
+export function recordQueueEnqueue(): void {
+  queueMetrics.updatedAt = Date.now();
+}
+
+/** Record that an entry was successfully processed and removed. */
+export function recordQueueProcessed(): void {
+  queueMetrics.processed += 1;
+  queueMetrics.updatedAt = Date.now();
+}
+
+/** Record that processing an entry failed. */
+export function recordQueueFailed(): void {
+  queueMetrics.failed += 1;
+  queueMetrics.updatedAt = Date.now();
+}
+
+/**
+ * Recompute the depth and oldest-entry-age gauges from the store.
+ * Safe to call when the store is not initialised (leaves gauges untouched).
+ */
+export async function refreshQueueMetrics(): Promise<void> {
+  if (!queueStore) return;
+  try {
+    const entries = await queueStore.getAll();
+    const now = Date.now();
+    queueMetrics.depth = entries.length;
+    queueMetrics.oldestEntryAgeMs =
+      entries.length === 0
+        ? 0
+        : now - Math.min(...entries.map((entry) => entry.createdAt));
+    queueMetrics.updatedAt = now;
+  } catch (err) {
+    logger.error({ err: String(err) }, "oracle_queue: metrics refresh failed");
+  }
+}
+
+/** Return a snapshot of the current queue metrics. */
+export function getQueueMetrics(): QueueMetricsSnapshot {
+  return {
+    depth: queueMetrics.depth,
+    oldestEntryAgeMs: queueMetrics.oldestEntryAgeMs,
+    processed: queueMetrics.processed,
+    failed: queueMetrics.failed,
+    successRate: computeSuccessRate(),
+    updatedAt: queueMetrics.updatedAt,
+  };
+}
+
+/** Reset all queue metrics (used by tests). */
+export function resetQueueMetrics(): void {
+  queueMetrics.depth = 0;
+  queueMetrics.oldestEntryAgeMs = 0;
+  queueMetrics.processed = 0;
+  queueMetrics.failed = 0;
+  queueMetrics.updatedAt = Date.now();
+}
+
+const DEFAULT_QUEUE_METRICS_INTERVAL_MS = 15_000;
+
+/**
+ * Start a periodic timer that refreshes the queue gauges so depth and
+ * oldest-entry age stay current even when the queue is idle.
+ * Returns a cleanup function that stops the timer.
+ */
+export function startQueueMetricsTask(
+  intervalMs = DEFAULT_QUEUE_METRICS_INTERVAL_MS,
+): () => void {
+  const timer = setInterval(() => {
+    void refreshQueueMetrics();
+  }, intervalMs);
+  if (typeof timer.unref === "function") timer.unref();
+  return () => clearInterval(timer);
+}
 
 export type QueueStoreType = "memory" | "sqlite";
 
@@ -108,6 +219,8 @@ export async function initializeQueue(): Promise<void> {
   }
 
   logger.info({ store: resolved }, "oracle_dlq: queue store initialized");
+
+  await refreshQueueMetrics();
 }
 
 /**
@@ -127,6 +240,7 @@ function getQueueStore(): PersistentQueueStore {
 export async function writeToDlq(
   payload: unknown,
   failureReason: string,
+  priority: JobPriority = "medium",
 ): Promise<DlqEntry> {
   const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const entry: DlqEntry = {
@@ -136,10 +250,12 @@ export async function writeToDlq(
     attempts: 0,
     createdAt: Date.now(),
     lastAttemptAt: null,
+    priority,
   };
 
   await getQueueStore().add(entry);
   logger.warn({ dlqId: id, failureReason }, "oracle_dlq: entry written");
+  recordQueueEnqueue();
   await emitDlqDepth();
   return entry;
 }
@@ -152,6 +268,7 @@ export async function listDlqEntries(): Promise<DlqEntry[]> {
 /** Remove a successfully processed entry. */
 export async function removeDlqEntry(id: string): Promise<void> {
   await getQueueStore().remove(id);
+  recordQueueProcessed();
   await emitDlqDepth();
 }
 
@@ -163,13 +280,101 @@ export async function updateDlqEntry(
   await getQueueStore().update(id, updates);
 }
 
-/** Emit the oracle_dlq_depth metric. */
+/** Emit the oracle_dlq_depth metric and refresh queue gauges. */
 async function emitDlqDepth(): Promise<void> {
   const depth = await getQueueStore().count();
   logger.info({ metric: "oracle_dlq_depth", value: depth }, "oracle_dlq_depth");
+  await refreshQueueMetrics();
 }
 
 export type RetryHandler = (entry: DlqEntry) => Promise<void>;
+
+const DEFAULT_BATCH_SIZE = 10;
+
+/**
+ * Parse the DLQ_BATCH_SIZE environment variable, falling back to the default
+ * (10) when unset or invalid (non-numeric, zero, or negative).
+ */
+export function parseBatchSize(rawValue: string | undefined): number {
+  if (rawValue === undefined || rawValue.trim() === "") {
+    return DEFAULT_BATCH_SIZE;
+  }
+
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isInteger(parsed)) {
+    logger.warn(
+      { rawValue },
+      "oracle_dlq: invalid DLQ_BATCH_SIZE, falling back to default of 10",
+    );
+    return DEFAULT_BATCH_SIZE;
+  }
+
+  return parsed;
+}
+
+export interface BatchResult {
+  /** Entries that were successfully processed and removed. */
+  resolved: string[];
+  /** Entries whose handler failed (kept in the DLQ for a later retry). */
+  failed: string[];
+  /** True when the whole batch was rolled back. */
+  rolledBack: boolean;
+}
+
+/**
+ * Process a batch of DLQ entries in a single atomic unit of work.
+ *
+ * All retry-state updates are staged and only committed once every entry in
+ * the batch has been processed successfully. If any handler throws, the batch
+ * is rolled back: no entry is removed and no retry state is persisted, so the
+ * entries remain pending for the next cycle.
+ */
+export async function processBatch(
+  entries: DlqEntry[],
+  handler: RetryHandler,
+): Promise<BatchResult> {
+  const store = getQueueStore();
+  const resolved: string[] = [];
+  const failed: string[] = [];
+
+  if (entries.length === 0) {
+    return { resolved, failed, rolledBack: false };
+  }
+
+  const staged: Array<{ id: string; updates: Partial<DlqEntry> }> = [];
+
+  try {
+    for (const entry of entries) {
+      const attempts = entry.attempts + 1;
+      const lastAttemptAt = Date.now();
+      staged.push({ id: entry.id, updates: { attempts, lastAttemptAt } });
+
+      await handler({ ...entry, attempts, lastAttemptAt });
+      resolved.push(entry.id);
+    }
+  } catch (err) {
+    // Roll back: discard staged updates and leave every entry untouched.
+    logger.error(
+      {
+        batchSize: entries.length,
+        resolved: resolved.length,
+        err: String(err).substring(0, 100),
+      },
+      "oracle_dlq: batch rolled back",
+    );
+    return { resolved: [], failed: entries.map((e) => e.id), rolledBack: true };
+  }
+
+  // Commit phase: persist retry state and remove resolved entries.
+  for (const { id, updates } of staged) {
+    await store.update(id, updates);
+  }
+  for (const id of resolved) {
+    await store.remove(id);
+  }
+
+  return { resolved, failed, rolledBack: false };
+}
 
 /**
  * Start the DLQ retry worker. Call once on startup.
@@ -212,20 +417,16 @@ export function startRetryWorker(
       return;
     }
 
+    const batchSize = parseBatchSize(process.env.DLQ_BATCH_SIZE);
+    const batch = entries.slice(0, batchSize);
+
     logger.info(
-      { count: entries.length, state: breaker.getState() },
+      { count: entries.length, batchSize: batch.length, state: breaker.getState() },
       "oracle_dlq: retry worker running",
     );
 
     try {
-      for (const entry of entries) {
-        // Record the attempt before calling the handler
-        entry.attempts += 1;
-        entry.lastAttemptAt = Date.now();
-        await updateDlqEntry(entry.id, {
-          attempts: entry.attempts,
-          lastAttemptAt: entry.lastAttemptAt,
-        });
+      const result = await processBatch(batch, handler);
 
         try {
           await handler(entry);
@@ -233,9 +434,140 @@ export function startRetryWorker(
           breaker.recordSuccess();
           logger.info({ dlqId: entry.id }, "oracle_dlq: entry resolved");
         } catch (err) {
+          recordQueueFailed();
           const isRpcError =
             String(err).includes("RPC") || String(err).includes("Network");
 
           if (isRpcError) {
             const circuitOpened = breaker.recordFailure();
-            if (circuitOpened) 
+            if (circuitOpened) {
+              logger.error(
+                {
+                  dlqId: entry.id,
+                  attempt: entry.attempts,
+                  failureCount: breaker.getFailureCount(),
+                  cooldown: breaker.getRemainingCooldown(),
+                },
+                "circuit_breaker: RPC circuit opened, pausing job processing",
+              );
+              // Stop processing remaining entries this cycle
+              break;
+            }
+      if (result.rolledBack) {
+        // Treat a rolled-back batch as a failure for circuit-breaker purposes.
+        const isRpcError = result.failed.some((id) => {
+          const entry = batch.find((e) => e.id === id);
+          return entry !== undefined && entry.attempts >= 0;
+        });
+        if (isRpcError) {
+          const circuitOpened = breaker.recordFailure();
+          if (circuitOpened) {
+            logger.error(
+              {
+                failureCount: breaker.getFailureCount(),
+                cooldown: breaker.getRemainingCooldown(),
+              },
+              "circuit_breaker: RPC circuit opened, pausing job processing",
+            );
+          }
+        }
+      } else {
+        for (const id of result.resolved) {
+          breaker.recordSuccess();
+          logger.info({ dlqId: id }, "oracle_dlq: entry resolved");
+        }
+      }
+
+      logger.info(
+        {
+          batchSize: batch.length,
+          resolved: result.resolved.length,
+          failed: result.failed.length,
+          rolledBack: result.rolledBack,
+        },
+        "oracle_dlq: batch processed",
+      );
+
+      await emitDlqDepth();
+    } catch (err) {
+      logger.error({ err: String(err) }, "oracle_dlq: retry worker error");
+    }
+  }, intervalMs);
+
+  return () => {
+    clearInterval(timer);
+  };
+}
+
+/**
+ * Shut down the queue store cleanly on application exit.
+ */
+export async function closeQueue(): Promise<void> {
+  if (queueStore) {
+    await queueStore.close();
+    queueStore = null;
+  }
+}
+
+const DEFAULT_DLQ_TTL_DAYS = 7;
+const DEFAULT_DLQ_EVICTION_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
+
+/**
+ * Parse the DLQ_TTL_DAYS environment variable, falling back to the default
+ * (7 days) when unset or invalid (non-numeric, zero, or negative).
+ */
+export function parseDlqTtlDays(rawValue: string | undefined): number {
+  if (rawValue === undefined || rawValue.trim() === "") {
+    return DEFAULT_DLQ_TTL_DAYS;
+  }
+
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    logger.warn(
+      { rawValue },
+      "oracle_dlq: invalid DLQ_TTL_DAYS, falling back to default of 7 days",
+    );
+    return DEFAULT_DLQ_TTL_DAYS;
+  }
+
+  return parsed;
+}
+
+/**
+ * Delete DLQ entries older than the configured TTL (DLQ_TTL_DAYS, default 7
+ * days). Logs the number of entries deleted. Returns that count.
+ */
+export async function evictExpiredDlqEntries(
+  ttlDays: number = parseDlqTtlDays(process.env.DLQ_TTL_DAYS),
+): Promise<number> {
+  const cutoff = Date.now() - ttlDays * 24 * 60 * 60 * 1000;
+  const entries = await listDlqEntries();
+  const expired = entries.filter((entry) => entry.createdAt < cutoff);
+
+  for (const entry of expired) {
+    await removeDlqEntry(entry.id);
+  }
+
+  logger.info(
+    { deleted: expired.length, ttlDays },
+    "oracle_dlq: TTL eviction run complete",
+  );
+
+  return expired.length;
+}
+
+/**
+ * Start the periodic DLQ TTL eviction task. Call once on startup.
+ * Returns a cleanup function that stops the task.
+ */
+export function startDlqEvictionTask(
+  intervalMs = DEFAULT_DLQ_EVICTION_INTERVAL_MS,
+): () => void {
+  const timer = setInterval(() => {
+    evictExpiredDlqEntries().catch((err) => {
+      logger.error({ err: String(err) }, "oracle_dlq: TTL eviction run failed");
+    });
+  }, intervalMs);
+
+  return () => clearInterval(timer);
+}

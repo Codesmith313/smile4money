@@ -1,9 +1,15 @@
+import { createHash } from 'node:crypto';
 import { LOG_EVENTS } from './log-events.js';
+import { traceLogFields } from './tracing/trace-context.js';
+
+const ERROR_DEDUPLICATION_WINDOW_MS = 60_000;
+const MAX_RECENT_ERRORS = 1_000;
 
 const NUMERIC_FIELDS = new Set([
   'status',
   'duration_ms',
   'count',
+  'duplicate_count',
   'store_count',
   'attempt',
   'attempts',
@@ -17,7 +23,17 @@ const NUMERIC_FIELDS = new Set([
   'cooldown',
   'failureCount',
   'durationMs',
-  'suppressed_count',
+  'queue_depth',
+  'oldest_entry_age_ms',
+  'success_rate',
+  'processed',
+  'failed',
+  'progress_delta',
+  'integrity_check_ms',
+  'schema_version',
+  'migration_version',
+  'query_duration_ms',
+  'slow_query_threshold_ms',
 ]);
 const ENUM_FIELDS: Record<string, readonly string[]> = {
   method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
@@ -26,10 +42,37 @@ const ENUM_FIELDS: Record<string, readonly string[]> = {
   store: ['sqlite', 'memory', 'mongodb'],
   sqlite_error_code: ['SQLITE_BUSY', 'SQLITE_LOCKED'],
   metric: ['oracle_dlq_depth'],
-  severity: ['critical', 'error', 'warning', 'info'],
+  replay_result: ['success', 'failed'],
+  stall_state: ['stalled', 'progressing'],
+  integrity_status: ['ok', 'failed'],
+};
+const STRING_FIELD_PATTERNS: Record<string, RegExp> = {
+  trace_id: /^[a-f0-9]{32}$/,
+  correlation_id: /^[a-f0-9]{32}$/,
+  span_id: /^[a-f0-9]{16}$/,
+  parent_span_id: /^[a-f0-9]{16}$/,
+  request_id: /^[a-f0-9]{16}$/,
 };
 
 /** Unknown fields and all arbitrary strings/errors are masked at the sink. */
+function safeLogValue(key: string, value: unknown): unknown {
+  if (NUMERIC_FIELDS.has(key)) {
+    return typeof value === 'number' && Number.isFinite(value)
+      ? value
+      : '[REDACTED]';
+  }
+  if (typeof value !== 'string') return '[REDACTED]';
+  if (ENUM_FIELDS[key]?.includes(value)) return value;
+  if (STRING_FIELD_PATTERNS[key]?.test(value)) return value;
+  if (
+    key === 'error_event' &&
+    (LOG_EVENTS.has(value) || value === 'log_event')
+  ) {
+    return value;
+  }
+  return '[REDACTED]';
+}
+
 export function safeLogContext(
   context: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -38,18 +81,11 @@ export function safeLogContext(
       .filter(
         ([key]) =>
           NUMERIC_FIELDS.has(key) ||
-          Object.prototype.hasOwnProperty.call(ENUM_FIELDS, key),
+          Object.prototype.hasOwnProperty.call(ENUM_FIELDS, key) ||
+          Object.prototype.hasOwnProperty.call(STRING_FIELD_PATTERNS, key) ||
+          key === 'error_event',
       )
-      .map(([key, value]) => [
-        key,
-        NUMERIC_FIELDS.has(key) &&
-        typeof value === 'number' &&
-        Number.isFinite(value)
-          ? value
-          : typeof value === 'string' && ENUM_FIELDS[key]?.includes(value)
-            ? value
-            : '[REDACTED]',
-      ]),
+      .map(([key, value]) => [key, safeLogValue(key, value)]),
   );
 }
 
@@ -63,6 +99,14 @@ interface LogContext {
 }
 
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+interface RecentError {
+  firstLoggedAt: number;
+  duplicateCount: number;
+  duplicateEventLogged: boolean;
+  event: string;
+  status?: number;
+}
 
 const LEVEL_ORDER: Record<LogLevel, number> = {
   debug: 0,
@@ -117,7 +161,7 @@ interface DedupEntry {
 }
 
 class Logger {
-  private dedupEntries = new Map<string, DedupEntry>();
+  private readonly recentErrors = new Map<string, RecentError>();
 
   /** Exposed so callers can skip building an expensive log payload entirely when it won't be emitted. */
   isLevelEnabled(level: LogLevel): boolean {
@@ -139,65 +183,83 @@ class Logger {
       service: 'smile4money-backend',
       message: LOG_EVENTS.has(message) ? message : 'log_event',
       ...safeLogContext(context),
+      ...safeLogContext(traceLogFields()),
     };
     console.log(JSON.stringify(logEntry));
   }
 
-  /**
-   * Emits an alert for errors whose severity warrants operator attention.
-   * Alerts are logged as a distinct event so downstream alerting can key on it.
-   */
-  private maybeAlert(severity: Severity, context: LogContext, message: string): void {
-    if (!ALERT_SEVERITIES.has(severity)) {
+  private logDeduplication(
+    message: string,
+    duplicateCount: number,
+    status?: number,
+  ): void {
+    this.log(
+      'error',
+      {
+        duplicate_count: duplicateCount,
+        error_event: message,
+        ...(status === undefined ? {} : { status }),
+      },
+      'error_deduplicated',
+    );
+  }
+
+  private errorWithDeduplication(context: LogContext, message: string): void {
+    if (!this.isLevelEnabled('error')) return;
+
+    const now = Date.now();
+    for (const [key, recent] of this.recentErrors) {
+      if (now - recent.firstLoggedAt < ERROR_DEDUPLICATION_WINDOW_MS) continue;
+      if (recent.duplicateCount > 1) {
+        this.logDeduplication(
+          recent.event,
+          recent.duplicateCount,
+          recent.status,
+        );
+      }
+      this.recentErrors.delete(key);
+    }
+
+    const safeContext = safeLogContext(context);
+    delete safeContext.request_id;
+    delete safeContext.correlation_id;
+    delete safeContext.trace_id;
+    delete safeContext.span_id;
+    delete safeContext.parent_span_id;
+    const key = JSON.stringify([
+      createHash('sha256').update(message.slice(0, 1024)).digest('hex'),
+      safeContext,
+    ]);
+    const event = LOG_EVENTS.has(message) ? message : 'log_event';
+    const recent = this.recentErrors.get(key);
+    if (recent) {
+      recent.duplicateCount += 1;
+      if (!recent.duplicateEventLogged) {
+        recent.duplicateEventLogged = true;
+        this.logDeduplication(
+          event,
+          1,
+          typeof safeContext.status === 'number'
+            ? safeContext.status
+            : undefined,
+        );
+      }
       return;
     }
-    this.log('error', { ...context, severity }, 'error_alert');
-  }
 
-  /**
-   * Builds a stable identity for an error so identical errors can be deduplicated.
-   * Uses the message plus the first stack frame (when available) to distinguish
-   * errors that share a message but originate from different call sites.
-   */
-  private errorIdentity(context: LogContext, message: string): string {
-    const err = context?.error ?? context?.err;
-    const errMessage =
-      typeof err === 'string'
-        ? err
-        : err && typeof err.message === 'string'
-          ? err.message
-          : '';
-    const stack =
-      err && typeof err.stack === 'string' ? err.stack.split('\n')[1]?.trim() : '';
-    return `${message}|${errMessage}|${stack ?? ''}`;
-  }
-
-  /**
-   * Returns true when the error should be suppressed as a duplicate within the
-   * configured window. When a window expires, the accumulated suppressed count
-   * is logged so operators can see how many duplicates were dropped.
-   */
-  private shouldSuppressError(identity: string): boolean {
-    const now = Date.now();
-    const windowMs = configuredDedupWindowMs();
-    const entry = this.dedupEntries.get(identity);
-
-    if (!entry) {
-      this.dedupEntries.set(identity, { firstSeen: now, suppressed: 0 });
-      return false;
+    if (this.recentErrors.size >= MAX_RECENT_ERRORS) {
+      const oldest = this.recentErrors.keys().next().value;
+      if (oldest !== undefined) this.recentErrors.delete(oldest);
     }
-
-    if (now - entry.firstSeen < windowMs) {
-      entry.suppressed += 1;
-      return true;
-    }
-
-    // Window expired: report how many duplicates were suppressed, then reset.
-    if (entry.suppressed > 0) {
-      this.log('info', { suppressed_count: entry.suppressed }, 'error_deduplicated');
-    }
-    this.dedupEntries.set(identity, { firstSeen: now, suppressed: 0 });
-    return false;
+    this.recentErrors.set(key, {
+      firstLoggedAt: now,
+      duplicateCount: 0,
+      duplicateEventLogged: false,
+      event,
+      status:
+        typeof safeContext.status === 'number' ? safeContext.status : undefined,
+    });
+    this.log('error', context, message);
   }
 
   debug(context: LogContext | string, message?: string): void {
@@ -226,36 +288,9 @@ class Logger {
 
   error(context: LogContext | string, message?: string): void {
     if (typeof context === 'string') {
-      if (this.shouldSuppressError(this.errorIdentity({}, context))) {
-        return;
-      }
-      this.log('error', {}, context);
+      this.errorWithDeduplication({}, context);
     } else {
-      const msg = message || '';
-      if (this.shouldSuppressError(this.errorIdentity(context, msg))) {
-        return;
-      }
-      this.log('error', context, msg);
-    }
-  }
-
-  /**
-   * Logs an error with an explicit severity classification. The severity is
-   * attached to the entry for filtering, and severities at or above the alert
-   * threshold additionally raise an alert.
-   */
-  classifiedError(
-    severity: Severity,
-    context: LogContext | string,
-    message?: string,
-  ): void {
-    if (!this.isSeverityEnabled(severity)) {
-      return;
-    }
-    const ctx: LogContext = typeof context === 'string' ? {} : context;
-    const msg = typeof context === 'string' ? context : message || '';
-    if (this.shouldSuppressError(this.errorIdentity(ctx, msg))) {
-      return;
+      this.errorWithDeduplication(context, message || '');
     }
     this.log('error', { ...ctx, severity }, msg);
     this.maybeAlert(severity, ctx, msg);
