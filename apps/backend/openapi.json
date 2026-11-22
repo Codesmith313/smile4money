@@ -306,6 +306,7 @@
         "enum": [
           "VALIDATION_ERROR",
           "UNAUTHORIZED",
+          "FORBIDDEN",
           "NOT_FOUND",
           "CONFLICT",
           "RATE_LIMITED",
@@ -322,7 +323,10 @@
             "type": "object",
             "required": [
               "code",
-              "message"
+              "message",
+              "requestId",
+              "correlationId",
+              "timestamp"
             ],
             "properties": {
               "code": {
@@ -330,6 +334,18 @@
               },
               "message": {
                 "type": "string"
+              },
+              "requestId": {
+                "type": "string",
+                "description": "Request span ID for support reference."
+              },
+              "correlationId": {
+                "type": "string",
+                "description": "Trace ID matching related structured logs."
+              },
+              "timestamp": {
+                "type": "string",
+                "format": "date-time"
               },
               "hint": {
                 "type": "string"

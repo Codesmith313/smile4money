@@ -3,7 +3,12 @@ import { matchStore, evidenceStore } from '../store/index.js';
 import { authenticate } from '../middleware/auth.js';
 import { validateSubmitResultInput, verifyGameResult } from '../services/oracle-service.js';
 import { errorToHttpStatus } from '../errors/errorToHttpStatus.js';
-import { errorEnvelope, ErrorCode, statusToErrorCode } from '../errors/errorResponse.js';
+import {
+  errorEnvelope,
+  ErrorCode,
+  statusToErrorCode,
+  userFacingErrorMessage,
+} from '../errors/errorResponse.js';
 
 const router = Router();
 const store = matchStore;
@@ -55,7 +60,12 @@ router.post('/submit-result', async (req, res) => {
     }, evidenceStore);
 
     if (!result.ok) {
-      const message = result.details ? `${result.error}: ${result.details}` : result.error;
+      const message =
+        result.status >= 500
+          ? userFacingErrorMessage(result.status)
+          : result.details
+            ? `${result.error}: ${result.details}`
+            : result.error;
       const extra = result.hint ? { hint: result.hint } : undefined;
       return res.status(result.status).json(errorEnvelope(statusToErrorCode(result.status), message, extra));
     }
@@ -72,13 +82,17 @@ router.post('/submit-result', async (req, res) => {
       message: result.message,
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
     // #47 — mapped centrally so e.g. an upstream RateLimitError surfaces as
     // 429 here instead of always flattening to 500.
-    return res.status(errorToHttpStatus(error)).json({
-      error: 'Result verification failed',
-      details: message,
-    });
+    const status = errorToHttpStatus(error);
+    return res
+      .status(status)
+      .json(
+        errorEnvelope(
+          statusToErrorCode(status),
+          userFacingErrorMessage(status),
+        ),
+      );
   }
 });
 

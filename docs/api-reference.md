@@ -1559,6 +1559,9 @@ Every error response from the backend API follows the same envelope:
     "message": "gameId is required",
     "suggestion": "Include a non-empty \"gameId\" string in the request body and retry.",
     "docsUrl": "https://docs.smile4money.example/api-reference#error-validation-error"
+    "requestId": "8b7c7638f9ea9b31",
+    "correlationId": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "timestamp": "2026-11-20T22:00:00.000Z"
   }
 }
 ```
@@ -1567,6 +1570,9 @@ Every error response from the backend API follows the same envelope:
 - `error.message` — a human-readable description of what went wrong.
 - `error.suggestion` — an actionable next step that tells the caller how to recover from this specific error. It is always present, always relevant to `error.code`, and is written as an instruction the caller can act on directly (e.g. "re-authenticate and retry", "wait and retry after the `Retry-After` header"). Clients may display it verbatim to end users.
 - `error.docsUrl` — an absolute link to the documentation anchor for this error code (see the table below). Always present, so a client can render a "Learn more" link without hardcoding URLs.
+- `error.requestId` — the request span ID, which can be shared with support.
+- `error.correlationId` — the trace ID included in related structured logs.
+- `error.timestamp` — the UTC time when the error response was created.
 
 `code`, `message`, `suggestion`, and `docsUrl` are always present. Some error responses include additional fields inside `error` (e.g. `error.hint`) for extra machine-readable context.
 
@@ -1592,6 +1598,7 @@ Each error code carries a fixed, actionable recovery suggestion and a documentat
 |---|---|---|
 | `VALIDATION_ERROR` | 400 | The request body or its fields are missing, malformed, or fail a business rule. |
 | `UNAUTHORIZED` | 401 | The `Authorization` header is missing, malformed, or the JWT is invalid/expired. |
+| `FORBIDDEN` | 403 | The caller is authenticated but is not allowed to perform the action. |
 | `NOT_FOUND` | 404 | The referenced resource (a match, a game on the upstream chess platform) does not exist. |
 | `CONFLICT` | 409 | The request conflicts with existing state (e.g. a duplicate `gameId`). |
 | `RATE_LIMITED` | 429 | The caller has exceeded the endpoint's rate limit. |

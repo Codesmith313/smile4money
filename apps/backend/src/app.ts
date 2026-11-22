@@ -10,6 +10,16 @@ import { errorToHttpStatus, errorCodeFromStatus } from './errors/errorToHttpStat
 import { errorEnvelope } from './errors/errorEnvelope.js';
 import { requestLogging } from './middleware/request-logging.js';
 import queueReplayRouter from './routes/queue-replay.js';
+import { errorToHttpStatus } from './errors/errorToHttpStatus.js';
+import {
+  ErrorCode,
+  errorEnvelope,
+  statusToErrorCode,
+  userFacingErrorMessage,
+} from './errors/errorResponse.js';
+import { requestLogging } from './middleware/request-logging.js';
+import { traceContext } from './middleware/trace-context.js';
+import logger from './logger.js';
 
 /**
  * Parse the ALLOWED_ORIGINS environment variable into an array of origin strings.
@@ -29,6 +39,7 @@ function getAllowedOrigins(): string[] {
 
 export const app = express();
 
+app.use(traceContext());
 app.use(
   cors({
     origin: (origin, callback) => {
@@ -74,5 +85,26 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
 // route list above stays untouched; the handler never throws.
 import statusRouter from './routes/status.js';
 app.use('/status', statusRouter);
+
+app.use((_req, res) => {
+  res
+    .status(404)
+    .json(errorEnvelope(ErrorCode.NOT_FOUND, userFacingErrorMessage(404)));
+});
+
+// Keep internal exception details in neither the response nor the logs.
+app.use(
+  (
+    err: unknown,
+    _req: express.Request,
+    res: express.Response,
+    _next: express.NextFunction,
+  ) => {
+    const status = errorToHttpStatus(err);
+    const code = statusToErrorCode(status);
+    logger.error({ status, error_code: code }, 'http_error');
+    res.status(status).json(errorEnvelope(code, userFacingErrorMessage(status)));
+  },
+);
 
 export default app;

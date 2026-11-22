@@ -13,6 +13,7 @@ router.get('/', async (req, res) => {
     includeLimiters: process.env.HEALTH_INCLUDE_LIMITERS === 'true',
     includeSettlement: process.env.HEALTH_INCLUDE_SETTLEMENT === 'true',
     includeQueue: process.env.HEALTH_INCLUDE_QUEUE === 'true',
+    includeDatabase: process.env.HEALTH_INCLUDE_DATABASE === 'true',
     uptimeSeconds,
     version,
   });

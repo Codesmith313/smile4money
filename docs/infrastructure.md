@@ -231,6 +231,26 @@ Progress is tracked per interval (entries processed in each interval). Stall det
 
 - An alert is sent to the on-call channel.
 - The stall is logged with the interval details for later diagnosis.
+Monitoring and alerting are partially in place. The backend now runs a periodic SQLite integrity check, tracks its schema version through the migration framework, and has a documented disaster-recovery runbook with a quarterly recovery drill. Contract event indexing, Oracle uptime monitoring and post-deploy smoke tests remain outstanding and must be addressed before mainnet launch.
+
+### Database integrity checks (#2202)
+
+- A scheduled job runs `PRAGMA integrity_check` against the SQLite database on a fixed interval.
+- Each run records its result (timestamp, outcome, and any reported errors) so the history can be inspected.
+- When the check is enabled, the latest result is surfaced on the backend `/health` and `/status` endpoints.
+- A failed check is logged and raises an alert; treat any failure as an incident and follow the recovery runbook (§8.1).
+
+### Schema migrations (#2204)
+
+- Schema changes are applied through a versioned migration framework; migrations are ordered, tracked, and recorded in a schema-version table.
+- The current schema version is tracked and reported alongside the integrity-check result on `/health` and `/status`.
+- Rollback is supported by reverting to the previous migration version; see the runbook for the procedure.
+
+### Disaster recovery (#2205)
+
+- Recovery procedures are documented in the runbook (see [live-restore.md](live-restore.md) and [storage-capacity.md](storage-capacity.md) for related restore and capacity guidance).
+- **Recovery time objective (RTO):** 30 minutes.
+- Recovery is tested quarterly via a documented drill; drill outcomes and any runbook corrections are recorded.
 
 ### Planned work (pre-mainnet)
 
@@ -279,6 +299,7 @@ These items are not yet implemented and represent the next infrastructure work t
 | Medium | Contract event indexer | Index on-chain events for frontend and monitoring use |
 | Medium | Oracle health monitoring | Uptime check with alerting |
 | Medium | `audit.toml` baseline | Document any intentional advisory ignores |
+| Medium | Recovery drill schedule | Automate the quarterly recovery drill and record results |
 | Low | Futurenet workflow | Optional; only needed when testing against upcoming protocol changes |
 
 ---

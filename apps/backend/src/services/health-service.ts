@@ -10,6 +10,8 @@ import { checkStellarRpc } from './stellar.js';
 import { getAllLimiterStats } from './bottleneck-limiters.js';
 import { getSettlementAgeMonitor, type SettlementSnapshot } from './settlement-age-monitor.js';
 import { getQueueMetrics, type QueueMetricsSnapshot } from './queue-metrics.js';
+import { getLatestIntegrityStatus } from '../store/db-maintenance.js';
+import { getCurrentSchemaVersion } from '../store/sqlite-migrations.js';
 
 export interface HealthCheckOptions {
   /** When true, performs a live connectivity check against the Stellar RPC. */
@@ -20,6 +22,8 @@ export interface HealthCheckOptions {
   includeSettlement?: boolean;
   /** When true, appends queue monitoring metrics to the response payload. */
   includeQueue?: boolean;
+  /** When true, appends database integrity status and current schema version to the response payload. */
+  includeDatabase?: boolean;
   /** Uptime in seconds (passed in from the route so the timer origin is preserved). */
   uptimeSeconds: number;
   /** Application version string. */
@@ -36,6 +40,10 @@ export interface HealthOk {
     limiters?: ReturnType<typeof getAllLimiterStats>;
     settlement?: SettlementSnapshot | null;
     queue?: QueueMetricsSnapshot | null;
+    database?: {
+      integrity: ReturnType<typeof getLatestIntegrityStatus>;
+      schemaVersion: number;
+    };
   };
 }
 
@@ -64,6 +72,7 @@ export type HealthCheckResult = HealthOk | HealthError;
  */
 export async function runHealthCheck(options: HealthCheckOptions): Promise<HealthCheckResult> {
   const { deepCheck, includeLimiters, includeSettlement, includeQueue, uptimeSeconds, version } =
+  const { deepCheck, includeLimiters, includeSettlement, includeDatabase, uptimeSeconds, version } =
     options;
 
   if (deepCheck) {
@@ -103,6 +112,11 @@ export async function runHealthCheck(options: HealthCheckOptions): Promise<Healt
 
   if (includeQueue) {
     payload.queue = getQueueMetrics()?.getSnapshot() ?? null;
+  if (includeDatabase) {
+    payload.database = {
+      integrity: getLatestIntegrityStatus(),
+      schemaVersion: getCurrentSchemaVersion(),
+    };
   }
 
   return { ok: true, payload };

@@ -17,6 +17,7 @@
 6. [Post-Incident Report Template](#6-post-incident-report-template)
 7. [Contact Escalation List](#7-contact-escalation-list)
 8. [Production Readiness Gates](#8-production-readiness-gates)
+9. [Database Recovery](#9-database-recovery)
 
 ---
 
@@ -691,6 +692,48 @@ It fails when:
 
 `Deploy to Mainnet` runs this check first. A tag push checks the record named after the tag; a
 manual run asks for the record's path. Merge the record (and so the decision) before deploying.
+
+---
+
+## 9. Database Recovery
+
+**When to use:** The oracle database is lost, corrupted, or unreachable and must be restored from
+backup. The full backup schedule, storage layout and step-by-step restore commands live in
+[Oracle Database Recovery](oracle-db-recovery.md); this section defines the objectives, the
+quarterly drill and the owner.
+
+### 9.1 Recovery objectives
+
+| Objective | Target | Meaning |
+|---|---|---|
+| **RTO** (recovery time objective) | **30 minutes** | From the decision to restore until the backend is serving traffic again with the restored database. |
+| **RPO** (recovery point objective) | **1 hour** | At most one hour of data may be lost; backups are taken at least hourly. |
+
+If a restore is projected to exceed the RTO, escalate per [§7](#7-contact-escalation-list) and
+record the overrun in the drill log and the post-incident report ([§6](#6-post-incident-report-template)).
+
+### 9.2 Quarterly recovery drill
+
+Run this drill **every quarter** on a non-production copy of the newest backup. Record the result
+in the drill log below.
+
+- [ ] Run `db-backup verify` on the newest backup and confirm it passes integrity checks.
+- [ ] Run the `verifyRestore` rehearsal against a scratch database and confirm it completes.
+- [ ] Confirm restored row counts match the source (matches, results, DLQ entries).
+- [ ] Confirm the backend starts against the restored database and the retry worker drains the DLQ.
+- [ ] Record the drill date, duration (against the 30-minute RTO) and outcome in the drill log.
+
+### 9.3 Drill log
+
+| Date (UTC) | Backup used | Duration | RTO met | Outcome / notes | Run by |
+|---|---|---|---|---|---|
+| _YYYY-MM-DD_ | _backup id_ | _mm:ss_ | _yes/no_ | _notes_ | _name_ |
+
+### 9.4 Runbook owner
+
+The **Backend owner** (see [§7](#7-contact-escalation-list)) maintains this runbook, keeps the
+drill log current, and schedules the quarterly recovery drill. Any gap found during a drill or an
+incident must be turned into a runbook update by that owner.
 
 ---
 

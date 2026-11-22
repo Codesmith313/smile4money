@@ -1,3 +1,5 @@
+import { currentTraceContext } from '../tracing/trace-context.js';
+
 /**
  * Standard API error envelope (#50).
  *
@@ -19,6 +21,7 @@
 export const ErrorCode = {
   VALIDATION_ERROR: 'VALIDATION_ERROR',
   UNAUTHORIZED: 'UNAUTHORIZED',
+  FORBIDDEN: 'FORBIDDEN',
   NOT_FOUND: 'NOT_FOUND',
   CONFLICT: 'CONFLICT',
   RATE_LIMITED: 'RATE_LIMITED',
@@ -120,6 +123,7 @@ export function errorEnvelope(
   extra?: Record<string, unknown>,
 ): ErrorEnvelope {
   const recovery = getRecoverySuggestion(code);
+  const context = currentTraceContext();
   return {
     error: {
       code,
@@ -127,6 +131,14 @@ export function errorEnvelope(
       suggestion: recovery.suggestion,
       docsUrl: recovery.docsUrl,
       ...extra,
+      ...extra,
+      ...(context
+        ? {
+            requestId: context.spanId,
+            correlationId: context.traceId,
+            timestamp: new Date().toISOString(),
+          }
+        : {}),
     },
   };
 }
@@ -146,6 +158,8 @@ export function statusToErrorCode(status: number): ErrorCode {
       return ErrorCode.VALIDATION_ERROR;
     case 401:
       return ErrorCode.UNAUTHORIZED;
+    case 403:
+      return ErrorCode.FORBIDDEN;
     case 404:
       return ErrorCode.NOT_FOUND;
     case 409:
@@ -156,5 +170,31 @@ export function statusToErrorCode(status: number): ErrorCode {
       return ErrorCode.RATE_LIMITED;
     default:
       return ErrorCode.INTERNAL_ERROR;
+  }
+}
+
+/** Safe, actionable messages for errors whose internal details must not reach clients. */
+export function userFacingErrorMessage(status: number): string {
+  switch (status) {
+    case 400:
+      return 'Check the request details and try again.';
+    case 401:
+      return 'Sign in with a valid account and try again.';
+    case 403:
+      return 'You do not have permission to perform this action.';
+    case 404:
+      return 'The requested resource could not be found.';
+    case 409:
+      return 'The request conflicts with the current state. Refresh and try again.';
+    case 422:
+      return 'The provided information could not be verified. Check it and try again.';
+    case 429:
+      return 'Too many requests. Please wait a moment before trying again.';
+    case 503:
+      return 'The service is temporarily unavailable. Please try again shortly.';
+    case 504:
+      return 'A service took too long to respond. Please try again.';
+    default:
+      return 'Something went wrong. Please try again later.';
   }
 }

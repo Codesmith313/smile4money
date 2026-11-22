@@ -6,6 +6,7 @@ import { listDlqEntries, replayDlqEntry } from '../queue.js';
 import { buildStatus, loadIncidents } from '../services/status-service.js';
 import { getQueueMetrics, type QueueMetrics } from '../services/queue-metrics.js';
 import { logger } from '../logger.js';
+import { getLatestIntegrityStatus } from '../store/db-maintenance.js';
 
 /**
  * GET /status: public, component-level service status and incidents (#115).
@@ -45,6 +46,38 @@ router.get('/', async (_req, res) => {
     incidents: loadIncidents(process.env.STATUS_INCIDENTS_FILE || defaultIncidentsFile),
     now: new Date(),
   });
+  let database: {
+    integrity: string;
+    checkedAt: string | null;
+    schemaVersion: string | number | null;
+  } = {
+    integrity: 'unknown',
+    checkedAt: null,
+    schemaVersion: null,
+  };
+  try {
+    const latest = await getLatestIntegrityStatus();
+    database = {
+      integrity: latest?.integrity ?? 'unknown',
+      checkedAt: latest?.checkedAt ?? null,
+      schemaVersion: latest?.schemaVersion ?? null,
+    };
+  } catch {
+    database = {
+      integrity: 'unknown',
+      checkedAt: null,
+      schemaVersion: null,
+    };
+  }
+  const status = {
+    ...buildStatus({
+      rpcCircuit,
+      pendingSubmissions,
+      incidents: loadIncidents(process.env.STATUS_INCIDENTS_FILE || defaultIncidentsFile),
+      now: new Date(),
+    }),
+    database,
+  };
   res.set('Cache-Control', 'public, max-age=30');
   res.status(200).json(status);
 });
