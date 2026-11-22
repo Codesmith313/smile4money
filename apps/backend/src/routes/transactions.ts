@@ -12,7 +12,7 @@ router.post("/sponsor", async (req, res) => {
       .status(503)
       .json(
         errorEnvelope(
-          ErrorCode.INTERNAL_ERROR,
+          ErrorCode.SERVICE_UNAVAILABLE,
           "Fee sponsorship is currently unavailable. Please try again later.",
         ),
       );

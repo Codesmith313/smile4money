@@ -1557,6 +1557,7 @@ Errors from API endpoints use the following envelope:
   "error": {
     "code": "VALIDATION_ERROR",
     "message": "gameId is required",
+    "details": {},
     "requestId": "8b7c7638f9ea9b31",
     "correlationId": "4bf92f3577b34da6a3ce929d0e0e4736",
     "timestamp": "2026-11-20T22:00:00.000Z"
@@ -1566,27 +1567,28 @@ Errors from API endpoints use the following envelope:
 
 - `error.code` — a stable, machine-readable string. API consumers should branch on this, not on `error.message` (which is meant for humans and may be reworded).
 - `error.message` — a human-readable description of what went wrong.
+- `error.details` — an object with safe diagnostic context, or `{}` when none is available.
 - `error.requestId` — the request span ID, which can be shared with support.
 - `error.correlationId` — the trace ID included in related structured logs.
 - `error.timestamp` — the UTC time when the error response was created.
 - `X-Request-ID` and `X-Correlation-ID` response headers expose the same identifiers; `traceparent` also carries the W3C trace context.
 
-Some error responses include additional fields inside `error` (e.g. `error.hint`) for extra machine-readable context, but `code` and `message` are always present.
+Additional diagnostic fields such as `error.hint` may also be present for backward compatibility; `error.details` is the standard location for that context.
 
-`/api/validate-game`'s failure responses are the one exception: because that endpoint's job is to report on a game's validity as a normal (non-exceptional) outcome, its `valid`/`platform`/`gameId`/`message` fields are also present at the top level alongside `error`, for backward compatibility with existing consumers of that specific endpoint.
-
-The existing `/health` 503 payload keeps its `status`, `error`, and `dependencies` fields; it includes `requestId`, `correlationId`, and `timestamp` at the top level. These IDs match the response headers and structured logs.
+`/api/validate-game` also retains its `valid`/`platform`/`gameId`/`message` fields at the top level for backward compatibility. A failed `/health` response uses the same error envelope; health status and dependency diagnostics are included in `error.details`.
 
 ### Error Codes
 
 | Code | HTTP Status | Meaning |
 |---|---|---|
-| `VALIDATION_ERROR` | 400 | The request body or its fields are missing, malformed, or fail a business rule. |
+| `VALIDATION_ERROR` | 400, 422 | The request body or its fields are missing, malformed, or fail a business rule. |
 | `UNAUTHORIZED` | 401 | The `Authorization` header is missing, malformed, or the JWT is invalid/expired. |
 | `FORBIDDEN` | 403 | The caller is authenticated but is not allowed to perform the action. |
 | `NOT_FOUND` | 404 | The referenced resource (a match, a game on the upstream chess platform) does not exist. |
 | `CONFLICT` | 409 | The request conflicts with existing state (e.g. a duplicate `gameId`). |
 | `RATE_LIMITED` | 429 | The caller has exceeded the endpoint's rate limit. |
+| `SERVICE_UNAVAILABLE` | 503 | The service or a required dependency is temporarily unavailable. |
+| `UPSTREAM_TIMEOUT` | 504 | A required upstream service did not respond in time. |
 | `INTERNAL_ERROR` | 500 | An unexpected server-side failure. |
 
 This mapping lives in `apps/backend/src/errors/errorResponse.ts` (`ErrorCode`, `errorEnvelope`, `statusToErrorCode`) — that module is the source of truth if this table and the code ever disagree.
@@ -1615,6 +1617,7 @@ curl -s -X POST http://localhost:4000/api/matches \
   "error": {
     "code": "VALIDATION_ERROR",
     "message": "player2 is required",
+    "details": {},
     "requestId": "8b7c7638f9ea9b31",
     "correlationId": "4bf92f3577b34da6a3ce929d0e0e4736",
     "timestamp": "2026-11-20T22:00:00.000Z"

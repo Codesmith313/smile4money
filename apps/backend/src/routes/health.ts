@@ -1,6 +1,10 @@
 import { Router } from 'express';
 import { runHealthCheck } from '../services/health-service.js';
-import { errorMetadata } from '../errors/errorResponse.js';
+import {
+  ErrorCode,
+  errorEnvelope,
+  userFacingErrorMessage,
+} from '../errors/errorResponse.js';
 
 const router = Router();
 const startTime = Date.now();
@@ -19,10 +23,15 @@ router.get('/', async (req, res) => {
   });
 
   if (!result.ok) {
-    return res.status(503).json({
-      ...result.payload,
-      ...errorMetadata(),
-    });
+    const { error, ...details } = result.payload;
+    return res
+      .status(503)
+      .json(
+        errorEnvelope(ErrorCode.SERVICE_UNAVAILABLE, userFacingErrorMessage(503), {
+          ...details,
+          healthError: error,
+        }),
+      );
   }
 
   return res.status(200).json(result.payload);

@@ -103,6 +103,23 @@ export function errorToHttpStatus(error: unknown): number {
     return 504;
   }
 
+  if (error && typeof error === 'object') {
+    const status =
+      'status' in error
+        ? error.status
+        : 'statusCode' in error
+          ? error.statusCode
+          : undefined;
+    if (
+      typeof status === 'number' &&
+      Number.isInteger(status) &&
+      status >= 400 &&
+      status <= 599
+    ) {
+      return status;
+    }
+  }
+
   // 500 — anything else is an unexpected server-side failure.
   return 500;
 }

@@ -13,6 +13,7 @@ describe('errorEnvelope (#50)', () => {
     expect(body.error).toMatchObject({
       code: 'VALIDATION_ERROR',
       message: 'bad input',
+      details: {},
       requestId: expect.stringMatching(/^[a-f0-9]{16}$/),
       correlationId: expect.stringMatching(/^[a-f0-9]{32}$/),
       timestamp: expect.any(String),
@@ -26,6 +27,7 @@ describe('errorEnvelope (#50)', () => {
     expect(body.error).toMatchObject({
       code: 'NOT_FOUND',
       message: 'missing',
+      details: { hint: 'check the id' },
       hint: 'check the id',
       requestId: expect.any(String),
       correlationId: expect.any(String),
@@ -37,6 +39,7 @@ describe('errorEnvelope (#50)', () => {
     expect(errorEnvelope('CUSTOM_CODE', 'x').error).toMatchObject({
       code: 'CUSTOM_CODE',
       message: 'x',
+      details: {},
       requestId: expect.any(String),
       correlationId: expect.any(String),
       timestamp: expect.any(String),
@@ -81,6 +84,11 @@ describe('statusToErrorCode (#50)', () => {
 
   it('maps 429 to RATE_LIMITED', () => {
     expect(statusToErrorCode(429)).toBe(ErrorCode.RATE_LIMITED);
+  });
+
+  it('maps 503 and 504 to their service error codes', () => {
+    expect(statusToErrorCode(503)).toBe(ErrorCode.SERVICE_UNAVAILABLE);
+    expect(statusToErrorCode(504)).toBe(ErrorCode.UPSTREAM_TIMEOUT);
   });
 
   it('maps any other status to INTERNAL_ERROR', () => {

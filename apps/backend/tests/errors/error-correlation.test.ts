@@ -75,14 +75,19 @@ describe("error correlation metadata", () => {
 
     const response = await request(createApp()).get("/health");
     expect(response.status).toBe(503);
-    expect(response.body).toMatchObject({
+    expect(response.body.error).toMatchObject({
+      code: "SERVICE_UNAVAILABLE",
+      details: {
+        status: "error",
+        dependencies: { stellar_rpc: "unreachable" },
+      },
       requestId: expect.stringMatching(/^[a-f0-9]{16}$/),
       correlationId: expect.stringMatching(/^[a-f0-9]{32}$/),
       timestamp: expect.any(String),
     });
-    expect(response.headers["x-request-id"]).toBe(response.body.requestId);
+    expect(response.headers["x-request-id"]).toBe(response.body.error.requestId);
     expect(response.headers["x-correlation-id"]).toBe(
-      response.body.correlationId,
+      response.body.error.correlationId,
     );
   });
 });

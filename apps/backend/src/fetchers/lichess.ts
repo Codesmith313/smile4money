@@ -4,8 +4,11 @@ import {
   evidenceFor,
   normalizeResult,
 } from './result.js';
-import axios from 'axios';
 import { RateLimitError } from '../errors/RateLimitError.js';
+import {
+  ProviderFetchError,
+  providerGet,
+} from './provider-validation.js';
 
 /** Maps to the on-chain MatchResult enum. */
 export type MatchResult = 'Player1Wins' | 'Player2Wins' | 'Draw';
@@ -93,7 +96,7 @@ export async function fetchLichessResult(gameId: string): Promise<NormalizedGame
   const url = `https://lichess.org/game/export/${encodeURIComponent(gameId)}`;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const response = await axios.get(url, {
+    const response = await providerGet(url, {
       headers: {
         Accept: 'application/json',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -118,6 +121,12 @@ export async function fetchLichessResult(gameId: string): Promise<NormalizedGame
     }
 
     if (response.status !== 200) {
+      if (response.status >= 500) {
+        throw new ProviderFetchError(
+          'unavailable',
+          `Lichess API error: ${response.status}`,
+        );
+      }
       throw new Error(`Lichess API error: ${response.status}`);
     }
 

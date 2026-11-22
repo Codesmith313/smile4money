@@ -11,7 +11,7 @@ import { currentTraceContext, newTraceContext } from '../tracing/trace-context.j
  *
  * Every error response now follows one schema:
  *
- *   { "error": { "code": "SOME_CODE", "message": "human-readable text" } }
+ *   { "error": { "code": "SOME_CODE", "message": "...", "details": {} } }
  *
  * documented in docs/api-reference.md. Route handlers should build their
  * error body with `errorEnvelope()` below rather than hand-rolling one.
@@ -25,6 +25,8 @@ export const ErrorCode = {
   NOT_FOUND: 'NOT_FOUND',
   CONFLICT: 'CONFLICT',
   RATE_LIMITED: 'RATE_LIMITED',
+  SERVICE_UNAVAILABLE: 'SERVICE_UNAVAILABLE',
+  UPSTREAM_TIMEOUT: 'UPSTREAM_TIMEOUT',
   INTERNAL_ERROR: 'INTERNAL_ERROR',
 } as const;
 
@@ -34,6 +36,7 @@ export interface ErrorEnvelope {
   error: {
     code: string;
     message: string;
+    details: Record<string, unknown>;
     [extra: string]: unknown;
   };
 }
@@ -55,22 +58,25 @@ export function errorMetadata(): ErrorMetadata {
 }
 
 /**
- * Builds the standard `{ error: { code, message } }` response body.
+ * Builds the standard error response body. `details` is always present;
+ * additional fields are mirrored at the error level for existing clients.
  *
  * `extra` merges additional diagnostic fields (e.g. a machine-readable
- * `hint`) into the `error` object, never onto the top-level response body —
- * every error response must have exactly one top-level key, `error`.
+ * `hint`) into the `error` object. The returned envelope has one top-level
+ * key, `error`.
  */
 export function errorEnvelope(
   code: ErrorCode | string,
   message: string,
   extra?: Record<string, unknown>,
 ): ErrorEnvelope {
+  const details = extra ?? {};
   return {
     error: {
+      ...extra,
       code,
       message,
-      ...extra,
+      details,
       ...errorMetadata(),
     },
   };
@@ -88,6 +94,8 @@ export function errorEnvelope(
 export function statusToErrorCode(status: number): ErrorCode {
   switch (status) {
     case 400:
+    case 413:
+    case 415:
       return ErrorCode.VALIDATION_ERROR;
     case 401:
       return ErrorCode.UNAUTHORIZED;
@@ -101,6 +109,10 @@ export function statusToErrorCode(status: number): ErrorCode {
       return ErrorCode.VALIDATION_ERROR;
     case 429:
       return ErrorCode.RATE_LIMITED;
+    case 503:
+      return ErrorCode.SERVICE_UNAVAILABLE;
+    case 504:
+      return ErrorCode.UPSTREAM_TIMEOUT;
     default:
       return ErrorCode.INTERNAL_ERROR;
   }
@@ -111,6 +123,10 @@ export function userFacingErrorMessage(status: number): string {
   switch (status) {
     case 400:
       return 'Check the request details and try again.';
+    case 413:
+      return 'The request is too large. Reduce its size and try again.';
+    case 415:
+      return 'The request format is not supported.';
     case 401:
       return 'Sign in with a valid account and try again.';
     case 403:
