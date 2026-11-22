@@ -15,32 +15,14 @@ import { resolveNetworkConfig } from './network.js';
 /** Default maximum number of poll retries before a job is moved to the DLQ. */
 const DEFAULT_POLLING_MAX_RETRIES = 5;
 
-/** Default number of days a DLQ entry is retained before automatic eviction. */
-const DEFAULT_DLQ_TTL_DAYS = 7;
+/** Default interval (ms) at which queue metrics are refreshed. */
+const DEFAULT_QUEUE_METRICS_INTERVAL_MS = 15_000;
 
-/** Default interval between DLQ expiration sweeps, in milliseconds (1 hour). */
-const DEFAULT_DLQ_EXPIRATION_INTERVAL_MS = 3_600_000;
+/** Default interval (ms) at which queue progress is sampled for stall detection. */
+const DEFAULT_QUEUE_STALL_INTERVAL_MS = 30_000;
 
-/** Default base delay for exponential backoff, in milliseconds. */
-const DEFAULT_BACKOFF_BASE_DELAY_MS = 1_000;
-
-/** Default maximum delay cap for exponential backoff, in milliseconds. */
-const DEFAULT_BACKOFF_MAX_DELAY_MS = 300_000;
-
-/** Default exponential backoff multiplier. */
-const DEFAULT_BACKOFF_MULTIPLIER = 2;
-
-/**
- * Parses a required-positive-integer environment variable.
- *
- * Rules:
- *  - If the variable is absent or empty, `defaultValue` is used.
- *  - If the variable is present but not a valid integer, startup fails.
- *  - If the parsed value is zero or negative, startup fails.
- *
- * @throws {Error} when the value is non-integer, zero, or negative.
- */
-function parsePositiveInt(name: string, defaultValue: number): number {
+/** Default number of consecutive no-progress intervals before a stall alert. */
+const DEFAULT_QUEUE_STALL_THRESHOLD = 3;
 /** Default directory where encrypted database backups are written. */
 const DEFAULT_BACKUP_DIR = './backups';
 
@@ -266,6 +248,37 @@ function parsePollingMaxRetries(): number {
   return parsed;
 }
 
+/**
+ * Parses a positive-integer environment variable, falling back to `defaultValue`
+ * when the variable is absent or empty.
+ *
+ * Rules:
+ *  - If the variable is absent or empty, the default is used.
+ *  - If the variable is present but not a valid integer, startup fails.
+ *  - If the parsed value is zero or negative, startup fails.
+ *
+ * @throws {Error} when the value is non-integer, zero, or negative.
+ */
+function parsePositiveInt(name: string, defaultValue: number): number {
+  const raw = process.env[name];
+
+  if (raw === undefined || raw === '') {
+    return defaultValue;
+  }
+
+  const parsed = parseInt(raw, 10);
+
+  if (isNaN(parsed) || !Number.isInteger(parsed)) {
+    throw new Error(`${name} must be a positive integer, got: "${raw}"`);
+  }
+
+  if (parsed <= 0) {
+    throw new Error(`${name} must be greater than zero, got: ${parsed}`);
+  }
+
+  return parsed;
+}
+
 export interface Env {
   /** Stellar network to connect to (e.g. "testnet", "mainnet"). */
   stellarNetwork: string;
@@ -295,78 +308,31 @@ export interface Env {
   pollingMaxRetries: number;
 
   /**
-   * Number of days a dead-letter-queue entry is retained before it is
-   * automatically evicted by the expiration job.
+   * How often (in milliseconds) queue monitoring metrics — depth, age of the
+   * oldest entry and success rate — are refreshed.
    *
-   * Sourced from DLQ_TTL_DAYS. Defaults to 7 when unset.
-   * Must be a positive integer — zero and negative values are rejected at startup.
+   * Sourced from QUEUE_METRICS_INTERVAL_MS. Defaults to 15000 when unset.
+   * Must be a positive integer.
    */
-  dlqTtlDays: number;
+  queueMetricsIntervalMs: number;
 
   /**
-   * Interval between DLQ expiration sweeps, in milliseconds.
+   * Sampling interval (in milliseconds) used by queue stall detection to
+   * compare progress between consecutive intervals.
    *
-   * Sourced from DLQ_EXPIRATION_INTERVAL_MS. Defaults to 3600000 (1 hour).
-   * Must be a positive integer — zero and negative values are rejected at startup.
+   * Sourced from QUEUE_STALL_INTERVAL_MS. Defaults to 30000 when unset.
+   * Must be a positive integer.
    */
-  dlqExpirationIntervalMs: number;
+  queueStallIntervalMs: number;
 
   /**
-   * Global base delay for exponential backoff, in milliseconds.
+   * Number of consecutive no-progress intervals after which the queue is
+   * considered stalled and an alert is sent.
    *
-   * Sourced from BACKOFF_BASE_DELAY_MS. Defaults to 1000.
+   * Sourced from QUEUE_STALL_THRESHOLD. Defaults to 3 when unset.
+   * Must be a positive integer.
    */
-  backoffBaseDelayMs: number;
-
-  /**
-   * Global maximum delay cap for exponential backoff, in milliseconds.
-   *
-   * Sourced from BACKOFF_MAX_DELAY_MS. Defaults to 300000.
-   */
-  backoffMaxDelayMs: number;
-
-  /**
-   * Global exponential backoff multiplier.
-   *
-   * Sourced from BACKOFF_MULTIPLIER. Defaults to 2.
-   */
-  backoffMultiplier: number;
-
-  /**
-   * Per-job-type backoff overrides, keyed by the normalised job type
-   * (e.g. "GAME_RESULT"). Job types without an entry use the global values.
-   */
-  backoffOverrides: Record<string, BackoffConfig>;
-}
-
-/**
- * Returns the effective exponential backoff configuration for a job type.
- * Falls back to the global backoff settings when no override is configured.
- *
- * @param jobType Job type identifier (e.g. "game-result", "GameResult").
- */
-export function getBackoffConfig(jobType: string): BackoffConfig {
-  const override = env.backoffOverrides[jobTypeEnvKey(jobType)];
-
-  if (override) {
-    return { ...override };
-  }
-
-  return {
-    baseDelayMs: env.backoffBaseDelayMs,
-    maxDelayMs: env.backoffMaxDelayMs,
-    multiplier: env.backoffMultiplier,
-  };
-}
-
-/** Returns the configured DLQ entry TTL in days. */
-export function getDlqTtlDays(): number {
-  return env.dlqTtlDays;
-}
-
-/** Returns the configured DLQ expiration sweep interval in milliseconds. */
-export function getDlqExpirationIntervalMs(): number {
-  return env.dlqExpirationIntervalMs;
+  queueStallThreshold: number;
   /** Directory where encrypted database backups are written (#2191). */
   backupDir: string;
 
@@ -428,16 +394,17 @@ function loadEnv(): Env {
     lichessApiToken: process.env.LICHESS_API_TOKEN ?? '',
     chessdotcomApiKey: process.env.CHESSDOTCOM_API_KEY ?? '',
     pollingMaxRetries: parsePollingMaxRetries(),
-    dlqTtlDays: parseDlqTtlDays(),
-    dlqExpirationIntervalMs: parseDlqExpirationIntervalMs(),
-    backoffBaseDelayMs,
-    backoffMaxDelayMs,
-    backoffMultiplier,
-    backoffOverrides: parseBackoffOverrides({
-      baseDelayMs: backoffBaseDelayMs,
-      maxDelayMs: backoffMaxDelayMs,
-      multiplier: backoffMultiplier,
-    }),
+    queueMetricsIntervalMs: parsePositiveInt(
+      'QUEUE_METRICS_INTERVAL_MS',
+      DEFAULT_QUEUE_METRICS_INTERVAL_MS
+    ),
+    queueStallIntervalMs: parsePositiveInt(
+      'QUEUE_STALL_INTERVAL_MS',
+      DEFAULT_QUEUE_STALL_INTERVAL_MS
+    ),
+    queueStallThreshold: parsePositiveInt(
+      'QUEUE_STALL_THRESHOLD',
+      DEFAULT_QUEUE_STALL_THRESHOLD
     backupDir: parseString('BACKUP_DIR', DEFAULT_BACKUP_DIR),
     backupIntervalMs: parsePositiveInt(
       'BACKUP_INTERVAL_MS',

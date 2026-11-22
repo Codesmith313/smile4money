@@ -59,6 +59,59 @@ export class ConflictError extends Error {
 }
 
 /**
+ * Stable, machine-readable identifiers for each error category. Used by the
+ * central error handler to look up the recovery suggestion and documentation
+ * link that accompany an error response (#2177).
+ */
+export type ErrorCode =
+  | 'PROVIDER_FETCH_ERROR'
+  | 'VALIDATION_ERROR'
+  | 'NOT_FOUND'
+  | 'CONFLICT'
+  | 'RATE_LIMIT'
+  | 'RPC_TIMEOUT'
+  | 'INTERNAL_ERROR';
+
+/**
+ * Maps a thrown/caught error to its stable `ErrorCode`. Unrecognized errors
+ * fall back to `'INTERNAL_ERROR'`. This preserves the error's class identity
+ * for suggestion lookup while `errorToHttpStatus` keeps owning the numeric
+ * status decision.
+ */
+export function errorToCode(error: unknown): ErrorCode {
+  if (error instanceof ProviderFetchError) {
+    return 'PROVIDER_FETCH_ERROR';
+  }
+
+  if (error instanceof ValidationError) {
+    return 'VALIDATION_ERROR';
+  }
+
+  if (
+    error instanceof NotFoundError ||
+    error instanceof LichessFetcherGameNotFoundError ||
+    error instanceof LichessServiceGameNotFoundError ||
+    error instanceof UserNotFoundError
+  ) {
+    return 'NOT_FOUND';
+  }
+
+  if (error instanceof ConflictError) {
+    return 'CONFLICT';
+  }
+
+  if (RateLimitError.isRateLimitError(error)) {
+    return 'RATE_LIMIT';
+  }
+
+  if (RpcTimeoutError.isRpcTimeoutError(error)) {
+    return 'RPC_TIMEOUT';
+  }
+
+  return 'INTERNAL_ERROR';
+}
+
+/**
  * Maps a thrown/caught error to the HTTP status code a route handler should
  * respond with. Falls back to 500 for anything unrecognized, since an
  * unrecognized error is, by definition, an unexpected server-side failure.
@@ -101,6 +154,23 @@ export function errorToHttpStatus(error: unknown): number {
   // downstream dependency did not respond in time.
   if (RpcTimeoutError.isRpcTimeoutError(error)) {
     return 504;
+  }
+
+  if (error && typeof error === 'object') {
+    const status =
+      'status' in error
+        ? error.status
+        : 'statusCode' in error
+          ? error.statusCode
+          : undefined;
+    if (
+      typeof status === 'number' &&
+      Number.isInteger(status) &&
+      status >= 400 &&
+      status <= 599
+    ) {
+      return status;
+    }
   }
 
   // 500 — anything else is an unexpected server-side failure.

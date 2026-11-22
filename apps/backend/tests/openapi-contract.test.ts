@@ -61,6 +61,22 @@ describe('openapi.json', () => {
     );
   });
 
+  it('requires details and correlation metadata on the shared error envelope', () => {
+    expect(spec.components.schemas.ErrorEnvelope.properties.error.required).toEqual(
+      expect.arrayContaining([
+        'code',
+        'message',
+        'details',
+        'requestId',
+        'correlationId',
+        'timestamp',
+      ]),
+    );
+    expect(
+      spec.components.schemas.ErrorEnvelope.properties.error.properties.details.type,
+    ).toBe('object');
+  });
+
   it('has a semantic version', () => {
     expect(spec.info.version).toMatch(/^\d+\.\d+\.\d+$/);
   });

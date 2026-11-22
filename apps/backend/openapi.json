@@ -310,6 +310,8 @@
           "NOT_FOUND",
           "CONFLICT",
           "RATE_LIMITED",
+          "SERVICE_UNAVAILABLE",
+          "UPSTREAM_TIMEOUT",
           "INTERNAL_ERROR"
         ]
       },
@@ -324,6 +326,7 @@
             "required": [
               "code",
               "message",
+              "details",
               "requestId",
               "correlationId",
               "timestamp"
@@ -334,6 +337,11 @@
               },
               "message": {
                 "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "description": "Additional safe diagnostic context; empty when none is available.",
+                "additionalProperties": true
               },
               "requestId": {
                 "type": "string",
@@ -410,42 +418,7 @@
         }
       },
       "HealthError": {
-        "type": "object",
-        "required": [
-          "status",
-          "uptime",
-          "version",
-          "error",
-          "dependencies"
-        ],
-        "properties": {
-          "status": {
-            "type": "string",
-            "enum": [
-              "error"
-            ]
-          },
-          "uptime": {
-            "type": "number"
-          },
-          "version": {
-            "type": "string"
-          },
-          "error": {
-            "type": "string"
-          },
-          "dependencies": {
-            "type": "object",
-            "properties": {
-              "stellar_rpc": {
-                "type": "string",
-                "enum": [
-                  "unreachable"
-                ]
-              }
-            }
-          }
-        }
+        "$ref": "#/components/schemas/ErrorEnvelope"
       },
       "CreateMatchRequest": {
         "type": "object",
@@ -610,7 +583,11 @@
             "type": "object",
             "required": [
               "code",
-              "message"
+              "message",
+              "details",
+              "requestId",
+              "correlationId",
+              "timestamp"
             ],
             "properties": {
               "code": {
@@ -618,6 +595,20 @@
               },
               "message": {
                 "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "requestId": {
+                "type": "string"
+              },
+              "correlationId": {
+                "type": "string"
+              },
+              "timestamp": {
+                "type": "string",
+                "format": "date-time"
               }
             }
           }

@@ -1,5 +1,10 @@
 import { Router } from 'express';
 import { runHealthCheck } from '../services/health-service.js';
+import {
+  ErrorCode,
+  errorEnvelope,
+  userFacingErrorMessage,
+} from '../errors/errorResponse.js';
 
 const router = Router();
 const startTime = Date.now();
@@ -12,13 +17,22 @@ router.get('/', async (req, res) => {
     deepCheck: process.env.DEEP_HEALTH === 'true',
     includeLimiters: process.env.HEALTH_INCLUDE_LIMITERS === 'true',
     includeSettlement: process.env.HEALTH_INCLUDE_SETTLEMENT === 'true',
+    includeQueue: process.env.HEALTH_INCLUDE_QUEUE === 'true',
     includeDatabase: process.env.HEALTH_INCLUDE_DATABASE === 'true',
     uptimeSeconds,
     version,
   });
 
   if (!result.ok) {
-    return res.status(503).json(result.payload);
+    const { error, ...details } = result.payload;
+    return res
+      .status(503)
+      .json(
+        errorEnvelope(ErrorCode.SERVICE_UNAVAILABLE, userFacingErrorMessage(503), {
+          ...details,
+          healthError: error,
+        }),
+      );
   }
 
   return res.status(200).json(result.payload);

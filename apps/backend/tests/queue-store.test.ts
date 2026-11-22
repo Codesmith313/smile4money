@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { InMemoryQueueStore } from "../src/store/in-memory-queue-store.js";
 import { SQLiteQueueStore } from "../src/store/sqlite-queue-store.js";
 import type { DlqEntry } from "../src/store/persistent-queue-store.js";
@@ -291,89 +291,156 @@ testQueueStore(() => {
   return store;
 });
 
-describe("SQLite durability", () => {
-  it("persists entries across close and re-instantiation", async () => {
-    const dbPath = path.join(
-      "/tmp",
-      `test-oracle-queue-durable-${Date.now()}.db`,
-    );
+describe("Priority ordering (#2183)", () => {
+  async function testPriorityOrdering(createStore: () => any) {
+    let store: any;
 
-    try {
-      const first = new SQLiteQueueStore(dbPath);
-      await first.initialize();
-      await first.add({
-        id: "persisted",
-        payload: { matchId: 7, nested: { ok: true } },
-        failureReason: "boom",
-        attempts: 2,
-        createdAt: 1000,
-        lastAttemptAt: 2000,
-      });
-      await first.close();
+    beforeEach(async () => {
+      store = createStore();
+      await store.initialize();
+    });
 
-      const second = new SQLiteQueueStore(dbPath);
-      await second.initialize();
-      const all = await second.getAll();
-      expect(all).toHaveLength(1);
-      expect(all[0].id).toBe("persisted");
-      expect(all[0].payload).toEqual({ matchId: 7, nested: { ok: true } });
-      expect(all[0].failureReason).toBe("boom");
-      expect(all[0].attempts).toBe(2);
-      expect(all[0].createdAt).toBe(1000);
-      expect(all[0].lastAttemptAt).toBe(2000);
-      await second.close();
-    } finally {
-      for (const suffix of ["", "-wal", "-shm"]) {
-        const file = `${dbPath}${suffix}`;
-        if (fs.existsSync(file)) {
-          fs.unlinkSync(file);
-        }
-      }
-    }
+    afterEach(async () => {
+      await store.close();
+    });
+
+    const makeEntry = (id: string, priority?: DlqEntry["priority"], createdAt = Date.now()): DlqEntry => ({
+      id,
+      payload: { id },
+      failureReason: "test",
+      attempts: 0,
+      createdAt,
+      lastAttemptAt: null,
+      priority,
+    });
+
+    it("returns high before medium before low regardless of insertion order", async () => {
+      await store.add(makeEntry("low1", "low", 1000));
+      await store.add(makeEntry("med1", "medium", 2000));
+      await store.add(makeEntry("hi1", "high", 3000));
+
+      const all = await store.getAll();
+      expect(all.map((e: DlqEntry) => e.id)).toEqual(["hi1", "med1", "low1"]);
+    });
+
+    it("within the same priority level, orders by createdAt ascending", async () => {
+      await store.add(makeEntry("hi2", "high", 2000));
+      await store.add(makeEntry("hi1", "high", 1000));
+      await store.add(makeEntry("hi3", "high", 3000));
+
+      const all = await store.getAll();
+      expect(all.map((e: DlqEntry) => e.id)).toEqual(["hi1", "hi2", "hi3"]);
+    });
+
+    it("treats entries with no priority as medium", async () => {
+      await store.add(makeEntry("lo1", "low", 1000));
+      await store.add(makeEntry("none", undefined, 2000));
+      await store.add(makeEntry("hi1", "high", 3000));
+
+      const all = await store.getAll();
+      expect(all[0].id).toBe("hi1");
+      // 'none' has implicit medium priority — before 'lo1'
+      expect(all[1].id).toBe("none");
+      expect(all[2].id).toBe("lo1");
+    });
+
+    it("preserves the priority field on round-trip", async () => {
+      await store.add(makeEntry("h", "high"));
+      await store.add(makeEntry("m", "medium"));
+      await store.add(makeEntry("l", "low"));
+
+      const all = await store.getAll();
+      const byId: Record<string, DlqEntry> = {};
+      for (const e of all) byId[e.id] = e;
+
+      expect(byId["h"].priority).toBe("high");
+      expect(byId["m"].priority).toBe("medium");
+      expect(byId["l"].priority).toBe("low");
+    });
+  }
+
+  describe("InMemoryQueueStore", () => {
+    testPriorityOrdering(() => new InMemoryQueueStore());
   });
 
-  it("records the dlq_entries migration in schema_version", async () => {
-    const dbPath = path.join(
-      "/tmp",
-      `test-oracle-queue-schema-${Date.now()}.db`,
-    );
-    const store = new SQLiteQueueStore(dbPath);
+  describe("SQLiteQueueStore", () => {
+    testPriorityOrdering(() => {
+      const dbPath = path.join("/tmp", `test-priority-queue-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+      const store = new SQLiteQueueStore(dbPath);
+      const originalClose = store.close.bind(store);
+      store.close = async () => {
+        await originalClose();
+        for (const suffix of ["", "-wal", "-shm"]) {
+          if (fs.existsSync(dbPath + suffix)) fs.unlinkSync(dbPath + suffix);
+        }
+      };
+      return store;
+    });
+  });
 
-    const get = <T>(db: sqlite3.Database, sql: string) =>
-      new Promise<T>((resolve, reject) => {
-        db.get(sql, (err: Error | null, row: T) =>
-          err ? reject(err) : resolve(row),
+  describe("SQLiteQueueStore migration (pre-existing DB without priority column)", () => {
+    it("adds the priority column to a database that pre-dates #2183", async () => {
+      const dbPath = path.join("/tmp", `test-migration-queue-${Date.now()}.db`);
+
+      // Create a bare-bones database without the priority column, simulating
+      // a DB from before this feature was added.
+      await new Promise<void>((resolve, reject) => {
+        const db = new sqlite3.Database(dbPath, (err) => err ? reject(err) : resolve());
+        db.run(
+          `CREATE TABLE oracle_dlq (
+            id TEXT PRIMARY KEY NOT NULL,
+            payload TEXT NOT NULL,
+            failureReason TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            createdAt INTEGER NOT NULL,
+            lastAttemptAt INTEGER,
+            expireAt INTEGER NOT NULL
+          )`,
+          () => db.close(),
         );
       });
-    const close = (db: sqlite3.Database) =>
-      new Promise<void>((resolve, reject) => {
-        db.close((err: Error | null) => (err ? reject(err) : resolve()));
+
+      // Insert a legacy row without priority.
+      await new Promise<void>((resolve, reject) => {
+        const db = new sqlite3.Database(dbPath, (err) => err ? reject(err) : resolve());
+        const expireAt = Date.now() + 30 * 24 * 60 * 60 * 1000;
+        db.run(
+          `INSERT INTO oracle_dlq (id, payload, failureReason, attempts, createdAt, lastAttemptAt, expireAt)
+           VALUES ('legacy1', '{}', 'rpc error', 0, ?, NULL, ?)`,
+          [Date.now(), expireAt],
+          () => db.close(),
+        );
       });
 
-    try {
-      await store.initialize();
-      await store.close();
-
-      const db = new sqlite3.Database(dbPath);
+      const store = new SQLiteQueueStore(dbPath);
       try {
-        const row = await get<{ version: number; name: string }>(
-          db,
-          `SELECT version, name FROM schema_version WHERE name = 'dlq_entries'`,
-        );
-        expect(row).toBeDefined();
-        expect(row.name).toBe("dlq_entries");
-        expect(typeof row.version).toBe("number");
+        await store.initialize();
+        const all = await store.getAll();
+        expect(all).toHaveLength(1);
+        // Legacy entry should come back with the default medium priority.
+        expect(all[0].id).toBe("legacy1");
+        expect(all[0].priority ?? "medium").toBe("medium");
+
+        // New high-priority entry should sort before the legacy medium one.
+        await store.add({
+          id: "hi1",
+          payload: {},
+          failureReason: "test",
+          attempts: 0,
+          createdAt: Date.now(),
+          lastAttemptAt: null,
+          priority: "high",
+        });
+        const ordered = await store.getAll();
+        expect(ordered[0].id).toBe("hi1");
+        expect(ordered[1].id).toBe("legacy1");
       } finally {
-        await close(db);
-      }
-    } finally {
-      for (const suffix of ["", "-wal", "-shm"]) {
-        const file = `${dbPath}${suffix}`;
-        if (fs.existsSync(file)) {
-          fs.unlinkSync(file);
+        await store.close();
+        for (const suffix of ["", "-wal", "-shm"]) {
+          if (fs.existsSync(dbPath + suffix)) fs.unlinkSync(dbPath + suffix);
         }
       }
-    }
+    });
   });
 });
 

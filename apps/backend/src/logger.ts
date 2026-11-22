@@ -23,6 +23,12 @@ const NUMERIC_FIELDS = new Set([
   'cooldown',
   'failureCount',
   'durationMs',
+  'queue_depth',
+  'oldest_entry_age_ms',
+  'success_rate',
+  'processed',
+  'failed',
+  'progress_delta',
   'integrity_check_ms',
   'schema_version',
   'migration_version',
@@ -36,6 +42,8 @@ const ENUM_FIELDS: Record<string, readonly string[]> = {
   store: ['sqlite', 'memory', 'mongodb'],
   sqlite_error_code: ['SQLITE_BUSY', 'SQLITE_LOCKED'],
   metric: ['oracle_dlq_depth'],
+  replay_result: ['success', 'failed'],
+  stall_state: ['stalled', 'progressing'],
   integrity_status: ['ok', 'failed'],
 };
 const STRING_FIELD_PATTERNS: Record<string, RegExp> = {
@@ -45,6 +53,33 @@ const STRING_FIELD_PATTERNS: Record<string, RegExp> = {
   parent_span_id: /^[a-f0-9]{16}$/,
   request_id: /^[a-f0-9]{16}$/,
 };
+
+function safeErrorDetails(error: unknown): Record<string, unknown> {
+  if (!(error instanceof Error)) {
+    return { type: 'NonErrorThrown', valueType: typeof error };
+  }
+
+  const type = /^[A-Z][A-Za-z0-9_$]{0,58}Error$/.test(error.name)
+    ? error.name
+    : 'Error';
+  const stack = (error.stack ?? '')
+    .split('\n')
+    .slice(1)
+    .filter((frame) => /^\s+at\s/.test(frame))
+    .map((frame) =>
+      frame
+        .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[REDACTED]')
+        .replace(/\bBearer\s+\S+/gi, 'Bearer [REDACTED]')
+        .replace(/\b[GS][A-Z2-7]{55}\b/g, '[REDACTED]')
+        .replace(/\b\+?\d[\d(). -]{7,}\d\b/g, '[REDACTED]')
+        .replace(
+          /([?&](?:access_token|api[_-]?key|password|secret|token)=)[^&\s)]+/gi,
+          '$1[REDACTED]',
+        ),
+    );
+
+  return { type, stack };
+}
 
 /** Unknown fields and all arbitrary strings/errors are masked at the sink. */
 function safeLogValue(key: string, value: unknown): unknown {
@@ -66,12 +101,13 @@ function safeLogValue(key: string, value: unknown): unknown {
 }
 
 export function safeLogContext(
-  context: Record<string, unknown>,
+  context: object,
 ): Record<string, unknown> {
   return Object.fromEntries(
-    Object.entries(context)
+    Object.entries(context as Record<string, unknown>)
       .filter(
-        ([key]) =>
+        ([key, value]) =>
+          key === 'error' ||
           NUMERIC_FIELDS.has(key) ||
           Object.prototype.hasOwnProperty.call(ENUM_FIELDS, key) ||
           Object.prototype.hasOwnProperty.call(STRING_FIELD_PATTERNS, key) ||
@@ -86,11 +122,9 @@ export function safeLogContext(
  * Outputs JSON to stdout for easy parsing and forwarding to logging services.
  */
 
-interface LogContext {
-  [key: string]: any;
-}
+type LogContext = object;
 
-type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'critical';
 
 interface RecentError {
   firstLoggedAt: number;
@@ -105,14 +139,69 @@ const LEVEL_ORDER: Record<LogLevel, number> = {
   info: 1,
   warn: 2,
   error: 3,
+  critical: 4,
 };
+
+const SEVERITY_BY_LEVEL: Record<LogLevel, string> = {
+  debug: 'info',
+  info: 'info',
+  warn: 'warning',
+  error: 'error',
+  critical: 'critical',
+};
+
+/**
+ * Error severity classification, ordered from most to least severe.
+ * Used to categorize errors for filtering and severity-based alerting.
+ */
+export type Severity = 'critical' | 'error' | 'warning' | 'info';
+
+const SEVERITY_ORDER: Record<Severity, number> = {
+  critical: 0,
+  error: 1,
+  warning: 2,
+  info: 3,
+};
+
+/** Severities at or above this threshold raise an alert. */
+const ALERT_SEVERITIES: ReadonlySet<Severity> = new Set(['critical', 'error']);
+
+function configuredMinSeverity(): Severity {
+  const raw = (process.env.LOG_MIN_SEVERITY || '').toLowerCase();
+  if (raw === 'critical' || raw === 'error' || raw === 'warning' || raw === 'info') {
+    return raw;
+  }
+  return 'info';
+}
 
 function configuredLevel(): LogLevel {
   const raw = (process.env.LOG_LEVEL || '').toLowerCase();
-  if (raw === 'debug' || raw === 'info' || raw === 'warn' || raw === 'error') {
+  if (raw === 'warning') {
+    return 'warn';
+  }
+  if (
+    raw === 'debug' ||
+    raw === 'info' ||
+    raw === 'warn' ||
+    raw === 'error' ||
+    raw === 'critical'
+  ) {
     return raw;
   }
   return process.env.NODE_ENV === 'production' ? 'info' : 'debug';
+}
+
+/** Default suppression window for duplicate errors (1 minute). */
+const DEFAULT_DEDUP_WINDOW_MS = 60_000;
+
+function configuredDedupWindowMs(): number {
+  const raw = Number(process.env.LOG_DEDUP_WINDOW_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_DEDUP_WINDOW_MS;
+}
+
+interface DedupEntry {
+  firstSeen: number;
+  suppressed: number;
 }
 
 class Logger {
@@ -123,6 +212,11 @@ class Logger {
     return LEVEL_ORDER[level] >= LEVEL_ORDER[configuredLevel()];
   }
 
+  /** Returns true when an error of the given severity passes the configured severity filter. */
+  isSeverityEnabled(severity: Severity): boolean {
+    return SEVERITY_ORDER[severity] <= SEVERITY_ORDER[configuredMinSeverity()];
+  }
+
   private log(level: LogLevel, context: LogContext, message: string): void {
     if (!this.isLevelEnabled(level)) {
       return;
@@ -130,6 +224,7 @@ class Logger {
     const logEntry = {
       timestamp: new Date().toISOString(),
       level,
+      severity: SEVERITY_BY_LEVEL[level],
       service: 'smile4money-backend',
       message: LOG_EVENTS.has(message) ? message : 'log_event',
       ...safeLogContext(context),
@@ -241,6 +336,16 @@ class Logger {
       this.errorWithDeduplication({}, context);
     } else {
       this.errorWithDeduplication(context, message || '');
+    }
+    this.log('error', { ...ctx, severity }, msg);
+    this.maybeAlert(severity, ctx, msg);
+  }
+
+  critical(context: LogContext | string, message?: string): void {
+    if (typeof context === 'string') {
+      this.log('critical', {}, context);
+    } else {
+      this.log('critical', context, message || '');
     }
   }
 }

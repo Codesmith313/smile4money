@@ -14,8 +14,7 @@ import { getMaintainableQueueStore } from './queue.js';
 import { performLiveRestore, defaultRestoreRequestPath } from './store/live-restore.js';
 import type { DlqEntry } from './store/persistent-queue-store.js';
 import { startStorageCapacityMonitor, type CapacityLogger } from './store/storage-capacity.js';
-import { evictExpiredDlqEntries } from './store/dlq-expiration.js';
-import { config } from './config.js';
+import { startQueueStallDetector, type QueueStallDetectorOptions } from './store/queue-stall.js';
 import { startIntegrityCheckJob } from './store/integrity-check.js';
 
 export interface MaintenanceOptions {
@@ -24,6 +23,8 @@ export interface MaintenanceOptions {
   isSettled?: (entry: DlqEntry) => Promise<boolean>;
   /** Signal that triggers a restore. Default SIGUSR2. */
   signal?: NodeJS.Signals;
+  /** Queue stall detection tuning. Defaults come from config/env.ts. */
+  stall?: Partial<QueueStallDetectorOptions>;
   /** Retention period in days. Defaults to RETENTION_DAYS or 30. */
   retentionDays?: number;
   /** Archive job interval in ms. Defaults to ARCHIVE_INTERVAL_MS or 24h. */
@@ -115,6 +116,10 @@ export function installMaintenance(options: MaintenanceOptions): () => void {
     ? startIntegrityCheckJob(databases, options.logger)
     : () => {};
 
+  const stopStallDetector = startQueueStallDetector({
+    logger: options.logger,
+    ...options.stall,
+  });
   const archival = resolveArchivalOptions(options);
   let archiving = false;
   const runArchiveJob = () => {
@@ -184,7 +189,7 @@ export function installMaintenance(options: MaintenanceOptions): () => void {
 
   return () => {
     stopMonitor();
-    clearInterval(expirationTimer);
+    stopStallDetector();
     stopIntegrityCheck();
     process.off(signal, onSignal);
   };

@@ -5,8 +5,9 @@
  *   tsx src/cli/db-backup.ts verify    <backup-file>
  *   tsx src/cli/db-backup.ts restore   <backup-file> <database>   # service stopped
  *   tsx src/cli/db-backup.ts prune     <database> <backup-dir> [retention-days]
- *   tsx src/cli/db-backup.ts migrate   <database>
- *   tsx src/cli/db-backup.ts rollback  <database> <target-version>
+ *   tsx src/cli/db-backup.ts migrate   <database> [migration-set]
+ *   tsx src/cli/db-backup.ts rollback  <database> <target-version> [migration-set]
+ *   tsx src/cli/db-backup.ts status    <database>
  *   tsx src/cli/db-backup.ts integrity <database>
  *
  * `backup` also verifies the new file and prunes old ones, so one scheduled
@@ -17,7 +18,7 @@
  * BACKUP_DIR environment variable. When BACKUP_ENCRYPTION_KEY is set, the new
  * backup is encrypted at rest (see `encrypt`).
  */
-import path from 'path';
+import path from "path";
 import {
   backupFileName,
   backupSqliteDatabase,
@@ -25,12 +26,17 @@ import {
   pruneBackups,
   restoreSqliteDatabase,
   verifySqliteBackup,
-} from '../store/sqlite-backup.js';
+} from "../store/sqlite-backup.js";
 import {
   applySqliteMigrations,
+  getCurrentSchemaVersion,
   rollbackSqliteMigrations,
+} from "../store/sqlite-migrations.js";
+import { getSqliteMigrationsForDatabase } from "../store/sqlite-schema-migrations.js";
+import {
+  openSqliteDatabase,
   runIntegrityCheck,
-} from '../store/sqlite-migrations.js';
+} from "../store/sqlite-config.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** Default retention, matching docs/oracle-db-recovery.md. */
@@ -38,92 +44,150 @@ export const DEFAULT_RETENTION_DAYS = 35;
 
 function retentionMs(raw: string | undefined): number {
   const days = raw === undefined ? DEFAULT_RETENTION_DAYS : Number(raw);
-  if (!Number.isFinite(days) || days <= 0) throw new Error(`invalid retention days: ${raw}`);
+  if (!Number.isFinite(days) || days <= 0)
+    throw new Error(`invalid retention days: ${raw}`);
   return days * DAY_MS;
 }
 
 export async function main(argv: string[]): Promise<number> {
   const [command, a, b, c] = argv;
   switch (command) {
-    case 'backup': {
+    case "backup": {
       const dir = b ?? process.env.BACKUP_DIR;
       if (!a || !dir) break;
       const target = path.join(dir, backupFileName(a));
       await backupSqliteDatabase(a, target);
       const check = await verifySqliteBackup(target);
       if (!check.ok) {
-        console.error(`backup written but failed verification: ${check.integrity.join('; ')}`);
+        console.error(
+          `backup written but failed verification: ${check.integrity.join("; ")}`,
+        );
         return 1;
       }
       const encryptionKey = process.env.BACKUP_ENCRYPTION_KEY;
-      const encrypted = encryptionKey ? await encryptBackupFile(target, encryptionKey) : undefined;
+      const encrypted = encryptionKey
+        ? await encryptBackupFile(target, encryptionKey)
+        : undefined;
       const pruned = pruneBackups(dir, a, retentionMs(c));
       console.log(
-        JSON.stringify({ backup: target, encrypted, tables: check.tables, pruned }),
+        JSON.stringify({
+          backup: target,
+          encrypted,
+          tables: check.tables,
+          pruned,
+        }),
       );
       return 0;
     }
-    case 'encrypt': {
+    case "encrypt": {
       if (!a) break;
       const encryptionKey = process.env.BACKUP_ENCRYPTION_KEY;
       if (!encryptionKey) {
-        console.error('BACKUP_ENCRYPTION_KEY is not set');
+        console.error("BACKUP_ENCRYPTION_KEY is not set");
         return 1;
       }
       const encrypted = await encryptBackupFile(a, encryptionKey);
       console.log(JSON.stringify({ encrypted }));
       return 0;
     }
-    case 'verify': {
+    case "verify": {
       if (!a) break;
       const check = await verifySqliteBackup(a);
       console.log(JSON.stringify(check));
       return check.ok ? 0 : 1;
     }
-    case 'restore': {
+    case "restore": {
       if (!a || !b) break;
       const check = await restoreSqliteDatabase(a, b);
-      console.log(JSON.stringify({ restored: b, from: a, tables: check.tables }));
+      console.log(
+        JSON.stringify({ restored: b, from: a, tables: check.tables }),
+      );
       return 0;
     }
-    case 'prune': {
+    case "prune": {
       if (!a || !b) break;
-      console.log(JSON.stringify({ pruned: pruneBackups(b, a, retentionMs(c)) }));
+      console.log(
+        JSON.stringify({ pruned: pruneBackups(b, a, retentionMs(c)) }),
+      );
       return 0;
     }
-    case 'migrate': {
+    case "migrate": {
       if (!a) break;
-      const result = await applySqliteMigrations(a);
-      console.log(JSON.stringify({ database: a, ...result }));
-      return 0;
+      const db = await openSqliteDatabase(a);
+      try {
+        const result = await applySqliteMigrations(
+          db,
+          getSqliteMigrationsForDatabase(a, b),
+        );
+        console.log(JSON.stringify({ database: a, ...result }));
+        return 0;
+      } finally {
+        await new Promise<void>((resolve, reject) =>
+          db.close((error) => (error ? reject(error) : resolve())),
+        );
+      }
     }
-    case 'rollback': {
+    case "rollback": {
       if (!a || !b) break;
       const target = Number(b);
       if (!Number.isInteger(target) || target < 0) {
         console.error(`invalid target version: ${b}`);
         return 2;
       }
-      const result = await rollbackSqliteMigrations(a, target);
-      console.log(JSON.stringify({ database: a, ...result }));
-      return 0;
+      const db = await openSqliteDatabase(a);
+      try {
+        const result = await rollbackSqliteMigrations(
+          db,
+          getSqliteMigrationsForDatabase(a, c),
+          target,
+        );
+        console.log(JSON.stringify({ database: a, ...result }));
+        return 0;
+      } finally {
+        await new Promise<void>((resolve, reject) =>
+          db.close((error) => (error ? reject(error) : resolve())),
+        );
+      }
     }
-    case 'integrity': {
+    case "status": {
       if (!a) break;
-      const check = await runIntegrityCheck(a);
-      console.log(JSON.stringify(check));
-      return check.ok ? 0 : 1;
+      const db = await openSqliteDatabase(a);
+      try {
+        const version = await getCurrentSchemaVersion(db);
+        console.log(JSON.stringify({ database: a, currentVersion: version }));
+        return 0;
+      } finally {
+        await new Promise<void>((resolve, reject) =>
+          db.close((error) => (error ? reject(error) : resolve())),
+        );
+      }
+    }
+    case "integrity": {
+      if (!a) break;
+      const db = await openSqliteDatabase(a);
+      try {
+        const check = await runIntegrityCheck(db);
+        console.log(JSON.stringify(check));
+        return check.ok ? 0 : 1;
+      } finally {
+        await new Promise<void>((resolve, reject) =>
+          db.close((error) => (error ? reject(error) : resolve())),
+        );
+      }
     }
   }
   console.error(
-    'usage: db-backup <backup|verify|restore|prune|migrate|rollback|integrity> ... ' +
-      '(see docs/oracle-db-recovery.md)',
+    "usage: db-backup <backup|verify|restore|prune|migrate|rollback|status|integrity> ... " +
+      "(see docs/oracle-db-recovery.md)",
   );
   return 2;
 }
 
-const invoked = process.argv[1] ? path.resolve(process.argv[1]) : '';
-if (invoked.endsWith(`${path.sep}db-backup.ts`) || invoked.endsWith(`${path.sep}db-backup.js`)) {
+const invoked = process.argv[1] ? path.resolve(process.argv[1]) : "";
+if (
+  invoked.endsWith(`${path.sep}db-backup.ts`) ||
+  invoked.endsWith(`${path.sep}db-backup.js`)
+) {
   main(process.argv.slice(2)).then(
     (code) => process.exit(code),
     (err) => {

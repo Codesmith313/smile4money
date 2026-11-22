@@ -2,6 +2,8 @@ import sqlite3 from "sqlite3";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { OracleSubmission } from "../services/oracle-submit.js";
+import { applySqliteMigrations } from "./sqlite-migrations.js";
+import { SQLITE_SCHEMA_MIGRATIONS } from "./sqlite-schema-migrations.js";
 
 export interface SettlementRecord {
   matchId: number;
@@ -32,9 +34,7 @@ export class SettlementStore {
     });
     await this.run("PRAGMA journal_mode = WAL");
     await this.run("PRAGMA synchronous = FULL");
-    await this.run(`CREATE TABLE IF NOT EXISTS settlements (
-      scope TEXT NOT NULL, match_id INTEGER NOT NULL, game_id TEXT NOT NULL,
-      record TEXT NOT NULL, PRIMARY KEY (scope, match_id, game_id))`);
+    await applySqliteMigrations(this.db, SQLITE_SCHEMA_MIGRATIONS.settlement);
   }
 
   private run(sql: string, args: unknown[] = []): Promise<void> {

@@ -6,16 +6,19 @@ import validateGameRouter from './routes/validate-game.js';
 import reviewRouter from './routes/oracle-review.js';
 import oracleRouter from './routes/oracle.js';
 import playerIdentityRouter from './routes/player-identity.js';
+import { errorToHttpStatus, errorCodeFromStatus } from './errors/errorToHttpStatus.js';
+import { errorEnvelope } from './errors/errorEnvelope.js';
+import { requestLogging } from './middleware/request-logging.js';
+import queueReplayRouter from './routes/queue-replay.js';
 import { errorToHttpStatus } from './errors/errorToHttpStatus.js';
 import {
   ErrorCode,
   errorEnvelope,
-  statusToErrorCode,
   userFacingErrorMessage,
 } from './errors/errorResponse.js';
 import { requestLogging } from './middleware/request-logging.js';
 import { traceContext } from './middleware/trace-context.js';
-import logger from './logger.js';
+import errorHandler from './middleware/error-handler.js';
 
 /**
  * Parse the ALLOWED_ORIGINS environment variable into an array of origin strings.
@@ -44,11 +47,17 @@ app.use(
       if (!origin || allowed.includes(origin)) {
         callback(null, true);
       } else {
-        callback(new Error(`CORS: origin '${origin}' is not allowed`));
+        callback(
+          Object.assign(
+            new Error(`CORS: origin '${origin}' is not allowed`),
+            { status: 403 },
+          ),
+        );
       }
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
+    exposedHeaders: ['traceparent', 'x-request-id', 'x-correlation-id'],
     credentials: true,
   })
 );
@@ -63,6 +72,19 @@ app.use('/api/validate-game', validateGameRouter);
 app.use('/api/oracle/reviews', reviewRouter);
 app.use('/api/oracle', oracleRouter);
 app.use('/api/player-identity', playerIdentityRouter);
+// #2184 — manual replay of failed queue entries (POST /queue/:id/replay).
+app.use('/queue', queueReplayRouter);
+
+// Fallback for any error a route handler doesn't catch itself, so every
+// route ends up with the same JSON error shape and the same centralized
+// status-code mapping (#47) rather than Express's default HTML error page.
+app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  const status = errorToHttpStatus(err);
+  const message = err instanceof Error ? err.message : 'Unknown error';
+  // #2177 — every error response carries a code, message, actionable
+  // suggestion and a link to the relevant documentation.
+  res.status(status).json(errorEnvelope(errorCodeFromStatus(status), message));
+});
 
 // Public service status (#115). Mounted here, after the other routes, so the
 // route list above stays untouched; the handler never throws.
@@ -75,19 +97,6 @@ app.use((_req, res) => {
     .json(errorEnvelope(ErrorCode.NOT_FOUND, userFacingErrorMessage(404)));
 });
 
-// Keep internal exception details in neither the response nor the logs.
-app.use(
-  (
-    err: unknown,
-    _req: express.Request,
-    res: express.Response,
-    _next: express.NextFunction,
-  ) => {
-    const status = errorToHttpStatus(err);
-    const code = statusToErrorCode(status);
-    logger.error({ status, error_code: code }, 'http_error');
-    res.status(status).json(errorEnvelope(code, userFacingErrorMessage(status)));
-  },
-);
+app.use(errorHandler);
 
 export default app;

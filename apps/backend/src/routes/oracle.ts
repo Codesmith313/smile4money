@@ -39,7 +39,7 @@ router.use(authenticate);
  * The oracle (a privileged service) must then sign the result and call the
  * escrow contract's `submit_result` method on Stellar Soroban.
  */
-router.post('/submit-result', async (req, res) => {
+router.post('/submit-result', async (req, res, next) => {
   const payload = req.body;
 
   if (!payload || typeof payload !== 'object') {

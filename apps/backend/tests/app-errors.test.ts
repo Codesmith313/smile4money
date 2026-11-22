@@ -26,6 +26,12 @@ describe("application error responses", () => {
       correlationId: expect.stringMatching(/^[a-f0-9]{32}$/),
       timestamp: expect.any(String),
     });
+    expect(response.headers["x-request-id"]).toBe(
+      response.body.error.requestId,
+    );
+    expect(response.headers["x-correlation-id"]).toBe(
+      response.body.error.correlationId,
+    );
     expect(response.text).not.toContain("Unexpected end of JSON input");
 
     const errorLog = lines
@@ -50,5 +56,11 @@ describe("application error responses", () => {
       correlationId: expect.stringMatching(/^[a-f0-9]{32}$/),
       timestamp: expect.any(String),
     });
+    expect(response.headers["x-request-id"]).toBe(
+      response.body.error.requestId,
+    );
+    expect(response.headers["x-correlation-id"]).toBe(
+      response.body.error.correlationId,
+    );
   });
 });

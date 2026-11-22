@@ -24,6 +24,7 @@ import { fileURLToPath } from 'url';
 import { withRetry } from './sqlite-queue-store.js';
 import type { RateLimitBackend, RateLimitResult } from '../middleware/rate-limit.js';
 import { applySqliteMigrations } from './sqlite-migrations.js';
+import { SQLITE_SCHEMA_MIGRATIONS } from './sqlite-schema-migrations.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -72,28 +73,7 @@ export class SqliteRateLimitStore implements RateLimitBackend {
       this.getDb().run('PRAGMA journal_mode=WAL', (err: Error | null) => cb(err)),
     );
 
-    await applySqliteMigrations(this.getDb(), [
-      {
-        version: 1,
-        name: 'create-rate-limit-buckets',
-        statements: [
-          `CREATE TABLE IF NOT EXISTS rate_limit_buckets (clientId TEXT PRIMARY KEY NOT NULL, tokens REAL NOT NULL, lastRefill INTEGER NOT NULL)`,
-        ],
-        down: [`DROP TABLE IF EXISTS rate_limit_buckets`],
-      },
-      {
-        version: 2,
-        name: 'rate-limit-refill-index',
-        statements: [`CREATE INDEX IF NOT EXISTS idx_rate_limit_last_refill ON rate_limit_buckets(lastRefill)`],
-        down: [`DROP INDEX IF EXISTS idx_rate_limit_last_refill`],
-      },
-      {
-        version: 3,
-        name: 'rate-limit-tokens-index',
-        statements: [`CREATE INDEX IF NOT EXISTS idx_rate_limit_tokens ON rate_limit_buckets(tokens)`],
-        down: [`DROP INDEX IF EXISTS idx_rate_limit_tokens`],
-      },
-    ]);
+    await applySqliteMigrations(this.getDb(), SQLITE_SCHEMA_MIGRATIONS['rate-limit']);
   }
 
   /**

@@ -48,4 +48,11 @@ describe('errorToHttpStatus (#47)', () => {
     expect(errorToHttpStatus(undefined)).toBe(500);
     expect(errorToHttpStatus(null)).toBe(500);
   });
+
+  it('preserves valid HTTP statuses carried by middleware errors', () => {
+    expect(errorToHttpStatus({ status: 400 })).toBe(400);
+    expect(errorToHttpStatus({ statusCode: 413 })).toBe(413);
+    expect(errorToHttpStatus({ status: 503 })).toBe(503);
+    expect(errorToHttpStatus({ status: 200 })).toBe(500);
+  });
 });
