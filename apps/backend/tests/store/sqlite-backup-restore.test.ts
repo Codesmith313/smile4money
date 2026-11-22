@@ -23,6 +23,7 @@ import {
   verifySqliteBackup,
 } from '../../src/store/sqlite-backup.js';
 import { main as cli } from '../../src/cli/db-backup.js';
+import { BackupScheduler } from '../../src/store/backup-scheduler.js';
 
 let dir: string;
 
@@ -204,5 +205,117 @@ describe('db-backup CLI (#104)', () => {
 
   it('rejects unknown commands', async () => {
     expect(await cli(['explode'])).toBe(2);
+  });
+});
+
+describe('scheduled encrypted backups (#2191)', () => {
+  const key = 'test-backup-key-0123456789abcdef';
+  const intervalMs = 60_000;
+
+  function schedulerFor(dbPath: string, backupDir: string, encryptionKey = key) {
+    return new BackupScheduler({
+      databases: [{ name: 'oracle-evidence', path: dbPath }],
+      backupDir,
+      intervalMs,
+      retentionMs: 35 * 24 * 60 * 60 * 1000,
+      encryptionKey,
+    });
+  }
+
+  it('runs on its interval and writes encrypted backups to BACKUP_DIR', async () => {
+    const dbPath = path.join(dir, 'oracle-evidence.db');
+    const backupDir = path.join(dir, 'configured-backups');
+    const live = new SQLiteQueueStore(dbPath);
+    await live.initialize();
+    await live.add(settlement('sched', 7, 'Player1'));
+    await live.close();
+
+    const scheduler = schedulerFor(dbPath, backupDir);
+    const first = await scheduler.runOnce();
+    expect(first).toHaveLength(1);
+    expect(first[0].ok).toBe(true);
+
+    const files = fs.readdirSync(backupDir);
+    expect(files).toHaveLength(1);
+    const backupPath = path.join(backupDir, files[0]);
+    expect(fs.statSync(backupPath).size).toBeGreaterThan(0);
+    // Encrypted at rest: the plaintext SQLite header must not be present.
+    const raw = fs.readFileSync(backupPath);
+    expect(raw.subarray(0, 16).toString('latin1')).not.toContain('SQLite format 3');
+
+    // The scheduler fires on its interval without manual intervention.
+    const runs: number[] = [];
+    scheduler.on('backup', () => runs.push(Date.now()));
+    scheduler.start();
+    await new Promise((resolve) => setTimeout(resolve, intervalMs + 250));
+    scheduler.stop();
+    expect(runs.length).toBeGreaterThanOrEqual(1);
+    expect(fs.readdirSync(backupDir).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('decrypts and restores a scheduled backup after losing the database', async () => {
+    const dbPath = path.join(dir, 'oracle-evidence.db');
+    const backupDir = path.join(dir, 'configured-backups');
+    const live = new SQLiteQueueStore(dbPath);
+    await live.initialize();
+    await live.add(settlement('r1', 11, 'Draw'));
+    await live.add(settlement('r2', 12, 'Player2'));
+    await live.close();
+
+    const scheduler = schedulerFor(dbPath, backupDir);
+    const [result] = await scheduler.runOnce();
+    expect(result.ok).toBe(true);
+
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(`${dbPath}${suffix}`, { force: true });
+
+    const verification = await scheduler.restore(result.backupPath, dbPath);
+    expect(verification.ok).toBe(true);
+    expect(verification.tables.oracle_dlq).toBe(2);
+
+    const restored = new SQLiteQueueStore(dbPath);
+    await restored.initialize();
+    expect((await restored.getAll()).map((e) => e.id).sort()).toEqual(['r1', 'r2']);
+    await restored.close();
+  });
+
+  it('refuses a wrong-key backup without touching the live database', async () => {
+    const dbPath = path.join(dir, 'oracle-evidence.db');
+    const backupDir = path.join(dir, 'configured-backups');
+    const live = new SQLiteQueueStore(dbPath);
+    await live.initialize();
+    await live.add(settlement('keep', 21, 'Player1'));
+    await live.close();
+
+    const [result] = await schedulerFor(dbPath, backupDir).runOnce();
+    expect(result.ok).toBe(true);
+
+    const wrongKey = schedulerFor(dbPath, backupDir, 'a-completely-different-key-000000');
+    await expect(wrongKey.restore(result.backupPath, dbPath)).rejects.toThrow(/decrypt|unhealthy/i);
+
+    const reopened = new SQLiteQueueStore(dbPath);
+    await reopened.initialize();
+    expect((await reopened.getAll()).map((e) => e.id)).toEqual(['keep']);
+    await reopened.close();
+  });
+
+  it('refuses a corrupt encrypted backup without touching the live database', async () => {
+    const dbPath = path.join(dir, 'oracle-evidence.db');
+    const backupDir = path.join(dir, 'configured-backups');
+    const live = new SQLiteQueueStore(dbPath);
+    await live.initialize();
+    await live.add(settlement('keep', 31, 'Draw'));
+    await live.close();
+
+    const scheduler = schedulerFor(dbPath, backupDir);
+    const [result] = await scheduler.runOnce();
+    expect(result.ok).toBe(true);
+
+    fs.writeFileSync(result.backupPath, 'not an encrypted backup'.repeat(50));
+    await expect(scheduler.restore(result.backupPath, dbPath)).rejects.toThrow(/decrypt|unhealthy/i);
+
+    const reopened = new SQLiteQueueStore(dbPath);
+    await reopened.initialize();
+    expect((await reopened.getAll()).map((e) => e.id)).toEqual(['keep']);
+    await reopened.close();
   });
 });

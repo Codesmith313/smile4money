@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { ErrorCode, errorEnvelope, statusToErrorCode } from '../../src/errors/errorResponse.js';
+import {
+  ErrorCode,
+  errorEnvelope,
+  statusToErrorCode,
+  userFacingErrorMessage,
+} from '../../src/errors/errorResponse.js';
+import { newTraceContext, runWithTraceContext } from '../../src/tracing/trace-context.js';
 
 describe('errorEnvelope (#50)', () => {
   it('builds the standard { error: { code, message } } shape', () => {
@@ -37,6 +43,20 @@ describe('errorEnvelope (#50)', () => {
         .error.suggestion,
     ).toBe('Contact the operator.');
   });
+
+  it('includes request and correlation context when handling an HTTP request', () => {
+    const context = newTraceContext();
+    const body = runWithTraceContext(context, () =>
+      errorEnvelope(ErrorCode.INTERNAL_ERROR, 'Try again later.'),
+    );
+
+    expect(body.error).toMatchObject({
+      requestId: context.spanId,
+      correlationId: context.traceId,
+      timestamp: expect.any(String),
+    });
+    expect(Number.isNaN(Date.parse(body.error.timestamp as string))).toBe(false);
+  });
 });
 
 describe('statusToErrorCode (#50)', () => {
@@ -68,5 +88,14 @@ describe('statusToErrorCode (#50)', () => {
     expect(statusToErrorCode(500)).toBe(ErrorCode.INTERNAL_ERROR);
     expect(statusToErrorCode(502)).toBe(ErrorCode.INTERNAL_ERROR);
     expect(statusToErrorCode(999)).toBe(ErrorCode.INTERNAL_ERROR);
+  });
+});
+
+describe('userFacingErrorMessage', () => {
+  it('provides actionable public guidance without exposing exception details', () => {
+    expect(userFacingErrorMessage(500)).toBe(
+      'Something went wrong. Please try again later.',
+    );
+    expect(userFacingErrorMessage(429)).toMatch(/wait a moment/i);
   });
 });

@@ -1,7 +1,12 @@
 import { Router } from 'express';
 import { createRateLimitStore, createRateLimitMiddleware } from '../middleware/rate-limit.js';
 import { validateGameInput, validateGame } from '../services/validate-game-service.js';
-import { ErrorCode, errorEnvelope, statusToErrorCode } from '../errors/errorResponse.js';
+import {
+  ErrorCode,
+  errorEnvelope,
+  statusToErrorCode,
+  userFacingErrorMessage,
+} from '../errors/errorResponse.js';
 
 const router = Router();
 
@@ -35,12 +40,15 @@ router.post('/', async (req, res) => {
     // so that shape is preserved; `error` is added alongside it, as the
     // standard { code, message } object (#50), rather than the old bare
     // string previously found under the same key.
-    const message = result.message ?? result.error ?? 'Game validation failed';
+    const message =
+      result.status >= 500
+        ? userFacingErrorMessage(result.status)
+        : result.message ?? result.error ?? 'Game validation failed';
     return res.status(result.status).json({
       valid: result.valid ?? false,
       platform: result.platform ?? payload.platform,
       gameId: result.gameId ?? payload.gameId,
-      ...(result.message ? { message: result.message } : {}),
+      ...(result.message || result.status >= 500 ? { message } : {}),
       // Machine-readable eligibility rejections (#110), when the game exists
       // but cannot be wagered on.
       ...('rejections' in result ? { rejections: result.rejections } : {}),

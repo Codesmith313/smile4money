@@ -324,8 +324,9 @@
             "required": [
               "code",
               "message",
-              "suggestion",
-              "documentation"
+              "requestId",
+              "correlationId",
+              "timestamp"
             ],
             "properties": {
               "code": {
@@ -334,12 +335,17 @@
               "message": {
                 "type": "string"
               },
-              "suggestion": {
-                "type": "string"
-              },
-              "documentation": {
+              "requestId": {
                 "type": "string",
-                "format": "uri"
+                "description": "Request span ID for support reference."
+              },
+              "correlationId": {
+                "type": "string",
+                "description": "Trace ID matching related structured logs."
+              },
+              "timestamp": {
+                "type": "string",
+                "format": "date-time"
               },
               "hint": {
                 "type": "string"

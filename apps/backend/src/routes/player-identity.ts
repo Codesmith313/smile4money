@@ -17,7 +17,7 @@ router.post('/challenge', (req, res) => {
       .json(
         errorEnvelope(
           ErrorCode.UNAUTHORIZED,
-          'Authenticated wallet address is required',
+          'Sign in with a valid wallet and try again.',
         ),
       );
   try {
@@ -27,13 +27,13 @@ router.post('/challenge', (req, res) => {
       username,
     );
     return res.status(200).json(challenge);
-  } catch (error) {
+  } catch {
     return res
       .status(400)
       .json(
         errorEnvelope(
           ErrorCode.VALIDATION_ERROR,
-          error instanceof Error ? error.message : 'Invalid link request',
+          'The identity-link request could not be completed. Check the platform and username, then try again.',
         ),
       );
   }
@@ -47,7 +47,7 @@ router.post('/confirm', async (req, res) => {
       .json(
         errorEnvelope(
           ErrorCode.VALIDATION_ERROR,
-          'nonce and signature are required',
+          'Both nonce and signature are required.',
         ),
       );
   }
@@ -57,7 +57,7 @@ router.post('/confirm', async (req, res) => {
       .json(
         errorEnvelope(
           ErrorCode.UNAUTHORIZED,
-          'Authenticated wallet address is required',
+          'Sign in with a valid wallet and try again.',
         ),
       );
   if (!(await confirmIdentityLink(nonce, req.address, signature))) {
@@ -66,7 +66,7 @@ router.post('/confirm', async (req, res) => {
       .json(
         errorEnvelope(
           ErrorCode.VALIDATION_ERROR,
-          'Invalid, expired, replayed, or wrong-wallet identity proof',
+          'This identity proof is invalid or expired. Request a new proof and try again.',
         ),
       );
   }

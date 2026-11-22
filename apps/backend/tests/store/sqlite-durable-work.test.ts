@@ -6,6 +6,7 @@ import { SqliteMatchStore } from '../../src/store/sqlite-match-store.js';
 import { SQLiteQueueStore } from '../../src/store/sqlite-queue-store.js';
 import { SqliteRateLimitStore } from '../../src/store/sqlite-rate-limit-store.js';
 import { applySqliteMigrations } from '../../src/store/sqlite-migrations.js';
+import { SqliteConnectionPool } from '../../src/store/sqlite-connection-pool.js';
 
 const dbPath = (name: string) =>
   path.join('/tmp', `durable-${name}-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
@@ -330,5 +331,147 @@ describe('SQLite schema upgrades and durable settlement work', () => {
     await new Promise<void>((resolve, reject) => check.close((e) => (e ? reject(e) : resolve())));
     expect(states).toEqual([{ state: 'pending' }]);
     expect(audit).toEqual([{ recordId: 'job:settlement:done-game' }]);
+  });
+
+  it('processes settlement jobs in configurable batches within a single transaction', async () => {
+    const file = dbPath('batch');
+    paths.push(file);
+    const store = new SqliteMatchStore(file);
+    stores.push(store);
+    await store.initialize();
+    for (const gameId of ['batch-1', 'batch-2', 'batch-3'])
+      await store.createMatch({
+        player1: 'a',
+        player2: 'b',
+        stakeAmount: 1,
+        token: 'XLM',
+        gameId,
+        platform: 'lichess',
+      });
+    const processed: string[] = [];
+    const first = await store.processSettlementBatch(
+      async (job) => {
+        processed.push(job.gameId);
+      },
+      { batchSize: 2 },
+    );
+    expect(first).toBe(2);
+    expect(processed).toHaveLength(2);
+    const second = await store.processSettlementBatch(
+      async (job) => {
+        processed.push(job.gameId);
+      },
+      { batchSize: 2 },
+    );
+    expect(second).toBe(1);
+    expect(processed).toHaveLength(3);
+    expect(await store.listActiveSettlementJobs()).toEqual([]);
+    const check = new sqlite3.Database(file);
+    const logs = await new Promise<any[]>((resolve, reject) =>
+      check.all("SELECT detail FROM settlement_batch_log WHERE outcome = 'committed'", (error, rows) =>
+        error ? reject(error) : resolve(rows),
+      ),
+    );
+    await new Promise<void>((resolve, reject) => check.close((e) => (e ? reject(e) : resolve())));
+    expect(logs.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('rolls back the whole batch when any job fails and logs the failure', async () => {
+    const file = dbPath('batch-rollback');
+    paths.push(file);
+    const store = new SqliteMatchStore(file);
+    stores.push(store);
+    await store.initialize();
+    for (const gameId of ['rb-1', 'rb-2', 'rb-3'])
+      await store.createMatch({
+        player1: 'a',
+        player2: 'b',
+        stakeAmount: 1,
+        token: 'XLM',
+        gameId,
+        platform: 'lichess',
+      });
+    await expect(
+      store.processSettlementBatch(
+        async (job) => {
+          if (job.gameId === 'rb-2') throw new Error('injected batch failure');
+        },
+        { batchSize: 3 },
+      ),
+    ).rejects.toThrow('injected batch failure');
+    expect((await store.listActiveSettlementJobs()).length).toBe(3);
+    const check = new sqlite3.Database(file);
+    const logs = await new Promise<any[]>((resolve, reject) =>
+      check.all("SELECT detail FROM settlement_batch_log WHERE outcome = 'rolled_back'", (error, rows) =>
+        error ? reject(error) : resolve(rows),
+      ),
+    );
+    await new Promise<void>((resolve, reject) => check.close((e) => (e ? reject(e) : resolve())));
+    expect(logs).toHaveLength(1);
+    expect(logs[0].detail).toContain('injected batch failure');
+  });
+
+  it('archives expired records into queryable archive tables and logs archival', async () => {
+    const file = dbPath('archive');
+    paths.push(file);
+    const store = new SqliteMatchStore(file);
+    stores.push(store);
+    await store.initialize();
+    await store.createMatch({
+      player1: 'a',
+      player2: 'b',
+      stakeAmount: 1,
+      token: 'XLM',
+      gameId: 'old-game',
+      platform: 'lichess',
+    });
+    await store.createMatch({
+      player1: 'a',
+      player2: 'c',
+      stakeAmount: 1,
+      token: 'XLM',
+      gameId: 'new-game',
+      platform: 'lichess',
+    });
+    await store.updateSettlementState(0, 'completed');
+    await store.updateSettlementState(1, 'completed');
+    const fixture = new sqlite3.Database(file);
+    await exec(fixture, 'UPDATE settlement_jobs SET updatedAt = 1 WHERE matchId = 0');
+    await new Promise<void>((resolve, reject) => fixture.close((e) => (e ? reject(e) : resolve())));
+    const archived = await store.archiveExpiredWork(Date.now(), { retentionMs: 1000, batchSize: 10 });
+    expect(archived).toBe(1);
+    const archivedRows = await store.listArchivedSettlementJobs();
+    expect(archivedRows.map((row) => row.gameId)).toEqual(['old-game']);
+    const check = new sqlite3.Database(file);
+    const live = await new Promise<any[]>((resolve, reject) =>
+      check.all('SELECT gameId FROM settlement_jobs ORDER BY matchId', (error, rows) =>
+        error ? reject(error) : resolve(rows),
+      ),
+    );
+    const logs = await new Promise<any[]>((resolve, reject) =>
+      check.all('SELECT recordId FROM settlement_archive_log', (error, rows) => (error ? reject(error) : resolve(rows))),
+    );
+    await new Promise<void>((resolve, reject) => check.close((e) => (e ? reject(e) : resolve())));
+    expect(live).toEqual([{ gameId: 'new-game' }]);
+    expect(logs).toEqual([{ recordId: 'job:settlement:old-game' }]);
+  });
+
+  it('reuses pooled connections, evicts idle ones and rejects when exhausted', async () => {
+    const file = dbPath('pool');
+    paths.push(file);
+    const pool = new SqliteConnectionPool({ path: file, maxSize: 2, idleTimeoutMs: 50 });
+    const first = await pool.acquire();
+    const second = await pool.acquire();
+    expect(pool.stats().inUse).toBe(2);
+    await expect(pool.acquire()).rejects.toThrow(/exhausted/i);
+    await pool.release(first);
+    const reused = await pool.acquire();
+    expect(reused).toBe(first);
+    await pool.release(reused);
+    await pool.release(second);
+    expect(pool.stats().idle).toBe(2);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(pool.stats().idle).toBe(0);
+    await pool.close();
   });
 });

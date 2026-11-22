@@ -15,7 +15,7 @@ export function createReviewRouter(ledger: EvidenceStore) {
     if (!req.address || !operators.includes(req.address))
       return res
         .status(403)
-        .json(errorEnvelope(ErrorCode.FORBIDDEN, 'Administrator required'));
+        .json(errorEnvelope(ErrorCode.FORBIDDEN, 'Administrator access is required.'));
     next();
   });
   router.get('/:gameId', async (req, res, next) => {
@@ -24,7 +24,7 @@ export function createReviewRouter(ledger: EvidenceStore) {
       if (!history.length)
         return res
           .status(404)
-          .json(errorEnvelope(ErrorCode.NOT_FOUND, 'Evidence not found'));
+          .json(errorEnvelope(ErrorCode.NOT_FOUND, 'Evidence could not be found.'));
       res.json({ history });
     } catch (error) {
       next(error);
@@ -44,7 +44,7 @@ export function createReviewRouter(ledger: EvidenceStore) {
         .json(
           errorEnvelope(
             ErrorCode.VALIDATION_ERROR,
-            'Provide only a reason (1–500 characters)',
+            'Provide only a reason between 1 and 500 characters.',
           ),
         );
     }
@@ -65,12 +65,7 @@ export function createReviewRouter(ledger: EvidenceStore) {
       if (decision === null)
         return res
           .status(409)
-          .json(
-            errorEnvelope(
-              ErrorCode.CONFLICT,
-              'Match is not awaiting review',
-            ),
-          );
+          .json(errorEnvelope(ErrorCode.CONFLICT, 'The match is not awaiting review.'));
       res.json({ decisionId: decision, state: 'retry_requested' });
     } catch (error) {
       next(error);

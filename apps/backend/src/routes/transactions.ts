@@ -13,11 +13,7 @@ router.post("/sponsor", async (req, res) => {
       .json(
         errorEnvelope(
           ErrorCode.INTERNAL_ERROR,
-          "Fee sponsorship disabled",
-          {
-            suggestion:
-              "Contact the operator to enable fee sponsorship before retrying.",
-          },
+          "Fee sponsorship is currently unavailable. Please try again later.",
         ),
       );
   if (
@@ -30,7 +26,7 @@ router.post("/sponsor", async (req, res) => {
       .json(
         errorEnvelope(
           ErrorCode.VALIDATION_ERROR,
-          "Signed transaction and explicit opt-in required",
+          "A signed transaction and explicit opt-in are required.",
         ),
       );
   try {
@@ -43,14 +39,12 @@ router.post("/sponsor", async (req, res) => {
     );
   } catch {
     // Neither secret keys nor request XDR are returned to clients.
-    return res
-      .status(400)
-      .json(
-        errorEnvelope(
-          ErrorCode.VALIDATION_ERROR,
-          "Sponsorship rejected: check eligibility, limits, signature, expiry, and prior submission",
-        ),
-      );
+    return res.status(400).json(
+      errorEnvelope(
+        ErrorCode.VALIDATION_ERROR,
+        "Sponsorship was not approved. Check eligibility, limits, signature, expiry, and prior submission.",
+      ),
+    );
   }
 });
 export default router;

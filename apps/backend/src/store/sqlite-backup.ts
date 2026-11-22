@@ -16,7 +16,9 @@
  *   atomically. A corrupt backup never replaces a working database.
  * - `pruneBackups` enforces the retention window.
  */
+import crypto from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import sqlite3 from 'sqlite3';
 
@@ -128,6 +130,51 @@ export async function restoreSqliteDatabase(
   return verification;
 }
 
+export interface RestoreRehearsal {
+  ok: boolean;
+  /** Verification of the backup taken from the source database. */
+  backup: BackupVerification;
+  /** Verification of the database after restoring the backup into a temp file. */
+  restored: BackupVerification;
+  /** Human-readable failure reason when `ok` is false. */
+  error?: string;
+}
+
+/**
+ * Rehearse the full recovery procedure against `sourcePath` without touching
+ * it: take a backup, verify it, restore it into a temporary file, and run
+ * `PRAGMA integrity_check` on the restored copy. Everything is written under
+ * a temporary directory that is removed afterwards. Used by the quarterly
+ * recovery drill and by `tests/store/sqlite-backup-restore.test.ts`.
+ */
+export async function verifyRestore(sourcePath: string): Promise<RestoreRehearsal> {
+  const empty: BackupVerification = { ok: false, integrity: ['not run'], tables: {} };
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sqlite-restore-drill-'));
+  const backupPath = path.join(workDir, backupFileName(sourcePath));
+  const restoredPath = path.join(workDir, `restored-${path.basename(sourcePath)}`);
+  try {
+    await backupSqliteDatabase(sourcePath, backupPath);
+    const backup = await verifySqliteBackup(backupPath);
+    if (!backup.ok) {
+      return { ok: false, backup, restored: empty, error: 'backup failed verification' };
+    }
+    const restored = await restoreSqliteDatabase(backupPath, restoredPath);
+    if (!restored.ok) {
+      return { ok: false, backup, restored, error: 'restored database failed verification' };
+    }
+    return { ok: true, backup, restored };
+  } catch (err) {
+    return {
+      ok: false,
+      backup: empty,
+      restored: empty,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  } finally {
+    fs.rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
 /** File name for a backup taken at `at`, e.g. `oracle-queue.2026-10-22T14-00-00Z.db`. */
 export function backupFileName(databasePath: string, at: Date = new Date()): string {
   const base = path.basename(databasePath, path.extname(databasePath));
@@ -173,4 +220,167 @@ export function pruneBackups(
     deleted.push(backup.name);
   });
   return deleted;
+}
+
+/** Databases covered by the scheduled backup job. */
+export const BACKUP_DATABASES = ['oracle-queue.db', 'match-store.db', 'oracle-evidence.db'];
+
+export interface BackupConfig {
+  /** Directory backups are written to. */
+  dir: string;
+  /** How often the job runs. */
+  intervalMs: number;
+  /** AES-256-GCM key material; backups are encrypted at rest when set. */
+  encryptionKey?: string;
+  /** Backups older than this are pruned. */
+  retentionMs: number;
+  /** Database file names (relative to the data dir) to back up. */
+  databases: string[];
+}
+
+/** Read backup settings from the environment, falling back to defaults. */
+export function backupConfigFromEnv(env: NodeJS.ProcessEnv = process.env): BackupConfig {
+  const dir = env.BACKUP_DIR || path.join(process.cwd(), 'backups');
+  const intervalMs = Number(env.BACKUP_INTERVAL_MS) || 6 * 60 * 60 * 1000;
+  const retentionDays = Number(env.BACKUP_RETENTION_DAYS) || 7;
+  return {
+    dir,
+    intervalMs,
+    encryptionKey: env.BACKUP_ENCRYPTION_KEY || undefined,
+    retentionMs: retentionDays * 24 * 60 * 60 * 1000,
+    databases: BACKUP_DATABASES,
+  };
+}
+
+function deriveKey(secret: string): Buffer {
+  // Accept a 64-char hex key directly, otherwise derive one from the passphrase.
+  if (/^[0-9a-fA-F]{64}$/.test(secret)) return Buffer.from(secret, 'hex');
+  return crypto.createHash('sha256').update(secret).digest();
+}
+
+/**
+ * Encrypt `file` in place with AES-256-GCM, writing `<file>.enc` and removing
+ * the plaintext. Layout: 12-byte IV, 16-byte auth tag, then ciphertext.
+ */
+export function encryptBackupFile(file: string, secret: string): string {
+  const key = deriveKey(secret);
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const plaintext = fs.readFileSync(file);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const out = `${file}.enc`;
+  fs.writeFileSync(out, Buffer.concat([iv, cipher.getAuthTag(), ciphertext]));
+  fs.rmSync(file, { force: true });
+  return out;
+}
+
+/** Decrypt a file produced by `encryptBackupFile` to `outFile`. */
+export function decryptBackupFile(file: string, secret: string, outFile: string): void {
+  const key = deriveKey(secret);
+  const data = fs.readFileSync(file);
+  const iv = data.subarray(0, 12);
+  const tag = data.subarray(12, 28);
+  const ciphertext = data.subarray(28);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  fs.writeFileSync(outFile, Buffer.concat([decipher.update(ciphertext), decipher.final()]));
+}
+
+export interface BackupRunResult {
+  database: string;
+  backup?: string;
+  ok: boolean;
+  error?: string;
+}
+
+/**
+ * Back up every configured database once: snapshot, verify, encrypt at rest,
+ * then prune. Returns a per-database result.
+ */
+export async function runBackupCycle(
+  config: BackupConfig,
+  dataDir: string,
+  now: Date = new Date(),
+): Promise<BackupRunResult[]> {
+  const results: BackupRunResult[] = [];
+  for (const database of config.databases) {
+    const source = path.join(dataDir, database);
+    if (!fs.existsSync(source)) continue;
+    const backupPath = path.join(config.dir, backupFileName(source, now));
+    try {
+      await backupSqliteDatabase(source, backupPath);
+      const verification = await verifySqliteBackup(backupPath);
+      if (!verification.ok) {
+        throw new Error(`verification failed: ${verification.integrity.join('; ')}`);
+      }
+      const stored = config.encryptionKey
+        ? encryptBackupFile(backupPath, config.encryptionKey)
+        : backupPath;
+      results.push({ database, backup: stored, ok: true });
+    } catch (err) {
+      fs.rmSync(backupPath, { force: true });
+      results.push({
+        database,
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  pruneBackups(config.dir, path.join(dataDir, config.databases[0]), config.retentionMs, now.getTime());
+  return results;
+}
+
+export interface ScheduledBackups {
+  /** Stop the schedule and wait for any in-flight cycle to finish. */
+  stop: () => Promise<void>;
+}
+
+/**
+ * Start the periodic backup job. Runs one cycle immediately, then every
+ * `config.intervalMs`. `log` receives structured events.
+ */
+export function startScheduledBackups(
+  config: BackupConfig,
+  dataDir: string,
+  log: (event: string, details?: Record<string, unknown>) => void = () => {},
+): ScheduledBackups {
+  let running = false;
+  let stopped = false;
+  let timer: NodeJS.Timeout | undefined;
+  let inFlight: Promise<void> = Promise.resolve();
+
+  const cycle = async (): Promise<void> => {
+    if (running || stopped) return;
+    running = true;
+    log('backup_started', { dir: config.dir, databases: config.databases });
+    try {
+      const results = await runBackupCycle(config, dataDir);
+      const failed = results.filter((r) => !r.ok);
+      if (failed.length > 0) {
+        log('backup_failed', { failures: failed });
+      } else {
+        log('backup_completed', { backups: results.map((r) => r.backup) });
+      }
+    } catch (err) {
+      log('backup_failed', { error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      running = false;
+    }
+  };
+
+  const schedule = (): void => {
+    if (stopped) return;
+    inFlight = cycle();
+    timer = setTimeout(schedule, config.intervalMs);
+    if (typeof timer.unref === 'function') timer.unref();
+  };
+  schedule();
+
+  return {
+    stop: async () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      await inFlight;
+    },
+  };
 }
