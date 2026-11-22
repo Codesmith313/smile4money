@@ -174,6 +174,93 @@ async function emitDlqDepth(): Promise<void> {
 
 export type RetryHandler = (entry: DlqEntry) => Promise<void>;
 
+const DEFAULT_BATCH_SIZE = 10;
+
+/**
+ * Parse the DLQ_BATCH_SIZE environment variable, falling back to the default
+ * (10) when unset or invalid (non-numeric, zero, or negative).
+ */
+export function parseBatchSize(rawValue: string | undefined): number {
+  if (rawValue === undefined || rawValue.trim() === "") {
+    return DEFAULT_BATCH_SIZE;
+  }
+
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isInteger(parsed)) {
+    logger.warn(
+      { rawValue },
+      "oracle_dlq: invalid DLQ_BATCH_SIZE, falling back to default of 10",
+    );
+    return DEFAULT_BATCH_SIZE;
+  }
+
+  return parsed;
+}
+
+export interface BatchResult {
+  /** Entries that were successfully processed and removed. */
+  resolved: string[];
+  /** Entries whose handler failed (kept in the DLQ for a later retry). */
+  failed: string[];
+  /** True when the whole batch was rolled back. */
+  rolledBack: boolean;
+}
+
+/**
+ * Process a batch of DLQ entries in a single atomic unit of work.
+ *
+ * All retry-state updates are staged and only committed once every entry in
+ * the batch has been processed successfully. If any handler throws, the batch
+ * is rolled back: no entry is removed and no retry state is persisted, so the
+ * entries remain pending for the next cycle.
+ */
+export async function processBatch(
+  entries: DlqEntry[],
+  handler: RetryHandler,
+): Promise<BatchResult> {
+  const store = getQueueStore();
+  const resolved: string[] = [];
+  const failed: string[] = [];
+
+  if (entries.length === 0) {
+    return { resolved, failed, rolledBack: false };
+  }
+
+  const staged: Array<{ id: string; updates: Partial<DlqEntry> }> = [];
+
+  try {
+    for (const entry of entries) {
+      const attempts = entry.attempts + 1;
+      const lastAttemptAt = Date.now();
+      staged.push({ id: entry.id, updates: { attempts, lastAttemptAt } });
+
+      await handler({ ...entry, attempts, lastAttemptAt });
+      resolved.push(entry.id);
+    }
+  } catch (err) {
+    // Roll back: discard staged updates and leave every entry untouched.
+    logger.error(
+      {
+        batchSize: entries.length,
+        resolved: resolved.length,
+        err: String(err).substring(0, 100),
+      },
+      "oracle_dlq: batch rolled back",
+    );
+    return { resolved: [], failed: entries.map((e) => e.id), rolledBack: true };
+  }
+
+  // Commit phase: persist retry state and remove resolved entries.
+  for (const { id, updates } of staged) {
+    await store.update(id, updates);
+  }
+  for (const id of resolved) {
+    await store.remove(id);
+  }
+
+  return { resolved, failed, rolledBack: false };
+}
+
 /**
  * Start the DLQ retry worker. Call once on startup.
  * Returns a cleanup function that stops the worker.
@@ -215,60 +302,53 @@ export function startRetryWorker(
       return;
     }
 
+    const batchSize = parseBatchSize(process.env.DLQ_BATCH_SIZE);
+    const batch = entries.slice(0, batchSize);
+
     logger.info(
-      { count: entries.length, state: breaker.getState() },
+      { count: entries.length, batchSize: batch.length, state: breaker.getState() },
       "oracle_dlq: retry worker running",
     );
 
     try {
-      for (const entry of entries) {
-        // Record the attempt before calling the handler
-        entry.attempts += 1;
-        entry.lastAttemptAt = Date.now();
-        await updateDlqEntry(entry.id, {
-          attempts: entry.attempts,
-          lastAttemptAt: entry.lastAttemptAt,
+      const result = await processBatch(batch, handler);
+
+      if (result.rolledBack) {
+        // Treat a rolled-back batch as a failure for circuit-breaker purposes.
+        const isRpcError = result.failed.some((id) => {
+          const entry = batch.find((e) => e.id === id);
+          return entry !== undefined && entry.attempts >= 0;
         });
-
-        try {
-          await handler(entry);
-          await removeDlqEntry(entry.id);
-          breaker.recordSuccess();
-          logger.info({ dlqId: entry.id }, "oracle_dlq: entry resolved");
-        } catch (err) {
-          const isRpcError =
-            String(err).includes("RPC") || String(err).includes("Network");
-
-          if (isRpcError) {
-            const circuitOpened = breaker.recordFailure();
-            if (circuitOpened) {
-              logger.error(
-                {
-                  dlqId: entry.id,
-                  attempt: entry.attempts,
-                  failureCount: breaker.getFailureCount(),
-                  cooldown: breaker.getRemainingCooldown(),
-                },
-                "circuit_breaker: RPC circuit opened, pausing job processing",
-              );
-              // Stop processing remaining entries this cycle
-              break;
-            }
+        if (isRpcError) {
+          const circuitOpened = breaker.recordFailure();
+          if (circuitOpened) {
+            logger.error(
+              {
+                failureCount: breaker.getFailureCount(),
+                cooldown: breaker.getRemainingCooldown(),
+              },
+              "circuit_breaker: RPC circuit opened, pausing job processing",
+            );
           }
-
-          logger.warn(
-            {
-              dlqId: entry.id,
-              attempt: entry.attempts,
-              isRpcError,
-              err: String(err).substring(0, 100),
-            },
-            "oracle_dlq: retry failed",
-          );
         }
-
-        await emitDlqDepth();
+      } else {
+        for (const id of result.resolved) {
+          breaker.recordSuccess();
+          logger.info({ dlqId: id }, "oracle_dlq: entry resolved");
+        }
       }
+
+      logger.info(
+        {
+          batchSize: batch.length,
+          resolved: result.resolved.length,
+          failed: result.failed.length,
+          rolledBack: result.rolledBack,
+        },
+        "oracle_dlq: batch processed",
+      );
+
+      await emitDlqDepth();
     } catch (err) {
       logger.error({ err: String(err) }, "oracle_dlq: retry worker error");
     }

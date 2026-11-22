@@ -1,4 +1,5 @@
 import { sqliteSettings, configureSqlite } from "./sqlite-config.js";
+import { applySqliteMigrations, type SqliteMigration } from "./sqlite-migrations.js";
 /**
  * SQLite-backed persistence for the RPC circuit breaker (#1716).
  *
@@ -28,6 +29,40 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /** Fixed row id: this process has exactly one (global) circuit breaker. */
 const ROW_ID = "rpc";
+
+/**
+ * Versioned schema migrations for the circuit breaker store (#2204).
+ * Each migration has a matching `down` statement so the schema can be
+ * rolled back to a previous version.
+ */
+const MIGRATIONS: SqliteMigration[] = [
+  {
+    version: 1,
+    name: "create_circuit_breaker_state",
+    up: `
+      CREATE TABLE IF NOT EXISTS circuit_breaker_state (
+        id TEXT PRIMARY KEY NOT NULL,
+        state TEXT NOT NULL,
+        failureCount INTEGER NOT NULL,
+        successCount INTEGER NOT NULL,
+        lastFailureTime INTEGER,
+        openedAt INTEGER,
+        attemptCount INTEGER NOT NULL,
+        updatedAt INTEGER NOT NULL
+      )
+    `,
+    down: `DROP TABLE IF EXISTS circuit_breaker_state`,
+  },
+  {
+    version: 2,
+    name: "index_circuit_breaker_state_updated_at",
+    up: `CREATE INDEX IF NOT EXISTS idx_circuit_breaker_state_updated_at ON circuit_breaker_state (updatedAt)`,
+    down: `DROP INDEX IF EXISTS idx_circuit_breaker_state_updated_at`,
+  },
+];
+
+/** Threshold (ms) above which a query is logged as slow (#2203). */
+const SLOW_QUERY_MS = Number(process.env.SQLITE_SLOW_QUERY_MS ?? 100);
 
 export type { PersistedCircuitBreakerState };
 
@@ -69,22 +104,8 @@ export class SqliteCircuitBreakerStore {
       this.getDb().run(`PRAGMA journal_mode=WAL`, (err: Error | null) => cb(err)),
     );
 
-    await withRetry<void>("circuit_breaker:initialize:createTable", (cb) =>
-      this.getDb().run(
-        `
-        CREATE TABLE IF NOT EXISTS circuit_breaker_state (
-          id TEXT PRIMARY KEY NOT NULL,
-          state TEXT NOT NULL,
-          failureCount INTEGER NOT NULL,
-          successCount INTEGER NOT NULL,
-          lastFailureTime INTEGER,
-          openedAt INTEGER,
-          attemptCount INTEGER NOT NULL,
-          updatedAt INTEGER NOT NULL
-        )
-        `,
-        (err: Error | null) => cb(err),
-      ),
+    await withRetry<void>("circuit_breaker:initialize:migrations", (cb) =>
+      applySqliteMigrations(this.getDb(), MIGRATIONS, (err: Error | null) => cb(err)),
     );
 
     this.initialized = true;
@@ -95,6 +116,7 @@ export class SqliteCircuitBreakerStore {
    * the (single) circuit breaker row.
    */
   async save(snapshot: PersistedCircuitBreakerState): Promise<void> {
+    const startedAt = Date.now();
     await withRetry<void>("circuit_breaker:save", (cb) =>
       this.getDb().run(
         `
@@ -123,10 +145,12 @@ export class SqliteCircuitBreakerStore {
         (err: Error | null) => cb(err),
       ),
     );
+    this.logSlowQuery("save", startedAt);
   }
 
   /** Returns the persisted state, or null if nothing has been saved yet. */
   async load(): Promise<PersistedCircuitBreakerState | null> {
+    const startedAt = Date.now();
     const row = await withRetry<any>("circuit_breaker:load", (cb) =>
       this.getDb().get(
         `SELECT * FROM circuit_breaker_state WHERE id = ?`,
@@ -134,6 +158,7 @@ export class SqliteCircuitBreakerStore {
         (err: Error | null, row: any) => cb(err, row),
       ),
     );
+    this.logSlowQuery("load", startedAt);
 
     if (!row) {
       return null;
@@ -147,6 +172,22 @@ export class SqliteCircuitBreakerStore {
       openedAt: row.openedAt ?? null,
       attemptCount: row.attemptCount,
     };
+  }
+
+  /** Log a `db_slow_query` warning when a query exceeds the threshold (#2203). */
+  private logSlowQuery(operation: string, startedAt: number): void {
+    const durationMs = Date.now() - startedAt;
+    if (durationMs > SLOW_QUERY_MS) {
+      console.warn(
+        JSON.stringify({
+          event: "db_slow_query",
+          store: "circuit_breaker",
+          operation,
+          durationMs,
+          thresholdMs: SLOW_QUERY_MS,
+        }),
+      );
+    }
   }
 
   async close(): Promise<void> {

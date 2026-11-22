@@ -68,3 +68,28 @@ it("masks unapproved event messages and serializes neither error objects nor nes
   });
   expect(log.mock.calls[0][0]).not.toContain("secret");
 });
+
+it("redacts PII and sensitive values from error logs", () => {
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  logger.error(
+    {
+      status: 598,
+      error_code: "INTERNAL_ERROR",
+      email: "person@example.com",
+      phone: "+1-555-0100",
+      walletAddress: "GPIIADDRESS",
+      error: new Error("private diagnostic"),
+    },
+    "http_error",
+  );
+
+  const output = log.mock.calls.map(([line]) => String(line)).join("\n");
+  expect(output).not.toMatch(
+    /person@example\.com|\+1-555-0100|GPIIADDRESS|private diagnostic/,
+  );
+  expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({
+    message: "http_error",
+    status: 598,
+  });
+  expect(JSON.parse(log.mock.calls[0][0]).error_code).toBeUndefined();
+});

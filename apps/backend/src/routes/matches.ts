@@ -10,6 +10,7 @@ import {
   ErrorCode,
   errorEnvelope,
   statusToErrorCode,
+  userFacingErrorMessage,
 } from '../errors/errorResponse.js';
 
 const router = Router();
@@ -65,9 +66,12 @@ router.post('/', async (req, res) => {
   });
 
   if (!result.ok) {
-    const message = result.details
-      ? `${result.error}: ${result.details}`
-      : result.error;
+    const message =
+      result.status >= 500
+        ? userFacingErrorMessage(result.status)
+        : result.details
+          ? `${result.error}: ${result.details}`
+          : result.error;
     return res
       .status(result.status)
       .json(errorEnvelope(statusToErrorCode(result.status), message));
