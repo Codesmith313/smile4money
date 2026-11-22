@@ -2,6 +2,8 @@ import sqlite3 from 'sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Evidence } from '../fetchers/result.js';
+import { applySqliteMigrations } from './sqlite-migrations.js';
+import { SQLITE_SCHEMA_MIGRATIONS } from './sqlite-schema-migrations.js';
 
 export interface Decision {
   id?: number;
@@ -43,18 +45,7 @@ export class SqliteEvidenceStore implements EvidenceStore {
         err ? reject(err) : resolve(),
       );
     });
-    await new Promise<void>((resolve, reject) =>
-      this.db!.run(
-        `CREATE TABLE IF NOT EXISTS oracle_decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, gameId TEXT NOT NULL, decision TEXT NOT NULL)`,
-        (err) => (err ? reject(err) : resolve()),
-      ),
-    );
-    await new Promise<void>((resolve, reject) =>
-      this.db!.run(
-        'CREATE INDEX IF NOT EXISTS oracle_decisions_game ON oracle_decisions(gameId, id)',
-        (err) => (err ? reject(err) : resolve()),
-      ),
-    );
+    await applySqliteMigrations(this.db!, SQLITE_SCHEMA_MIGRATIONS['oracle-evidence']);
   }
   async history(gameId: string): Promise<Decision[]> {
     if (!this.db) throw new Error('Evidence store not initialized');

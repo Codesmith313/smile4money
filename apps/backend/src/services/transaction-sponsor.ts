@@ -9,6 +9,8 @@ import {
 import sqlite3 from "sqlite3";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
+import { applySqliteMigrations } from "../store/sqlite-migrations.js";
+import { SQLITE_SCHEMA_MIGRATIONS } from "../store/sqlite-schema-migrations.js";
 
 export interface SponsorPolicy {
   secret: string;
@@ -63,9 +65,7 @@ async function reserve(
       ),
     );
   try {
-    await run(
-      "CREATE TABLE IF NOT EXISTS sponsorships (hash TEXT PRIMARY KEY, source TEXT NOT NULL, sequence TEXT NOT NULL, day INTEGER NOT NULL, fee INTEGER NOT NULL, UNIQUE(source, sequence))",
-    );
+    await applySqliteMigrations(db, SQLITE_SCHEMA_MIGRATIONS.sponsorship);
     await run("BEGIN IMMEDIATE");
     const day = Math.floor(now / 86400);
     const budget = await get(

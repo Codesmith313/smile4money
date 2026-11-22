@@ -25,6 +25,8 @@ import type {
   PersistentQueueStore,
 } from "./persistent-queue-store.js";
 import logger from "../logger.js";
+import { applySqliteMigrations } from "./sqlite-migrations.js";
+import { SQLITE_SCHEMA_MIGRATIONS } from "./sqlite-schema-migrations.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -187,39 +189,7 @@ export class SQLiteQueueStore implements PersistentQueueStore {
     });
     await configureSqlite(this.getDb());
 
-    await withRetry<void>("initialize:createTable", (cb) =>
-      this.getDb().run(
-        `
-        CREATE TABLE IF NOT EXISTS oracle_dlq (
-          id TEXT PRIMARY KEY NOT NULL,
-          payload TEXT NOT NULL,
-          failureReason TEXT NOT NULL,
-          attempts INTEGER NOT NULL DEFAULT 0,
-          createdAt INTEGER NOT NULL,
-          lastAttemptAt INTEGER,
-          expireAt INTEGER NOT NULL,
-          CONSTRAINT expireAt_check CHECK (expireAt > 0)
-        )
-        `,
-        (err: Error | null) => cb(err),
-      ),
-    );
-
-    await withRetry<void>("initialize:createIndex", (cb) =>
-      this.getDb().run(
-        `CREATE INDEX IF NOT EXISTS idx_oracle_dlq_expireAt ON oracle_dlq(expireAt)`,
-        (err: Error | null) => cb(err),
-      ),
-    );
-
-    // Indexes on frequently queried columns (#2203): expireAt is used by
-    // deleteExpired/count, createdAt by the getAll ordering.
-    await withRetry<void>("initialize:createIndexCreatedAt", (cb) =>
-      this.getDb().run(
-        `CREATE INDEX IF NOT EXISTS idx_oracle_dlq_created_at ON oracle_dlq(createdAt)`,
-        (err: Error | null) => cb(err),
-      ),
-    );
+    await applySqliteMigrations(this.getDb(), SQLITE_SCHEMA_MIGRATIONS["oracle-queue"]);
 
     this.initialized = true;
   }

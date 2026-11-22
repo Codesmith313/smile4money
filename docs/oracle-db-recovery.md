@@ -29,7 +29,7 @@ The scheduler backs up both `oracle-queue.db` and `match-store.db` on each run.
 Three mechanisms keep this document honest:
 
 - **Integrity checks** (`apps/backend/src/store/sqlite-integrity.ts`) run periodically against the live databases, record every result, and alert on failure. They catch corruption before a backup or restore depends on it.
-- **Schema migrations** (`apps/backend/src/store/sqlite-migrate.ts`) version every schema change, track the current version in the database, and can roll back.
+- **Schema migrations** (`apps/backend/src/store/sqlite-migrations.ts`) version schema changes, track applied versions in each database, and support rollback.
 - **The quarterly drill** exercises a real restore with `verifyRestore` and confirms the RTO/RPO targets below still hold.
 
 ## What is protected
@@ -104,21 +104,25 @@ Example crontab entry:
 
 ## Schema migrations
 
-Schema changes are versioned and applied systematically by `apps/backend/src/store/sqlite-migrate.ts`:
+Schema changes are managed by the backend's custom SQLite migration runner in `apps/backend/src/store/sqlite-migrations.ts`:
 
-- **Versioned migrations.** Each migration has a monotonically increasing version and an `up` and `down` step.
-- **Current version tracked.** The applied version is stored in the database itself, so the service knows exactly what schema it is running against.
-- **Rollback capability.** Every migration can be rolled back to the previous version.
+- **Versioned migrations.** Each migration has a consecutive version, an `up` step, and a `down` step.
+- **Current version tracked.** Applied migrations are recorded in the database's `schema_version` table.
+- **Rollback capability.** Migrations can be rolled back to a requested version; `down` steps run in reverse order.
 
 ```sh
 cd apps/backend
 # Apply all pending migrations.
 npx tsx src/cli/db-backup.ts migrate data/oracle-queue.db
-# Roll back the most recent migration.
-npx tsx src/cli/db-backup.ts rollback data/oracle-queue.db
+# Show the current applied schema version.
+npx tsx src/cli/db-backup.ts status data/oracle-queue.db
+# Roll back to version 1 (version 0 removes all migrations).
+npx tsx src/cli/db-backup.ts rollback data/oracle-queue.db 1
 ```
 
-Migrations run automatically on startup and are applied before the service accepts work. Take a backup before applying migrations in production so a failed migration can be rolled back or restored.
+Migration sets are registered in `apps/backend/src/store/sqlite-schema-migrations.ts`. The CLI infers the set from standard database filenames; pass the set name as an additional argument for a custom filename, for example `migrate /data/custom.db oracle-queue`. Supported sets are `match-store`, `oracle-queue`, `oracle-evidence`, `rate-limit`, `circuit-breaker`, `settlement`, and `sponsorship`.
+
+Migrations run automatically on startup and are applied before the store accepts work. Each migration and its version marker commit atomically. Rollback may remove stored data, so back up the database before applying or rolling back migrations in production.
 
 ## Restoring
 
