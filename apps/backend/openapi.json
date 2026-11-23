@@ -543,6 +543,15 @@
           "gameId": {
             "type": "string"
           },
+          "stale": {
+            "type": "boolean",
+            "description": "True when returned from cache because the provider is unavailable."
+          },
+          "cacheAgeMs": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Age of the cached result in milliseconds when stale is true."
+          },
           "status": {
             "type": "string"
           },
@@ -578,6 +587,15 @@
           },
           "message": {
             "type": "string"
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "True when eligibility was evaluated from cached provider data."
+          },
+          "cacheAgeMs": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Age of the cached result in milliseconds when stale is true."
           },
           "error": {
             "type": "object",

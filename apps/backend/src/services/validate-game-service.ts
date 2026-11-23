@@ -15,6 +15,33 @@ import {
   type EligibilityRejection,
   type GameMetadata,
 } from './game-eligibility.js';
+import type { NormalizedGameResult } from '../fetchers/result.js';
+import type { CachedProviderResult } from './provider-result-cache.js';
+import {
+  ProviderResultCache,
+  providerCacheConfigFromEnv,
+} from './provider-result-cache.js';
+
+let validateGameCache: ProviderResultCache<NormalizedGameResult> | undefined;
+
+function getValidateGameCache(): ProviderResultCache<NormalizedGameResult> {
+  validateGameCache ??= new ProviderResultCache(providerCacheConfigFromEnv());
+  return validateGameCache;
+}
+
+export function initializeValidateGameCache(): void {
+  getValidateGameCache();
+}
+
+export function resetValidateGameCache(): void {
+  validateGameCache?.clear();
+  validateGameCache = undefined;
+}
+
+interface StalenessMetadata {
+  stale: boolean;
+  cacheAgeMs?: number;
+}
 
 export interface ValidateGameInput {
   gameId: string;
@@ -25,6 +52,8 @@ export interface ValidateGameInput {
 export interface ValidateGameSuccess {
   ok: true;
   valid: true;
+  stale: boolean;
+  cacheAgeMs?: number;
   platform: string;
   gameId: string;
   status?: string;
@@ -57,6 +86,8 @@ export interface ValidateGameIneligible {
   ok: false;
   status: 422;
   valid: false;
+  stale: boolean;
+  cacheAgeMs?: number;
   platform: string;
   gameId: string;
   message: string;
@@ -84,6 +115,7 @@ function ineligibleResponse(
   platform: string,
   gameId: string,
   game: FetchedGame,
+  cached: CachedProviderResult<NormalizedGameResult>,
 ): ValidateGameIneligible | null {
   const { eligible, rejections } = checkGameEligibility({
     ...game.metadata,
@@ -94,11 +126,20 @@ function ineligibleResponse(
     ok: false,
     status: 422,
     valid: false,
+    ...stalenessMetadata(cached),
     platform,
     gameId,
     message: rejections.map((r) => r.message).join(' '),
     rejections,
   };
+}
+
+function stalenessMetadata(
+  cached: CachedProviderResult<NormalizedGameResult>,
+): StalenessMetadata {
+  return cached.stale
+    ? { stale: true, cacheAgeMs: cached.cacheAgeMs }
+    : { stale: false };
 }
 
 /**
@@ -130,17 +171,31 @@ export function validateGameInput(input: Partial<ValidateGameInput>): string | n
  *
  * Assumes input has already been validated by `validateGameInput`.
  */
-export async function validateGame(input: ValidateGameInput): Promise<ValidateGameResult> {
+export async function validateGame(
+  input: ValidateGameInput,
+  cache: ProviderResultCache<NormalizedGameResult> = getValidateGameCache(),
+): Promise<ValidateGameResult> {
   const { gameId, platform, username } = input;
 
   try {
     if (platform === 'lichess') {
-      const result = await fetchLichessResult(gameId);
-      const ineligible = ineligibleResponse('lichess', result.gameId, result);
+      const cached = await cache.get(
+        JSON.stringify(['lichess', gameId]),
+        'lichess',
+        () => fetchLichessResult(gameId),
+      );
+      const result = cached.value;
+      const ineligible = ineligibleResponse(
+        'lichess',
+        result.gameId,
+        result,
+        cached,
+      );
       if (ineligible) return ineligible;
       return {
         ok: true,
         valid: true,
+        ...stalenessMetadata(cached),
         platform: 'lichess',
         gameId: result.gameId,
         status: result.status,
@@ -150,12 +205,23 @@ export async function validateGame(input: ValidateGameInput): Promise<ValidateGa
       };
     } else {
       // chessdotcom — username already validated by validateGameInput
-      const result = await fetchChessDotComResult(username as string, gameId);
-      const ineligible = ineligibleResponse('chessdotcom', result.gameId, result);
+      const cached = await cache.get(
+        JSON.stringify(['chessdotcom', username?.toLowerCase(), gameId]),
+        'chessdotcom',
+        () => fetchChessDotComResult(username as string, gameId),
+      );
+      const result = cached.value;
+      const ineligible = ineligibleResponse(
+        'chessdotcom',
+        result.gameId,
+        result,
+        cached,
+      );
       if (ineligible) return ineligible;
       return {
         ok: true,
         valid: true,
+        ...stalenessMetadata(cached),
         platform: 'chessdotcom',
         gameId: result.gameId,
         status: result.status,

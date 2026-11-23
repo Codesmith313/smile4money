@@ -1592,6 +1592,8 @@ Each error code carries a fixed, actionable recovery suggestion and a documentat
 
 `/api/validate-game` also retains its `valid`/`platform`/`gameId`/`message` fields at the top level for backward compatibility. A failed `/health` response uses the same error envelope; health status and dependency diagnostics are included in `error.details`.
 
+Successful game-validation responses include `stale: false` when freshly verified or `stale: true` when a recent cached result is being served during a provider outage. Stale responses include `cacheAgeMs`. The maximum accepted cache age is configured with `PROVIDER_CACHE_STALE_TOLERANCE_MS` (default 300000 ms); the service retries the provider asynchronously after returning stale data. This cache applies only to game validation, not Oracle settlement evidence.
+
 ### Error Codes
 
 | Code | HTTP Status | Meaning |

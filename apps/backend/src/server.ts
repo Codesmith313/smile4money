@@ -13,6 +13,7 @@ import { PollingJobStore, PollingWorker, parsePollingIntervalMs } from './servic
 import ChessPlatformPoller from './services/game-poller.js';
 import { getCurrentLedger } from './services/stellar.js';
 import { retryDlqSubmission, type OracleSubmission } from './services/oracle-submit.js';
+import { initializeValidateGameCache } from './services/validate-game-service.js';
 import { createShutdownHandler } from './shutdown.js';
 import { resolveNetworkConfig } from './config/network.js';
 import logger from './logger.js';
@@ -66,6 +67,8 @@ async function retryOracleSubmission(entry: DlqEntry): Promise<void> {
 
 async function main() {
   try {
+    initializeValidateGameCache();
+
     // #118 — fail fast on a network identity conflict (e.g. mainnet with the
     // testnet RPC, or another network's contract id) before touching any store.
     const network = resolveNetworkConfig(process.env);
