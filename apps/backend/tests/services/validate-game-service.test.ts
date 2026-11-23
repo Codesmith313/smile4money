@@ -11,6 +11,7 @@ import {
   validateGameInput,
   validateGame,
 } from '../../src/services/validate-game-service.js';
+import { clearGameValidationCache } from '../../src/services/game-validation-cache.js';
 
 // ---------------------------------------------------------------------------
 // Mock external fetchers
@@ -100,7 +101,10 @@ describe('validateGameInput', () => {
 // validateGame — lichess
 // ---------------------------------------------------------------------------
 describe('validateGame (lichess)', () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearGameValidationCache();
+  });
 
   it('returns ok:true with game details when lichess game exists', async () => {
     mockFetchLichess.mockResolvedValue(LICHESS_GAME);
@@ -162,7 +166,10 @@ describe('validateGame (lichess)', () => {
 // validateGame — chessdotcom
 // ---------------------------------------------------------------------------
 describe('validateGame (chessdotcom)', () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearGameValidationCache();
+  });
 
   it('returns ok:true with game details when chess.com game exists', async () => {
     mockFetchChess.mockResolvedValue(CHESS_GAME);

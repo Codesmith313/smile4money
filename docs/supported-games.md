@@ -54,6 +54,8 @@ The validation endpoint (`POST /api/validate-game`) checks each rule it can read
 
 A private or deleted game cannot be fetched at all and gets `404` (`NOT_FOUND`) instead.
 
+Match creation also fetches the game from the selected provider before persisting the match, so an unknown game ID is rejected before a match is created. Successful provider lookups are shared with `/api/validate-game` and cached for 30 seconds; failed lookups are not cached.
+
 The rules live in `apps/backend/src/services/game-eligibility.ts` and are covered by `apps/backend/tests/services/game-eligibility.test.ts`. Change this page, the module and its tests together.
 
 ### What is checked today

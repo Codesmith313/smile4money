@@ -47,6 +47,7 @@ vi.mock('../../src/services/stellar.js', () => ({
 import app from '../../src/app.js';
 import { fetchLichessResult } from '../../src/fetchers/lichess.js';
 import { checkStellarRpc } from '../../src/services/stellar.js';
+import { clearGameValidationCache } from '../../src/services/game-validation-cache.js';
 
 const mockFetchLichessResult = vi.mocked(fetchLichessResult);
 const mockCheckStellarRpc = vi.mocked(checkStellarRpc);
@@ -105,6 +106,7 @@ class SimulatedEscrow {
 describe('integration: full match lifecycle (create → deposit×2 → game result fetched → oracle submits)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearGameValidationCache();
     delete process.env.DEEP_HEALTH;
   });
 
