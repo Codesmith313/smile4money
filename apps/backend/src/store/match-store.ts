@@ -1,4 +1,5 @@
 import { computeIdentityHash } from '../services/player-identity.js';
+import { randomUUID } from 'node:crypto';
 
 export interface MatchRecord {
   matchId: number;
@@ -10,7 +11,7 @@ export interface MatchRecord {
   token: string;
   gameId: string;
   platform: string;
-  state: 'Pending';
+  state: MatchState;
   /**
    * SHA-256 binding of (player1Username, player1, player2Username, player2),
    * computed once at creation (#1720). Verified against a fresh recomputation
@@ -20,6 +21,44 @@ export interface MatchRecord {
    */
   identityHash?: string;
   evidence?: CanonicalSettlementEvidence;
+}
+
+export type MatchState = 'Pending' | 'Active' | 'PendingResult' | 'Completed' | 'Cancelled';
+const MATCH_STATE_VALUES = new Set<string>([
+  'Pending',
+  'Active',
+  'PendingResult',
+  'Completed',
+  'Cancelled',
+]);
+
+export function isMatchState(value: unknown): value is MatchState {
+  return typeof value === 'string' && MATCH_STATE_VALUES.has(value);
+}
+
+export interface WebhookSubscription {
+  id: string;
+  matchId: number;
+  owner: string;
+  url: string;
+  secret: string;
+  createdAt: number;
+}
+
+export interface WebhookDelivery {
+  id: string;
+  eventId: string;
+  subscriptionId: string;
+  url: string;
+  secret: string;
+  payload: string;
+  attempts: number;
+}
+
+export interface MatchStateChange {
+  match: MatchRecord;
+  previousState: MatchState;
+  state: MatchState;
 }
 
 export interface CanonicalSettlementEvidence {
@@ -49,17 +88,32 @@ export interface CreateMatchPayload {
 export interface MatchStorePort {
   createMatch(payload: CreateMatchPayload): Promise<MatchRecord>;
   findByGameId(gameId: string): Promise<MatchRecord | null>;
+  findByMatchId(matchId: number): Promise<MatchRecord | null>;
+  listMatchesForStateSync(): Promise<MatchRecord[]>;
+  updateMatchState(matchId: number, state: MatchState): Promise<MatchStateChange | null>;
+  createWebhookSubscription(
+    input: Omit<WebhookSubscription, 'createdAt'>,
+  ): Promise<WebhookSubscription>;
+  listWebhookSubscriptions(owner: string): Promise<Omit<WebhookSubscription, 'secret'>[]>;
+  deleteWebhookSubscription(id: string, owner: string): Promise<boolean>;
+  getDueWebhookDeliveries(now: number, limit: number): Promise<WebhookDelivery[]>;
+  completeWebhookDelivery(
+    id: string,
+    result: { success: true } | { success: false; error: string; nextAttemptAt: number; terminal: boolean },
+  ): Promise<void>;
   count(): Promise<number>;
   saveSettlementEvidence(evidence: CanonicalSettlementEvidence): Promise<void>;
   getSettlementEvidence(matchId: number): Promise<CanonicalSettlementEvidence | null>;
   getSettlementEvidenceHistory(matchId: number): Promise<CanonicalSettlementEvidence[]>;
 }
 
-export class MatchStore {
+export class MatchStore implements MatchStorePort {
   private matches = new Map<number, MatchRecord>();
   private gameIds = new Set<string>();
   private nextId = 0;
   private evidenceByMatch = new Map<number, CanonicalSettlementEvidence[]>();
+  private webhookSubscriptions = new Map<string, WebhookSubscription>();
+  private webhookDeliveries = new Map<string, WebhookDelivery & { nextAttemptAt: number; delivered: boolean; lastError?: string }>();
 
   async saveSettlementEvidence(evidence: CanonicalSettlementEvidence): Promise<void> {
     const records = this.evidenceByMatch.get(evidence.matchId) ?? [];
@@ -128,6 +182,108 @@ export class MatchStore {
     return null;
   }
 
+  async findByMatchId(matchId: number): Promise<MatchRecord | null> {
+    const match = this.matches.get(matchId);
+    return match ? { ...match } : null;
+  }
+
+  async listMatchesForStateSync(): Promise<MatchRecord[]> {
+    return [...this.matches.values()]
+      .filter((match) => match.state !== 'Completed' && match.state !== 'Cancelled')
+      .map((match) => ({ ...match }));
+  }
+
+  async updateMatchState(matchId: number, state: MatchState): Promise<MatchStateChange | null> {
+    const match = this.matches.get(matchId);
+    if (!match || match.state === state) return null;
+    const previousState = match.state;
+    match.state = state;
+    const eventId = randomUUID();
+    const payload = JSON.stringify({
+      id: eventId,
+      type: 'match.state_changed',
+      occurredAt: new Date().toISOString(),
+      data: { matchId, gameId: match.gameId, previousState, state },
+    });
+    for (const subscription of this.webhookSubscriptions.values()) {
+      if (subscription.matchId === matchId) {
+        const id = randomUUID();
+        this.webhookDeliveries.set(id, {
+          id,
+          eventId,
+          subscriptionId: subscription.id,
+          url: subscription.url,
+          secret: subscription.secret,
+          payload,
+          attempts: 0,
+          nextAttemptAt: Date.now(),
+          delivered: false,
+        });
+      }
+    }
+    return { match: { ...match }, previousState, state };
+  }
+
+  async createWebhookSubscription(
+    input: Omit<WebhookSubscription, 'createdAt'>,
+  ): Promise<WebhookSubscription> {
+    const match = this.matches.get(input.matchId);
+    if (!match) throw new Error('Match not found');
+    if (
+      match.player1.toUpperCase() !== input.owner.toUpperCase() &&
+      match.player2.toUpperCase() !== input.owner.toUpperCase()
+    ) {
+      throw new Error('Only a match participant can subscribe to its webhooks');
+    }
+    const duplicate = [...this.webhookSubscriptions.values()].some(
+      (subscription) =>
+        subscription.matchId === input.matchId &&
+        subscription.owner.toUpperCase() === input.owner.toUpperCase() &&
+        subscription.url === input.url,
+    );
+    if (duplicate) throw new Error('UNIQUE constraint failed: webhook_subscriptions');
+    const subscription = { ...input, owner: input.owner.toUpperCase(), createdAt: Date.now() };
+    this.webhookSubscriptions.set(input.id, subscription);
+    return { ...subscription };
+  }
+
+  async listWebhookSubscriptions(owner: string): Promise<Omit<WebhookSubscription, 'secret'>[]> {
+    return [...this.webhookSubscriptions.values()]
+      .filter((subscription) => subscription.owner.toUpperCase() === owner.toUpperCase())
+      .map(({ secret: _secret, ...subscription }) => ({ ...subscription }));
+  }
+
+  async deleteWebhookSubscription(id: string, owner: string): Promise<boolean> {
+    const subscription = this.webhookSubscriptions.get(id);
+    if (!subscription || subscription.owner.toUpperCase() !== owner.toUpperCase()) return false;
+    this.webhookSubscriptions.delete(id);
+    for (const [deliveryId, delivery] of this.webhookDeliveries) {
+      if (delivery.subscriptionId === id && !delivery.delivered) this.webhookDeliveries.delete(deliveryId);
+    }
+    return true;
+  }
+
+  async getDueWebhookDeliveries(now: number, limit: number): Promise<WebhookDelivery[]> {
+    return [...this.webhookDeliveries.values()]
+      .filter((delivery) => !delivery.delivered && delivery.nextAttemptAt <= now)
+      .slice(0, limit)
+      .map(({ nextAttemptAt: _next, delivered: _delivered, lastError: _error, ...delivery }) => ({ ...delivery }));
+  }
+
+  async completeWebhookDelivery(
+    id: string,
+    result: { success: true } | { success: false; error: string; nextAttemptAt: number; terminal: boolean },
+  ): Promise<void> {
+    const delivery = this.webhookDeliveries.get(id);
+    if (!delivery) return;
+    delivery.attempts += 1;
+    if (result.success || result.terminal) delivery.delivered = true;
+    else {
+      delivery.nextAttemptAt = result.nextAttemptAt;
+      delivery.lastError = result.error;
+    }
+  }
+
   async unlinkIdentities(address: string): Promise<number> {
     let count = 0;
     for (const match of this.matches.values()) {
@@ -153,5 +309,7 @@ export class MatchStore {
     this.gameIds.clear();
     this.nextId = 0;
     this.evidenceByMatch.clear();
+    this.webhookSubscriptions.clear();
+    this.webhookDeliveries.clear();
   }
 }

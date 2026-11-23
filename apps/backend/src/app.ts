@@ -6,17 +6,15 @@ import validateGameRouter from './routes/validate-game.js';
 import reviewRouter from './routes/oracle-review.js';
 import oracleRouter from './routes/oracle.js';
 import playerIdentityRouter from './routes/player-identity.js';
+import webhookRouter from './routes/webhooks.js';
 import { errorToHttpStatus, errorCodeFromStatus } from './errors/errorToHttpStatus.js';
-import { errorEnvelope } from './errors/errorEnvelope.js';
 import { requestLogging } from './middleware/request-logging.js';
 import queueReplayRouter from './routes/queue-replay.js';
-import { errorToHttpStatus } from './errors/errorToHttpStatus.js';
 import {
   ErrorCode,
   errorEnvelope,
   userFacingErrorMessage,
 } from './errors/errorResponse.js';
-import { requestLogging } from './middleware/request-logging.js';
 import { traceContext } from './middleware/trace-context.js';
 import errorHandler from './middleware/error-handler.js';
 
@@ -72,6 +70,7 @@ app.use('/api/validate-game', validateGameRouter);
 app.use('/api/oracle/reviews', reviewRouter);
 app.use('/api/oracle', oracleRouter);
 app.use('/api/player-identity', playerIdentityRouter);
+app.use('/api/webhooks', webhookRouter);
 // #2184 — manual replay of failed queue entries (POST /queue/:id/replay).
 app.use('/queue', queueReplayRouter);
 

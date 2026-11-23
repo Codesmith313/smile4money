@@ -122,6 +122,130 @@
         }
       }
     },
+    "/api/webhooks": {
+      "get": {
+        "operationId": "listWebhookSubscriptions",
+        "summary": "List the authenticated player's webhook subscriptions",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Subscriptions (signing secrets are never returned)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/WebhookSubscription"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "createWebhookSubscription",
+        "summary": "Subscribe a match participant to signed state-change events",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWebhookSubscriptionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Subscription created; secret is returned only once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateWebhookSubscriptionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid match ID or webhook URL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Authenticated player is not a match participant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/webhooks/{id}": {
+      "delete": {
+        "operationId": "deleteWebhookSubscription",
+        "summary": "Delete an owned webhook subscription",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Subscription deleted"
+          },
+          "404": {
+            "description": "Subscription not found or not owned by caller",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/validate-game": {
       "post": {
         "operationId": "validateGame",
@@ -452,6 +576,72 @@
           }
         }
       },
+      "CreateWebhookSubscriptionRequest": {
+        "type": "object",
+        "required": [
+          "matchId",
+          "url"
+        ],
+        "properties": {
+          "matchId": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Public HTTPS URL. Local/private IP destinations and redirects are not allowed."
+          }
+        }
+      },
+      "WebhookSubscription": {
+        "type": "object",
+        "required": [
+          "id",
+          "matchId",
+          "owner",
+          "url",
+          "createdAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "matchId": {
+            "type": "integer"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "createdAt": {
+            "type": "integer"
+          }
+        }
+      },
+      "CreateWebhookSubscriptionResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/WebhookSubscription"
+          },
+          {
+            "type": "object",
+            "required": [
+              "secret"
+            ],
+            "properties": {
+              "secret": {
+                "type": "string",
+                "description": "Signing secret returned only at creation time."
+              }
+            }
+          }
+        ]
+      },
       "Match": {
         "type": "object",
         "required": [
@@ -495,7 +685,11 @@
           "state": {
             "type": "string",
             "enum": [
-              "Pending"
+              "Pending",
+              "Active",
+              "PendingResult",
+              "Completed",
+              "Cancelled"
             ]
           },
           "identityHash": {

@@ -9,8 +9,21 @@ import sqlite3 from 'sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import type { CanonicalSettlementEvidence, MatchRecord } from './match-store.js';
+import type {
+  CanonicalSettlementEvidence,
+  CreateMatchPayload,
+  isMatchState,
+  MatchRecord,
+  MatchStorePort,
+} from './match-store.js';
+import type {
+  MatchState,
+  MatchStateChange,
+  WebhookDelivery,
+  WebhookSubscription,
+} from './match-store.js';
 import { computeIdentityHash } from '../services/player-identity.js';
+import { randomUUID } from 'node:crypto';
 import { SqliteConnectionPool } from './sqlite-connection-pool.js';
 import { getCurrentSchemaVersion, applySqliteMigrations } from './sqlite-migrations.js';
 import { SQLITE_SCHEMA_MIGRATIONS } from './sqlite-schema-migrations.js';
@@ -39,6 +52,31 @@ function runAsync(db: sqlite3.Database, sql: string): Promise<void> {
   });
 }
 
+function runWithParams(db: sqlite3.Database, sql: string, params: unknown[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, (err: Error | null) => (err ? reject(err) : resolve()));
+  });
+}
+
+function readMatch(row: any): MatchRecord {
+  if (!isMatchState(row.state)) {
+    throw new Error(`Unknown persisted match state: ${String(row.state)}`);
+  }
+  return {
+    matchId: row.matchId,
+    player1: row.player1,
+    player2: row.player2,
+    player1Username: row.player1Username ?? undefined,
+    player2Username: row.player2Username ?? undefined,
+    stakeAmount: row.stakeAmount,
+    token: row.token,
+    gameId: row.gameId,
+    platform: row.platform,
+    state: row.state,
+    identityHash: row.identityHash ?? undefined,
+  };
+}
+
 function logSlowQuery(query: string, durationMs: number): void {
   if (durationMs > SQLITE_SLOW_QUERY_MS) {
     console.warn('db_slow_query', {
@@ -49,18 +87,7 @@ function logSlowQuery(query: string, durationMs: number): void {
   }
 }
 
-interface CreateMatchPayload {
-  player1: string;
-  player2: string;
-  player1Username?: string;
-  player2Username?: string;
-  stakeAmount: number;
-  token: string;
-  gameId: string;
-  platform: string;
-}
-
-export class SqliteMatchStore {
+export class SqliteMatchStore implements MatchStorePort {
   private pool: SqliteConnectionPool | null = null;
   private dbPath: string;
   private nextId = 0;
@@ -210,22 +237,198 @@ export class SqliteMatchStore {
             resolve(null);
             return;
           }
-          resolve({
-            matchId: row.matchId,
-            player1: row.player1,
-            player2: row.player2,
-            player1Username: row.player1Username ?? undefined,
-            player2Username: row.player2Username ?? undefined,
-            stakeAmount: row.stakeAmount,
-            token: row.token,
-            gameId: row.gameId,
-            platform: row.platform,
-            state: row.state,
-            identityHash: row.identityHash ?? undefined,
-          });
+          resolve(readMatch(row));
         },
       );
     }));
+  }
+
+  async findByMatchId(matchId: number): Promise<MatchRecord | null> {
+    return this.withConnection((db) => new Promise((resolve, reject) => {
+      db.get('SELECT * FROM matches WHERE matchId = ?', [matchId], (err: Error | null, row: any) => {
+        if (err) reject(err);
+        else resolve(row ? readMatch(row) : null);
+      });
+    }));
+  }
+
+  async listMatchesForStateSync(): Promise<MatchRecord[]> {
+    return this.withConnection((db) => new Promise((resolve, reject) => {
+      db.all(
+        `SELECT * FROM matches WHERE state NOT IN ('Completed', 'Cancelled') ORDER BY matchId`,
+        (err: Error | null, rows: any[]) => {
+          if (err) reject(err);
+          else resolve(rows.map(readMatch));
+        },
+      );
+    }));
+  }
+
+  async updateMatchState(matchId: number, state: MatchState): Promise<MatchStateChange | null> {
+    return this.withConnection(async (db) => {
+      await runAsync(db, 'BEGIN IMMEDIATE');
+      try {
+        const row = await new Promise<any>((resolve, reject) => db.get(
+          'SELECT * FROM matches WHERE matchId = ?', [matchId],
+          (err: Error | null, result: any) => err ? reject(err) : resolve(result),
+        ));
+        if (!row) {
+          await runAsync(db, 'COMMIT');
+          return null;
+        }
+        const match = readMatch(row);
+        if (match.state === state) {
+          await runAsync(db, 'COMMIT');
+          return null;
+        }
+        const previousState = match.state;
+        await runWithParams(db, 'UPDATE matches SET state = ? WHERE matchId = ?', [state, matchId]);
+        const subscriptions = await new Promise<Array<{ id: string; url: string; secret: string }>>(
+          (resolve, reject) => db.all(
+            'SELECT id, url, secret FROM webhook_subscriptions WHERE matchId = ?',
+            [matchId],
+            (err: Error | null, rows: Array<{ id: string; url: string; secret: string }>) =>
+              err ? reject(err) : resolve(rows),
+          ),
+        );
+        if (subscriptions.length > 0) {
+          const eventId = randomUUID();
+          const payload = JSON.stringify({
+            id: eventId,
+            type: 'match.state_changed',
+            occurredAt: new Date().toISOString(),
+            data: { matchId, gameId: match.gameId, previousState, state },
+          });
+          for (const subscription of subscriptions) {
+            await runWithParams(
+              db,
+              `INSERT INTO webhook_deliveries
+                (id, eventId, subscriptionId, url, secret, payload, nextAttemptAt)
+               VALUES (?, ?, ?, ?, ?, ?, ?)`,
+              [randomUUID(), eventId, subscription.id, subscription.url, subscription.secret, payload, Date.now()],
+            );
+          }
+        }
+        await runAsync(db, 'COMMIT');
+        return { match: { ...match, state }, previousState, state };
+      } catch (error) {
+        await runAsync(db, 'ROLLBACK').catch(() => undefined);
+        throw error;
+      }
+    });
+  }
+
+  async createWebhookSubscription(
+    input: Omit<WebhookSubscription, 'createdAt'>,
+  ): Promise<WebhookSubscription> {
+    const now = Date.now();
+    await this.withConnection((db) => new Promise<void>((resolve, reject) => {
+      db.get(
+        'SELECT player1, player2 FROM matches WHERE matchId = ?',
+        [input.matchId],
+        (error: Error | null, match: { player1: string; player2: string } | undefined) => {
+          if (error) return reject(error);
+          if (!match) return reject(new Error('Match not found'));
+          if (match.player1.toUpperCase() !== input.owner.toUpperCase() &&
+              match.player2.toUpperCase() !== input.owner.toUpperCase()) {
+            return reject(new Error('Only a match participant can subscribe to its webhooks'));
+          }
+          db.run(
+            `INSERT INTO webhook_subscriptions (id, matchId, owner, url, secret, createdAt)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [input.id, input.matchId, input.owner.toUpperCase(), input.url, input.secret, now],
+            (err: Error | null) => {
+              if (err) reject(err);
+              else resolve();
+            },
+          );
+        },
+      );
+    }));
+    return { ...input, owner: input.owner.toUpperCase(), createdAt: now };
+  }
+
+  async listWebhookSubscriptions(owner: string): Promise<Omit<WebhookSubscription, 'secret'>[]> {
+    return this.withConnection((db) => new Promise((resolve, reject) => {
+      db.all(
+        `SELECT id, matchId, owner, url, createdAt FROM webhook_subscriptions
+         WHERE UPPER(owner) = UPPER(?) ORDER BY createdAt`,
+        [owner],
+        (error: Error | null, rows: Array<Omit<WebhookSubscription, 'secret'>>) =>
+          error ? reject(error) : resolve(rows),
+      );
+    }));
+  }
+
+  async deleteWebhookSubscription(id: string, owner: string): Promise<boolean> {
+    return this.withConnection(async (db) => {
+      await runAsync(db, 'BEGIN IMMEDIATE');
+      try {
+        const deleted = await new Promise<boolean>((resolve, reject) => {
+          db.run(
+            'DELETE FROM webhook_subscriptions WHERE id = ? AND UPPER(owner) = UPPER(?)',
+            [id, owner],
+            function (this: sqlite3.RunResult, error: Error | null) {
+              if (error) reject(error);
+              else resolve(this.changes > 0);
+            },
+          );
+        });
+        if (deleted) {
+          await runWithParams(
+            db,
+            'DELETE FROM webhook_deliveries WHERE subscriptionId = ? AND deliveredAt IS NULL AND deadAt IS NULL',
+            [id],
+          );
+        }
+        await runAsync(db, 'COMMIT');
+        return deleted;
+      } catch (error) {
+        await runAsync(db, 'ROLLBACK').catch(() => undefined);
+        throw error;
+      }
+    });
+  }
+
+  async getDueWebhookDeliveries(now: number, limit: number): Promise<WebhookDelivery[]> {
+    return this.withConnection((db) => new Promise((resolve, reject) => {
+      db.all(
+        `SELECT id, eventId, subscriptionId, url, secret, payload, attempts
+         FROM webhook_deliveries
+         WHERE deliveredAt IS NULL AND deadAt IS NULL AND nextAttemptAt <= ?
+         ORDER BY nextAttemptAt LIMIT ?`,
+        [now, limit],
+        (error: Error | null, rows: WebhookDelivery[]) => error ? reject(error) : resolve(rows),
+      );
+    }));
+  }
+
+  async completeWebhookDelivery(
+    id: string,
+    result: { success: true } | { success: false; error: string; nextAttemptAt: number; terminal: boolean },
+  ): Promise<void> {
+    const now = Date.now();
+    if (result.success) {
+      await this.withConnection((db) => runWithParams(
+        db,
+        'UPDATE webhook_deliveries SET attempts = attempts + 1, deliveredAt = ? WHERE id = ?',
+        [now, id],
+      ));
+      return;
+    }
+    if (result.terminal) {
+      await this.withConnection((db) => runWithParams(
+        db,
+        'UPDATE webhook_deliveries SET attempts = attempts + 1, deadAt = ?, lastError = ? WHERE id = ?',
+        [now, result.error.slice(0, 1000), id],
+      ));
+      return;
+    }
+    await this.withConnection((db) => runWithParams(
+      db,
+      'UPDATE webhook_deliveries SET attempts = attempts + 1, nextAttemptAt = ?, lastError = ? WHERE id = ?',
+      [result.nextAttemptAt, result.error.slice(0, 1000), id],
+    ));
   }
 
   async saveSettlementEvidence(evidence: CanonicalSettlementEvidence): Promise<void> {
