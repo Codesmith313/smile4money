@@ -22,11 +22,17 @@ vi.mock('../../src/services/bottleneck-limiters.js', () => ({
   })),
 }));
 
+vi.mock('../../src/store/index.js', () => ({
+  matchStore: { getSchemaVersion: vi.fn() },
+}));
+
 import { checkStellarRpc } from '../../src/services/stellar.js';
 import { getAllLimiterStats } from '../../src/services/bottleneck-limiters.js';
+import { matchStore } from '../../src/store/index.js';
 
 const mockCheckRpc = vi.mocked(checkStellarRpc);
 const mockGetLimiterStats = vi.mocked(getAllLimiterStats);
+const mockGetSchemaVersion = vi.mocked(matchStore.getSchemaVersion);
 
 // ---------------------------------------------------------------------------
 // runHealthCheck
@@ -37,84 +43,79 @@ describe('runHealthCheck', () => {
     version: '1.2.3',
   };
 
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockCheckRpc.mockResolvedValue(undefined);
+    mockGetSchemaVersion.mockResolvedValue(3);
+  });
 
-  it('returns ok:true with status, uptime, and version by default', async () => {
+  it('returns ready with status, uptime, version, and dependency details by default', async () => {
     const result = await runHealthCheck(BASE_OPTIONS);
 
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.payload.status).toBe('ok');
+      expect(result.payload.ready).toBe(true);
       expect(result.payload.uptime).toBe(42);
       expect(result.payload.version).toBe('1.2.3');
+      expect(result.payload.dependencies).toEqual({
+        database: { status: 'ok', schemaVersion: 3 },
+        stellar_rpc: 'ok',
+      });
       expect(result.payload.limiters).toBeUndefined();
     }
-    // Stellar RPC should NOT be called unless deepCheck is true
-    expect(mockCheckRpc).not.toHaveBeenCalled();
-  });
-
-  it('does not call checkStellarRpc when deepCheck is false', async () => {
-    await runHealthCheck({ ...BASE_OPTIONS, deepCheck: false });
-    expect(mockCheckRpc).not.toHaveBeenCalled();
-  });
-
-  it('calls checkStellarRpc when deepCheck is true', async () => {
-    mockCheckRpc.mockResolvedValue(undefined);
-    const result = await runHealthCheck({ ...BASE_OPTIONS, deepCheck: true });
-
     expect(mockCheckRpc).toHaveBeenCalledOnce();
-    expect(result.ok).toBe(true);
+    expect(mockGetSchemaVersion).toHaveBeenCalledOnce();
   });
 
-  // #45 — dependencies.stellar_rpc reports reachability distinctly from `status`
-  it('reports dependencies.stellar_rpc as "ok" when the RPC check succeeds', async () => {
-    mockCheckRpc.mockResolvedValue(undefined);
-    const result = await runHealthCheck({ ...BASE_OPTIONS, deepCheck: true });
-
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.payload.dependencies).toEqual({ stellar_rpc: 'ok' });
-    }
-  });
-
-  it('does not include dependencies when deepCheck is not requested', async () => {
-    const result = await runHealthCheck(BASE_OPTIONS);
-
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.payload.dependencies).toBeUndefined();
-    }
-  });
-
-  it('returns ok:false when deepCheck is true and RPC check fails', async () => {
+  it('returns not ready when the RPC check fails', async () => {
     mockCheckRpc.mockRejectedValue(new Error('connection refused'));
 
-    const result = await runHealthCheck({ ...BASE_OPTIONS, deepCheck: true });
+    const result = await runHealthCheck(BASE_OPTIONS);
 
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.payload.status).toBe('error');
+      expect(result.payload.ready).toBe(false);
       expect(result.payload.uptime).toBe(42);
       expect(result.payload.version).toBe('1.2.3');
       expect(result.payload.error).toContain('connection refused');
-      // #45 — an unreachable RPC is reported via dependencies.stellar_rpc
-      expect(result.payload.dependencies).toEqual({ stellar_rpc: 'unreachable' });
+      expect(result.payload.dependencies).toEqual({
+        database: { status: 'ok', schemaVersion: 3 },
+        stellar_rpc: 'unreachable',
+      });
+      expect(result.payload.dependencyErrors).toEqual({
+        stellar_rpc: 'connection refused',
+      });
     }
   });
 
-  it('returns ok:false with rpc unreachable message for non-Error throws', async () => {
+  it('reports database and external failures together', async () => {
+    mockGetSchemaVersion.mockRejectedValue(new Error('database unavailable'));
     mockCheckRpc.mockRejectedValue('some string error');
 
-    const result = await runHealthCheck({ ...BASE_OPTIONS, deepCheck: true });
+    const result = await runHealthCheck(BASE_OPTIONS);
 
     expect(result.ok).toBe(false);
     if (!result.ok) {
-      expect(result.payload.error).toBe('rpc unreachable');
+      expect(result.payload.dependencies).toEqual({
+        database: { status: 'unreachable', error: 'database unavailable' },
+        stellar_rpc: 'unreachable',
+      });
+      expect(result.payload.dependencyErrors).toEqual({
+        database: 'database unavailable',
+        stellar_rpc: 'some string error',
+      });
+      expect(result.payload.error).toContain('database: database unavailable');
+      expect(result.payload.error).toContain('stellar_rpc: some string error');
     }
   });
 
   it('includes limiter stats when includeLimiters is true', async () => {
-    const result = await runHealthCheck({ ...BASE_OPTIONS, includeLimiters: true });
+    const result = await runHealthCheck({
+      ...BASE_OPTIONS,
+      includeLimiters: true,
+    });
 
     expect(result.ok).toBe(true);
     if (result.ok) {
@@ -124,7 +125,10 @@ describe('runHealthCheck', () => {
   });
 
   it('does not include limiter stats when includeLimiters is false', async () => {
-    const result = await runHealthCheck({ ...BASE_OPTIONS, includeLimiters: false });
+    const result = await runHealthCheck({
+      ...BASE_OPTIONS,
+      includeLimiters: false,
+    });
 
     expect(result.ok).toBe(true);
     if (result.ok) {
@@ -134,7 +138,10 @@ describe('runHealthCheck', () => {
   });
 
   it('propagates the exact version string passed in', async () => {
-    const result = await runHealthCheck({ uptimeSeconds: 0, version: 'unknown' });
+    const result = await runHealthCheck({
+      uptimeSeconds: 0,
+      version: 'unknown',
+    });
 
     expect(result.ok).toBe(true);
     if (result.ok) {
@@ -142,12 +149,9 @@ describe('runHealthCheck', () => {
     }
   });
 
-  it('can succeed on deepCheck and also include limiters', async () => {
-    mockCheckRpc.mockResolvedValue(undefined);
-
+  it('includes limiter stats alongside readiness checks', async () => {
     const result = await runHealthCheck({
       ...BASE_OPTIONS,
-      deepCheck: true,
       includeLimiters: true,
     });
 

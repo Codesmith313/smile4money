@@ -4,6 +4,10 @@ Complete reference for all smart contract functions, types, and errors.
 
 > The backend HTTP API (`/health`, `/status`, `/api/...`) is specified separately in [`apps/backend/openapi.json`](../apps/backend/openapi.json), under the versioning rules in [api-compatibility.md](api-compatibility.md).
 
+`GET /health` is a readiness check: it returns `200` with `ready: true` only
+when the match database and Stellar RPC are reachable. Otherwise it returns
+`503` and reports each dependency's status and any probe error.
+
 ## Escrow Contract
 
 ### Initialization
