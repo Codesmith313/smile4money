@@ -314,6 +314,106 @@
         }
       }
     },
+    "/api/oracle/history": {
+      "get": {
+        "operationId": "getOracleHistory",
+        "summary": "Query the authenticated player's oracle submissions",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "game_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "description": "Inclusive ISO 8601 date or timestamp.",
+            "schema": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              ]
+            }
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "description": "Inclusive ISO 8601 date or timestamp; a date-only value includes the full UTC day.",
+            "schema": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Submission history, ordered by decision ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OracleHistoryResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid filter",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Game history not found for this player",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/oracle/submit-result": {
       "post": {
         "operationId": "submitResult",
@@ -819,6 +919,66 @@
           "matchId": {
             "type": "integer",
             "minimum": 1
+          },
+          "OracleHistoryResponse": {
+            "type": "object",
+            "required": [
+              "submissions"
+            ],
+            "properties": {
+              "submissions": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "decisionId",
+                    "matchId",
+                    "gameId",
+                    "state",
+                    "reason",
+                    "recordedAt",
+                    "provider"
+                  ],
+                  "properties": {
+                    "decisionId": {
+                      "type": "integer"
+                    },
+                    "matchId": {
+                      "type": "integer"
+                    },
+                    "gameId": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "review_required",
+                        "verified",
+                        "in_progress",
+                        "retry_requested"
+                      ]
+                    },
+                    "reason": {
+                      "type": "string"
+                    },
+                    "recordedAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "provider": {
+                      "$ref": "#/components/schemas/Platform"
+                    },
+                    "evidence": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "operator": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           },
           "gameId": {
             "type": "string"

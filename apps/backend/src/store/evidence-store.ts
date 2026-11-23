@@ -17,6 +17,7 @@ export interface Decision {
 }
 export interface EvidenceStore {
   history(gameId: string): Promise<Decision[]>;
+  query(options?: { gameId?: string; startTime?: number; endTime?: number }): Promise<Decision[]>;
   append(decision: Decision): Promise<number>;
 }
 
@@ -26,6 +27,24 @@ export class MemoryEvidenceStore implements EvidenceStore {
     return this.entries
       .filter((e) => e.gameId === gameId)
       .map((e) => structuredClone(e));
+  }
+  async query(
+    options: {
+      gameId?: string;
+      startTime?: number;
+      endTime?: number;
+    } = {},
+  ): Promise<Decision[]> {
+    return this.entries
+      .filter((entry) => {
+        const recordedAt = Date.parse(entry.recordedAt);
+        return (
+          (!options.gameId || entry.gameId === options.gameId) &&
+          (options.startTime === undefined || recordedAt >= options.startTime) &&
+          (options.endTime === undefined || recordedAt <= options.endTime)
+        );
+      })
+      .map((entry) => structuredClone(entry));
   }
   async append(decision: Decision): Promise<number> {
     const id = this.entries.length + 1;
@@ -61,6 +80,31 @@ export class SqliteEvidenceStore implements EvidenceStore {
               ),
       ),
     );
+  }
+  async query(
+    options: {
+      gameId?: string;
+      startTime?: number;
+      endTime?: number;
+    } = {},
+  ): Promise<Decision[]> {
+    if (!this.db) throw new Error('Evidence store not initialized');
+    const sql = options.gameId
+      ? 'SELECT id, decision FROM oracle_decisions WHERE gameId = ? ORDER BY id'
+      : 'SELECT id, decision FROM oracle_decisions ORDER BY id';
+    const params = options.gameId ? [options.gameId] : [];
+    const rows = await new Promise<{ id: number; decision: string }[]>((resolve, reject) =>
+      this.db!.all(sql, params, (err, result) => (err ? reject(err) : resolve(result))),
+    );
+    return rows
+      .map((row) => ({ ...JSON.parse(row.decision), id: row.id }) as Decision)
+      .filter((entry) => {
+        const recordedAt = Date.parse(entry.recordedAt);
+        return (
+          (options.startTime === undefined || recordedAt >= options.startTime) &&
+          (options.endTime === undefined || recordedAt <= options.endTime)
+        );
+      });
   }
   async append(decision: Decision): Promise<number> {
     if (!this.db) throw new Error('Evidence store not initialized');

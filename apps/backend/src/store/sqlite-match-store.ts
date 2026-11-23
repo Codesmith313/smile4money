@@ -9,19 +9,8 @@ import sqlite3 from 'sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import type {
-  CanonicalSettlementEvidence,
-  CreateMatchPayload,
-  isMatchState,
-  MatchRecord,
-  MatchStorePort,
-} from './match-store.js';
-import type {
-  MatchState,
-  MatchStateChange,
-  WebhookDelivery,
-  WebhookSubscription,
-} from './match-store.js';
+import type { CanonicalSettlementEvidence, CreateMatchPayload, isMatchState, MatchRecord, MatchStorePort } from './match-store.js';
+import type { MatchState, MatchStateChange, WebhookDelivery, WebhookSubscription } from './match-store.js';
 import { computeIdentityHash } from '../services/player-identity.js';
 import { randomUUID } from 'node:crypto';
 import { SqliteConnectionPool } from './sqlite-connection-pool.js';
@@ -109,9 +98,7 @@ export class SqliteMatchStore implements MatchStorePort {
    * Acquire a pooled connection, run `fn` against it, and always release it
    * back to the pool afterwards (even if `fn` throws).
    */
-  private async withConnection<T>(
-    fn: (db: sqlite3.Database) => Promise<T>,
-  ): Promise<T> {
+  private async withConnection<T>(fn: (db: sqlite3.Database) => Promise<T>): Promise<T> {
     const db = await this.getPool().acquire();
     try {
       return await fn(db);
@@ -138,20 +125,21 @@ export class SqliteMatchStore implements MatchStorePort {
         await applySqliteMigrations(db, SQLITE_SCHEMA_MIGRATIONS['match-store']);
         await runAsync(db, "DELETE FROM settlement_evidence WHERE evaluatedAt < datetime('now', '-30 days')");
         const row = await new Promise<{ nextId: number }>((resolve, reject) =>
-          db.get(
-            'SELECT COALESCE(MAX(matchId), -1) + 1 AS nextId FROM matches',
-            (error, result: { nextId: number } | undefined) =>
-              error ? reject(error) : resolve(result ?? { nextId: 0 }),
+          db.get('SELECT COALESCE(MAX(matchId), -1) + 1 AS nextId FROM matches', (error, result: { nextId: number } | undefined) =>
+            error ? reject(error) : resolve(result ?? { nextId: 0 }),
           ),
         );
         this.nextId = row.nextId;
       });
       this.initialized = true;
-      this.evidenceCleanupTimer = setInterval(() => {
-        void this.withConnection((db) =>
-          runAsync(db, "DELETE FROM settlement_evidence WHERE evaluatedAt < datetime('now', '-30 days')"),
-        ).catch((error) => console.warn('settlement_evidence_cleanup_failed', error));
-      }, 24 * 60 * 60 * 1000);
+      this.evidenceCleanupTimer = setInterval(
+        () => {
+          void this.withConnection((db) => runAsync(db, "DELETE FROM settlement_evidence WHERE evaluatedAt < datetime('now', '-30 days')")).catch((error) =>
+            console.warn('settlement_evidence_cleanup_failed', error),
+          );
+        },
+        24 * 60 * 60 * 1000,
+      );
       this.evidenceCleanupTimer.unref();
     } catch (error) {
       const pool = this.pool;
@@ -170,108 +158,123 @@ export class SqliteMatchStore implements MatchStorePort {
     // kept identical here so both store implementations bind the same way.
     const identityHash =
       payload.player1Username && payload.player2Username
-        ? computeIdentityHash(
-            payload.player1Username,
-            payload.player1,
-            payload.player2Username,
-            payload.player2,
-          )
+        ? computeIdentityHash(payload.player1Username, payload.player1, payload.player2Username, payload.player2)
         : null;
 
-    return this.withConnection((db) => new Promise((resolve, reject) => {
-      const stmt = db.prepare(
-        `INSERT INTO matches (matchId, player1, player2, player1Username, player2Username, stakeAmount, token, gameId, platform, state, identityHash)
+    return this.withConnection(
+      (db) =>
+        new Promise((resolve, reject) => {
+          const stmt = db.prepare(
+            `INSERT INTO matches (matchId, player1, player2, player1Username, player2Username, stakeAmount, token, gameId, platform, state, identityHash)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?)`,
-      );
+          );
 
-      const matchId = this.nextId++;
-      stmt.run(
-        matchId,
-        payload.player1,
-        payload.player2,
-        payload.player1Username ?? null,
-        payload.player2Username ?? null,
-        payload.stakeAmount,
-        payload.token,
-        payload.gameId,
-        payload.platform,
-        identityHash,
-        function (this: sqlite3.RunResult, err: Error | null) {
-          if (err) {
-            reject(err);
-            return;
-          }
-          resolve({
+          const matchId = this.nextId++;
+          stmt.run(
             matchId,
-            player1: payload.player1,
-            player2: payload.player2,
-            player1Username: payload.player1Username,
-            player2Username: payload.player2Username,
-            stakeAmount: payload.stakeAmount,
-            token: payload.token,
-            gameId: payload.gameId,
-            platform: payload.platform,
-            state: 'Pending',
-            identityHash: identityHash ?? undefined,
-          });
-        },
-      );
-      stmt.finalize();
-    }));
+            payload.player1,
+            payload.player2,
+            payload.player1Username ?? null,
+            payload.player2Username ?? null,
+            payload.stakeAmount,
+            payload.token,
+            payload.gameId,
+            payload.platform,
+            identityHash,
+            function (this: sqlite3.RunResult, err: Error | null) {
+              if (err) {
+                reject(err);
+                return;
+              }
+              resolve({
+                matchId,
+                player1: payload.player1,
+                player2: payload.player2,
+                player1Username: payload.player1Username,
+                player2Username: payload.player2Username,
+                stakeAmount: payload.stakeAmount,
+                token: payload.token,
+                gameId: payload.gameId,
+                platform: payload.platform,
+                state: 'Pending',
+                identityHash: identityHash ?? undefined,
+              });
+            },
+          );
+          stmt.finalize();
+        }),
+    );
   }
 
   async findByGameId(gameId: string): Promise<MatchRecord | null> {
     const query = 'SELECT * FROM matches WHERE gameId = ?';
     const startedAt = performance.now();
-    return this.withConnection((db) => new Promise((resolve, reject) => {
-      db.get(
-        query,
-        [gameId],
-        (err: Error | null, row: any) => {
-          logSlowQuery(query, performance.now() - startedAt);
-          if (err) {
-            reject(err);
-            return;
-          }
-          if (!row) {
-            resolve(null);
-            return;
-          }
-          resolve(readMatch(row));
-        },
-      );
-    }));
+    return this.withConnection(
+      (db) =>
+        new Promise((resolve, reject) => {
+          db.get(query, [gameId], (err: Error | null, row: any) => {
+            logSlowQuery(query, performance.now() - startedAt);
+            if (err) {
+              reject(err);
+              return;
+            }
+            if (!row) {
+              resolve(null);
+              return;
+            }
+            resolve(readMatch(row));
+          });
+        }),
+    );
   }
 
   async findByMatchId(matchId: number): Promise<MatchRecord | null> {
-    return this.withConnection((db) => new Promise((resolve, reject) => {
-      db.get('SELECT * FROM matches WHERE matchId = ?', [matchId], (err: Error | null, row: any) => {
-        if (err) reject(err);
-        else resolve(row ? readMatch(row) : null);
-      });
-    }));
+    return this.withConnection(
+      (db) =>
+        new Promise((resolve, reject) => {
+          db.get('SELECT * FROM matches WHERE matchId = ?', [matchId], (err: Error | null, row: any) => {
+            if (err) reject(err);
+            else resolve(row ? readMatch(row) : null);
+          });
+        }),
+    );
+  }
+
+  async listMatchesByPlayer(address: string): Promise<MatchRecord[]> {
+    return this.withConnection(
+      (db) =>
+        new Promise((resolve, reject) => {
+          db.all(
+            'SELECT * FROM matches WHERE lower(player1) = lower(?) OR lower(player2) = lower(?) ORDER BY matchId',
+            [address, address],
+            (err: Error | null, rows: any[]) => {
+              if (err) reject(err);
+              else resolve(rows.map(readMatch));
+            },
+          );
+        }),
+    );
   }
 
   async listMatchesForStateSync(): Promise<MatchRecord[]> {
-    return this.withConnection((db) => new Promise((resolve, reject) => {
-      db.all(
-        `SELECT * FROM matches WHERE state NOT IN ('Completed', 'Cancelled') ORDER BY matchId`,
-        (err: Error | null, rows: any[]) => {
-          if (err) reject(err);
-          else resolve(rows.map(readMatch));
-        },
-      );
-    }));
+    return this.withConnection(
+      (db) =>
+        new Promise((resolve, reject) => {
+          db.all(`SELECT * FROM matches WHERE state NOT IN ('Completed', 'Cancelled') ORDER BY matchId`, (err: Error | null, rows: any[]) => {
+            if (err) reject(err);
+            else resolve(rows.map(readMatch));
+          });
+        }),
+    );
   }
 
   async updateMatchState(matchId: number, state: MatchState): Promise<MatchStateChange | null> {
     return this.withConnection(async (db) => {
       await runAsync(db, 'BEGIN IMMEDIATE');
       try {
-        const row = await new Promise<any>((resolve, reject) => db.get(
-          'SELECT * FROM matches WHERE matchId = ?', [matchId],
-          (err: Error | null, result: any) => err ? reject(err) : resolve(result),
-        ));
+        const row = await new Promise<any>((resolve, reject) =>
+          db.get('SELECT * FROM matches WHERE matchId = ?', [matchId], (err: Error | null, result: any) => (err ? reject(err) : resolve(result))),
+        );
         if (!row) {
           await runAsync(db, 'COMMIT');
           return null;
@@ -283,12 +286,11 @@ export class SqliteMatchStore implements MatchStorePort {
         }
         const previousState = match.state;
         await runWithParams(db, 'UPDATE matches SET state = ? WHERE matchId = ?', [state, matchId]);
-        const subscriptions = await new Promise<Array<{ id: string; url: string; secret: string }>>(
-          (resolve, reject) => db.all(
+        const subscriptions = await new Promise<Array<{ id: string; url: string; secret: string }>>((resolve, reject) =>
+          db.all(
             'SELECT id, url, secret FROM webhook_subscriptions WHERE matchId = ?',
             [matchId],
-            (err: Error | null, rows: Array<{ id: string; url: string; secret: string }>) =>
-              err ? reject(err) : resolve(rows),
+            (err: Error | null, rows: Array<{ id: string; url: string; secret: string }>) => (err ? reject(err) : resolve(rows)),
           ),
         );
         if (subscriptions.length > 0) {
@@ -318,46 +320,48 @@ export class SqliteMatchStore implements MatchStorePort {
     });
   }
 
-  async createWebhookSubscription(
-    input: Omit<WebhookSubscription, 'createdAt'>,
-  ): Promise<WebhookSubscription> {
+  async createWebhookSubscription(input: Omit<WebhookSubscription, 'createdAt'>): Promise<WebhookSubscription> {
     const now = Date.now();
-    await this.withConnection((db) => new Promise<void>((resolve, reject) => {
-      db.get(
-        'SELECT player1, player2 FROM matches WHERE matchId = ?',
-        [input.matchId],
-        (error: Error | null, match: { player1: string; player2: string } | undefined) => {
-          if (error) return reject(error);
-          if (!match) return reject(new Error('Match not found'));
-          if (match.player1.toUpperCase() !== input.owner.toUpperCase() &&
-              match.player2.toUpperCase() !== input.owner.toUpperCase()) {
-            return reject(new Error('Only a match participant can subscribe to its webhooks'));
-          }
-          db.run(
-            `INSERT INTO webhook_subscriptions (id, matchId, owner, url, secret, createdAt)
+    await this.withConnection(
+      (db) =>
+        new Promise<void>((resolve, reject) => {
+          db.get(
+            'SELECT player1, player2 FROM matches WHERE matchId = ?',
+            [input.matchId],
+            (error: Error | null, match: { player1: string; player2: string } | undefined) => {
+              if (error) return reject(error);
+              if (!match) return reject(new Error('Match not found'));
+              if (match.player1.toUpperCase() !== input.owner.toUpperCase() && match.player2.toUpperCase() !== input.owner.toUpperCase()) {
+                return reject(new Error('Only a match participant can subscribe to its webhooks'));
+              }
+              db.run(
+                `INSERT INTO webhook_subscriptions (id, matchId, owner, url, secret, createdAt)
              VALUES (?, ?, ?, ?, ?, ?)`,
-            [input.id, input.matchId, input.owner.toUpperCase(), input.url, input.secret, now],
-            (err: Error | null) => {
-              if (err) reject(err);
-              else resolve();
+                [input.id, input.matchId, input.owner.toUpperCase(), input.url, input.secret, now],
+                (err: Error | null) => {
+                  if (err) reject(err);
+                  else resolve();
+                },
+              );
             },
           );
-        },
-      );
-    }));
+        }),
+    );
     return { ...input, owner: input.owner.toUpperCase(), createdAt: now };
   }
 
   async listWebhookSubscriptions(owner: string): Promise<Omit<WebhookSubscription, 'secret'>[]> {
-    return this.withConnection((db) => new Promise((resolve, reject) => {
-      db.all(
-        `SELECT id, matchId, owner, url, createdAt FROM webhook_subscriptions
+    return this.withConnection(
+      (db) =>
+        new Promise((resolve, reject) => {
+          db.all(
+            `SELECT id, matchId, owner, url, createdAt FROM webhook_subscriptions
          WHERE UPPER(owner) = UPPER(?) ORDER BY createdAt`,
-        [owner],
-        (error: Error | null, rows: Array<Omit<WebhookSubscription, 'secret'>>) =>
-          error ? reject(error) : resolve(rows),
-      );
-    }));
+            [owner],
+            (error: Error | null, rows: Array<Omit<WebhookSubscription, 'secret'>>) => (error ? reject(error) : resolve(rows)),
+          );
+        }),
+    );
   }
 
   async deleteWebhookSubscription(id: string, owner: string): Promise<boolean> {
@@ -375,11 +379,7 @@ export class SqliteMatchStore implements MatchStorePort {
           );
         });
         if (deleted) {
-          await runWithParams(
-            db,
-            'DELETE FROM webhook_deliveries WHERE subscriptionId = ? AND deliveredAt IS NULL AND deadAt IS NULL',
-            [id],
-          );
+          await runWithParams(db, 'DELETE FROM webhook_deliveries WHERE subscriptionId = ? AND deliveredAt IS NULL AND deadAt IS NULL', [id]);
         }
         await runAsync(db, 'COMMIT');
         return deleted;
@@ -391,95 +391,161 @@ export class SqliteMatchStore implements MatchStorePort {
   }
 
   async getDueWebhookDeliveries(now: number, limit: number): Promise<WebhookDelivery[]> {
-    return this.withConnection((db) => new Promise((resolve, reject) => {
-      db.all(
-        `SELECT id, eventId, subscriptionId, url, secret, payload, attempts
+    return this.withConnection(
+      (db) =>
+        new Promise((resolve, reject) => {
+          db.all(
+            `SELECT id, eventId, subscriptionId, url, secret, payload, attempts
          FROM webhook_deliveries
          WHERE deliveredAt IS NULL AND deadAt IS NULL AND nextAttemptAt <= ?
          ORDER BY nextAttemptAt LIMIT ?`,
-        [now, limit],
-        (error: Error | null, rows: WebhookDelivery[]) => error ? reject(error) : resolve(rows),
-      );
-    }));
+            [now, limit],
+            (error: Error | null, rows: WebhookDelivery[]) => (error ? reject(error) : resolve(rows)),
+          );
+        }),
+    );
   }
 
   async completeWebhookDelivery(
     id: string,
-    result: { success: true } | { success: false; error: string; nextAttemptAt: number; terminal: boolean },
+    result:
+      | { success: true }
+      | {
+          success: false;
+          error: string;
+          nextAttemptAt: number;
+          terminal: boolean;
+        },
   ): Promise<void> {
     const now = Date.now();
     if (result.success) {
-      await this.withConnection((db) => runWithParams(
-        db,
-        'UPDATE webhook_deliveries SET attempts = attempts + 1, deliveredAt = ? WHERE id = ?',
-        [now, id],
-      ));
+      await this.withConnection((db) => runWithParams(db, 'UPDATE webhook_deliveries SET attempts = attempts + 1, deliveredAt = ? WHERE id = ?', [now, id]));
       return;
     }
     if (result.terminal) {
-      await this.withConnection((db) => runWithParams(
-        db,
-        'UPDATE webhook_deliveries SET attempts = attempts + 1, deadAt = ?, lastError = ? WHERE id = ?',
-        [now, result.error.slice(0, 1000), id],
-      ));
+      await this.withConnection((db) =>
+        runWithParams(db, 'UPDATE webhook_deliveries SET attempts = attempts + 1, deadAt = ?, lastError = ? WHERE id = ?', [
+          now,
+          result.error.slice(0, 1000),
+          id,
+        ]),
+      );
       return;
     }
-    await this.withConnection((db) => runWithParams(
-      db,
-      'UPDATE webhook_deliveries SET attempts = attempts + 1, nextAttemptAt = ?, lastError = ? WHERE id = ?',
-      [result.nextAttemptAt, result.error.slice(0, 1000), id],
-    ));
+    await this.withConnection((db) =>
+      runWithParams(db, 'UPDATE webhook_deliveries SET attempts = attempts + 1, nextAttemptAt = ?, lastError = ? WHERE id = ?', [
+        result.nextAttemptAt,
+        result.error.slice(0, 1000),
+        id,
+      ]),
+    );
   }
 
   async saveSettlementEvidence(evidence: CanonicalSettlementEvidence): Promise<void> {
-    await this.withConnection((db) => new Promise<void>((resolve, reject) => {
-      db.run(`INSERT INTO settlement_evidence
+    await this.withConnection(
+      (db) =>
+        new Promise<void>((resolve, reject) => {
+          db.run(
+            `INSERT INTO settlement_evidence
         (matchId, parserVersion, evaluatedAt, gameId, platform, whitePlayer, blackPlayer, result, status, decision)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [evidence.matchId, evidence.parserVersion, evidence.evaluatedAt, evidence.gameId, evidence.platform,
-        evidence.whitePlayer, evidence.blackPlayer, evidence.result, evidence.status, evidence.decision],
-      (err: Error | null) => err ? reject(err) : resolve());
-    }));
+            [
+              evidence.matchId,
+              evidence.parserVersion,
+              evidence.evaluatedAt,
+              evidence.gameId,
+              evidence.platform,
+              evidence.whitePlayer,
+              evidence.blackPlayer,
+              evidence.result,
+              evidence.status,
+              evidence.decision,
+            ],
+            (err: Error | null) => (err ? reject(err) : resolve()),
+          );
+        }),
+    );
   }
 
   async getSettlementEvidence(matchId: number): Promise<CanonicalSettlementEvidence | null> {
-    return this.withConnection((db) => new Promise((resolve, reject) => db.get(
-      'SELECT * FROM settlement_evidence WHERE matchId = ? ORDER BY evidenceId DESC LIMIT 1', [matchId], (err: Error | null, row: any) => {
-        if (err) { reject(err); return; }
-        if (!row) { resolve(null); return; }
-        resolve({ parserVersion: row.parserVersion, evaluatedAt: row.evaluatedAt, matchId,
-          gameId: row.gameId, platform: row.platform, whitePlayer: row.whitePlayer,
-          blackPlayer: row.blackPlayer, result: row.result ?? null, status: row.status, decision: row.decision });
-      })));
+    return this.withConnection(
+      (db) =>
+        new Promise((resolve, reject) =>
+          db.get('SELECT * FROM settlement_evidence WHERE matchId = ? ORDER BY evidenceId DESC LIMIT 1', [matchId], (err: Error | null, row: any) => {
+            if (err) {
+              reject(err);
+              return;
+            }
+            if (!row) {
+              resolve(null);
+              return;
+            }
+            resolve({
+              parserVersion: row.parserVersion,
+              evaluatedAt: row.evaluatedAt,
+              matchId,
+              gameId: row.gameId,
+              platform: row.platform,
+              whitePlayer: row.whitePlayer,
+              blackPlayer: row.blackPlayer,
+              result: row.result ?? null,
+              status: row.status,
+              decision: row.decision,
+            });
+          }),
+        ),
+    );
   }
 
   async getSettlementEvidenceHistory(matchId: number): Promise<CanonicalSettlementEvidence[]> {
-    return this.withConnection((db) => new Promise((resolve, reject) => db.all(
-      'SELECT * FROM settlement_evidence WHERE matchId = ? ORDER BY evidenceId ASC', [matchId],
-      (err: Error | null, rows: any[]) => {
-        if (err) { reject(err); return; }
-        resolve(rows.map((row) => ({ parserVersion: row.parserVersion, evaluatedAt: row.evaluatedAt,
-          matchId, gameId: row.gameId, platform: row.platform, whitePlayer: row.whitePlayer,
-          blackPlayer: row.blackPlayer, result: row.result ?? null, status: row.status, decision: row.decision })));
-      })));
+    return this.withConnection(
+      (db) =>
+        new Promise((resolve, reject) =>
+          db.all('SELECT * FROM settlement_evidence WHERE matchId = ? ORDER BY evidenceId ASC', [matchId], (err: Error | null, rows: any[]) => {
+            if (err) {
+              reject(err);
+              return;
+            }
+            resolve(
+              rows.map((row) => ({
+                parserVersion: row.parserVersion,
+                evaluatedAt: row.evaluatedAt,
+                matchId,
+                gameId: row.gameId,
+                platform: row.platform,
+                whitePlayer: row.whitePlayer,
+                blackPlayer: row.blackPlayer,
+                result: row.result ?? null,
+                status: row.status,
+                decision: row.decision,
+              })),
+            );
+          }),
+        ),
+    );
   }
 
   async count(): Promise<number> {
-    return this.withConnection((db) => new Promise((resolve, reject) => {
-      db.get(
-        'SELECT COUNT(*) AS count FROM matches',
-        (err: Error | null, row: any) => {
-          if (err) reject(err);
-          else resolve(row?.count ?? 0);
-        },
-      );
-    }));
+    return this.withConnection(
+      (db) =>
+        new Promise((resolve, reject) => {
+          db.get('SELECT COUNT(*) AS count FROM matches', (err: Error | null, row: any) => {
+            if (err) reject(err);
+            else resolve(row?.count ?? 0);
+          });
+        }),
+    );
   }
 
   clear(): void {
-    this.withConnection((db) => new Promise<void>((resolve, reject) => {
-      db.run('DELETE FROM matches', (err: Error | null) => err ? reject(err) : resolve());
-    })).catch(() => { /* best-effort clear */ });
+    this.withConnection(
+      (db) =>
+        new Promise<void>((resolve, reject) => {
+          db.run('DELETE FROM matches', (err: Error | null) => (err ? reject(err) : resolve()));
+        }),
+    ).catch(() => {
+      /* best-effort clear */
+    });
     this.nextId = 0;
   }
 

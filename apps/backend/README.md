@@ -41,6 +41,13 @@ within one backend process; run one process per evidence database. Keep operator
 reasons free of personal data. Actual on-chain settlement continues to require the
 contract's privileged oracle authorization.
 
+Authenticated match participants can query their submission history with
+`GET /api/oracle/history`. Optional `game_id`, `start_date`, and `end_date`
+filters narrow the results; date bounds are inclusive ISO 8601 values (date-only
+`end_date` includes the full UTC day). Each submission includes its `decisionId`
+and provider. A game-specific query returns 404 when the game is not owned by a
+match the caller participates in.
+
 ### Error classification
 
 Every logged error carries a severity so operators can filter and alert on it.

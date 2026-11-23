@@ -89,6 +89,7 @@ export interface MatchStorePort {
   createMatch(payload: CreateMatchPayload): Promise<MatchRecord>;
   findByGameId(gameId: string): Promise<MatchRecord | null>;
   findByMatchId(matchId: number): Promise<MatchRecord | null>;
+  listMatchesByPlayer(address: string): Promise<MatchRecord[]>;
   listMatchesForStateSync(): Promise<MatchRecord[]>;
   updateMatchState(matchId: number, state: MatchState): Promise<MatchStateChange | null>;
   createWebhookSubscription(
@@ -185,6 +186,17 @@ export class MatchStore implements MatchStorePort {
   async findByMatchId(matchId: number): Promise<MatchRecord | null> {
     const match = this.matches.get(matchId);
     return match ? { ...match } : null;
+  }
+
+  async listMatchesByPlayer(address: string): Promise<MatchRecord[]> {
+    const normalizedAddress = address.toLowerCase();
+    return [...this.matches.values()]
+      .filter(
+        (match) =>
+          match.player1.toLowerCase() === normalizedAddress ||
+          match.player2.toLowerCase() === normalizedAddress,
+      )
+      .map((match) => ({ ...match }));
   }
 
   async listMatchesForStateSync(): Promise<MatchRecord[]> {
