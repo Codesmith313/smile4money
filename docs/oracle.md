@@ -101,6 +101,17 @@ code, but it is not protection against a privileged user with arbitrary DDL or
 database-file access. Production deployments must restrict database access
 and retain backups accordingly.
 
+## SQLite Connection Pool
+
+The match store reuses SQLite connections from a process-local pool. Configure
+`SQLITE_POOL_SIZE` (default 5) to set its maximum number of connections and
+`SQLITE_POOL_IDLE_TIMEOUT_MS` (default 30,000) to set how long unused
+connections remain open. When all connections are checked out, another request
+fails with an explicit pool-exhaustion error rather than opening an unbounded
+number of handles. Idle connections are closed after the configured timeout.
+Each backend process has its own pool; this does not coordinate concurrent
+processes accessing the same SQLite database.
+
 ## Player Identity Binding
 
 `verifyPlayerIdentities` (`services/player-identity.ts`) checks the usernames

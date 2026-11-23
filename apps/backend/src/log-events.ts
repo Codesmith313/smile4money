@@ -96,4 +96,5 @@ export const LOG_EVENTS = new Set([
   "sqlite_operation_retrying",
   "sqlite_pool_evicted",
   "sqlite_pool_exhausted",
+  "sqlite_pool_idle_close_failed",
 ]);

@@ -85,11 +85,12 @@ export class SqliteMatchStore {
   private async withConnection<T>(
     fn: (db: sqlite3.Database) => Promise<T>,
   ): Promise<T> {
-    const db = await this.getPool().acquire();
+    const pool = this.getPool();
+    const db = await pool.acquire();
     try {
       return await fn(db);
     } finally {
-      this.getPool().release(db);
+      await pool.release(db);
     }
   }
 
@@ -99,7 +100,7 @@ export class SqliteMatchStore {
       fs.mkdirSync(dir, { recursive: true });
     }
 
-    this.pool = new SqliteConnectionPool({ dbPath: this.dbPath });
+    this.pool = new SqliteConnectionPool({ path: this.dbPath });
     try {
       await this.withConnection(async (db) => {
         try {
