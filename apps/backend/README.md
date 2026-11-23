@@ -54,3 +54,13 @@ narrow results to a single level or to everything at or above a threshold.
 Alerting: `critical` and `error` entries raise alerts; `warning` and `info` are
 recorded for filtering only. Route alerts through the existing logger/queue
 alerting hooks so severity drives whether an operator is paged.
+
+### HTTP metrics
+
+Scrape `GET /metrics` for Prometheus-format HTTP request totals and response
+duration histograms, labeled by method, route template, and status code. The
+scrape endpoint itself is excluded. The process also exposes exact p50, p90,
+p95, and p99 duration gauges over its most recent 10,000 completed requests;
+these gauges and counters reset when the process restarts. Histogram-based
+percentiles can be calculated across instances with, for example,
+`histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))`.
