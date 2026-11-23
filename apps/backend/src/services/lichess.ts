@@ -2,6 +2,7 @@ import axios from 'axios';
 import { privateEnv } from '../config/private-env.js';
 import { getLichessLimiterSingleton } from './bottleneck-limiters.js';
 import logger from '../logger.js';
+import { traceHeaders } from '../tracing/trace-context.js';
 
 export class GameNotFoundError extends Error {
   constructor(gameId: string) {
@@ -27,6 +28,7 @@ export async function fetchLichessGame(gameId: string): Promise<LichessGame> {
       const response = await axios.get(url, {
         headers: {
           Accept: 'application/json',
+          ...traceHeaders(),
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
         timeout: 10000,

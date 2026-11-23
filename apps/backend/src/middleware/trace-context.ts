@@ -1,10 +1,9 @@
 /**
  * Trace context middleware (issue #123).
  *
- * Continues the caller's W3C trace (`traceparent` / `tracestate` request
- * headers) or starts a new one, runs the rest of the request inside it, and
- * echoes the server span back as a `traceparent` response header so a client
- * or support engineer can quote it.
+ * Continues the caller's W3C trace (`traceparent` / `tracestate`) or valid
+ * `X-Trace-ID`, or starts a new trace. The active context is available to
+ * logs and downstream requests for the lifetime of the request.
  *
  * Mount it before every other middleware so their log lines carry the ids.
  */
@@ -20,10 +19,12 @@ export function traceContext() {
     const ctx = contextFromHeaders(
       req.header("traceparent"),
       req.header("tracestate"),
+      req.header("x-trace-id"),
     );
     res.setHeader("traceparent", formatTraceparent(ctx));
     res.setHeader("x-request-id", ctx.spanId);
     res.setHeader("x-correlation-id", ctx.traceId);
+    res.setHeader("x-trace-id", ctx.traceId);
     runWithTraceContext(ctx, () => next());
   };
 }

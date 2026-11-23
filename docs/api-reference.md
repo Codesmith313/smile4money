@@ -1577,7 +1577,7 @@ Errors from API endpoints use the following envelope:
 - `error.requestId` — the request span ID, which can be shared with support.
 - `error.correlationId` — the trace ID included in related structured logs.
 - `error.timestamp` — the UTC time when the error response was created.
-- `X-Request-ID` and `X-Correlation-ID` response headers expose the same identifiers; `traceparent` also carries the W3C trace context.
+- `X-Request-ID` identifies the server span. `X-Correlation-ID` and `X-Trace-ID` expose the trace ID; `traceparent` carries the W3C trace context. A valid incoming `X-Trace-ID` is continued when `traceparent` is absent or invalid; otherwise the backend generates a trace ID. The backend sends trace headers to downstream HTTP services and writes the ID as `trace_id` in structured logs for querying.
 
 `code`, `message`, `suggestion`, and `docsUrl` are always present. Some error responses include additional fields inside `error` (e.g. `error.hint`) for extra machine-readable context.
 

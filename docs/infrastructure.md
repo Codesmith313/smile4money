@@ -213,6 +213,16 @@ CI suite before merging.
 
 Contract event indexing and Oracle health monitoring are not yet configured. This is acceptable for testnet but must be addressed before mainnet launch. Queue monitoring and stall detection are described below.
 
+### 8.1 Trace context propagation
+
+Every HTTP request receives a trace ID. The backend continues a valid
+`traceparent` when supplied, otherwise it continues a valid `X-Trace-ID` or
+generates a new ID. Responses include `X-Trace-ID`; W3C `traceparent` and
+`tracestate` are also propagated where applicable. Downstream HTTP requests
+receive these trace headers, and structured logs include the ID as `trace_id`.
+Search logs by `trace_id` to follow a request across backend operations and
+downstream calls.
+
 ### Queue monitoring metrics
 
 The queue worker exposes the following metrics for monitoring:
