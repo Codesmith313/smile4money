@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   CircuitBreaker,
   CircuitState,
+  circuitBreakerConfigFromEnv,
   getCircuitBreaker,
   resetCircuitBreaker,
   type PersistedCircuitBreakerState,
@@ -102,6 +103,19 @@ describe('CircuitBreaker', () => {
       vi.advanceTimersByTime(1000);
       expect(breaker.allowRequest()).toBe(true);
     });
+
+    it('limits half-open recovery to one in-flight probe', () => {
+      vi.advanceTimersByTime(1000);
+      expect(breaker.allowRequest()).toBe(true);
+      expect(breaker.allowRequest()).toBe(false);
+
+      breaker.recordSuccess();
+      expect(breaker.allowRequest()).toBe(true);
+      expect(breaker.allowRequest()).toBe(false);
+
+      breaker.recordSuccess();
+      expect(breaker.getState()).toBe(CircuitState.CLOSED);
+    });
   });
 
   describe('Half-open state', () => {
@@ -130,7 +144,6 @@ describe('CircuitBreaker', () => {
       expect(probeBreaker.allowRequest()).toBe(true);
       expect(probeBreaker.getState()).toBe(CircuitState.HALF_OPEN);
 
-      expect(probeBreaker.allowRequest()).toBe(true);
       probeBreaker.recordSuccess();
 
       expect(probeBreaker.getState()).toBe(CircuitState.CLOSED);
@@ -286,6 +299,35 @@ describe('CircuitBreaker', () => {
       const breaker1 = getCircuitBreaker();
       const breaker2 = getCircuitBreaker();
       expect(breaker1).toBe(breaker2);
+    });
+
+    describe('Environment configuration', () => {
+      it('uses the default threshold when unset and parses a configured threshold', () => {
+        expect(circuitBreakerConfigFromEnv({})).toEqual({});
+        const config = circuitBreakerConfigFromEnv({
+          RPC_CIRCUIT_BREAKER_FAILURE_THRESHOLD: '8',
+        });
+        expect(config).toEqual({ failureThreshold: 8 });
+
+        const configuredBreaker = new CircuitBreaker(config);
+        for (let failure = 0; failure < 7; failure += 1) {
+          configuredBreaker.recordFailure();
+        }
+        expect(configuredBreaker.getState()).toBe(CircuitState.CLOSED);
+        configuredBreaker.recordFailure();
+        expect(configuredBreaker.getState()).toBe(CircuitState.OPEN);
+      });
+
+      it.each(['0', '-1', '2.5', 'not-a-number'])(
+        'rejects invalid failure thresholds: %s',
+        (value) => {
+          expect(() =>
+            circuitBreakerConfigFromEnv({
+              RPC_CIRCUIT_BREAKER_FAILURE_THRESHOLD: value,
+            }),
+          ).toThrow('RPC_CIRCUIT_BREAKER_FAILURE_THRESHOLD');
+        },
+      );
     });
 
     it('allows configuration on first call', () => {

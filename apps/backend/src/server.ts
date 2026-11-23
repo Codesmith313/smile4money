@@ -4,7 +4,11 @@ dotenv.config();
 import { app } from './app.js';
 import { initializeQueue, closeQueue, startRetryWorker, startDlqEvictionTask, listDlqEntries, writeToDlq, type DlqEntry } from './queue.js';
 import { initializeMatchStore, matchStore } from './store/index.js';
-import { initializeCircuitBreaker, closeCircuitBreakerStore } from './services/circuit-breaker.js';
+import {
+  circuitBreakerConfigFromEnv,
+  initializeCircuitBreaker,
+  closeCircuitBreakerStore,
+} from './services/circuit-breaker.js';
 import { PollingJobStore, PollingWorker, parsePollingIntervalMs } from './services/polling.js';
 import ChessPlatformPoller from './services/game-poller.js';
 import { getCurrentLedger } from './services/stellar.js';
@@ -81,7 +85,7 @@ async function main() {
     // Initialize the circuit breaker with SQLite-backed persistence (#1716),
     // restoring its prior state (or resetting to CLOSED if it went stale
     // while this process was down) before the retry worker starts using it.
-    await initializeCircuitBreaker();
+    await initializeCircuitBreaker(circuitBreakerConfigFromEnv());
     logger.info('Circuit breaker initialized');
 
     // Review-only monitor: compares settled outcomes with independent provider evidence.
