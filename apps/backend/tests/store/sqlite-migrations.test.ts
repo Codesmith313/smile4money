@@ -63,12 +63,53 @@ describe("SQLite schema migrations", () => {
     );
   });
 
+  it("makes oracle decisions append-only and prevents rolling back that protection", async () => {
+    db = new sqlite3.Database(":memory:");
+    const migrations = SQLITE_SCHEMA_MIGRATIONS["oracle-evidence"];
+    await applySqliteMigrations(db, migrations);
+    await new Promise<void>((resolve, reject) =>
+      db!.run(
+        "INSERT INTO oracle_decisions(gameId, decision) VALUES ('game', '{}')",
+        (error) => (error ? reject(error) : resolve()),
+      ),
+    );
+
+    const run = (sql: string) =>
+      new Promise<void>((resolve, reject) =>
+        db!.run(sql, (error) => (error ? reject(error) : resolve())),
+      );
+    await expect(
+      run("UPDATE oracle_decisions SET decision = '{\"changed\":true}'"),
+    ).rejects.toThrow("oracle decisions are immutable");
+    await expect(run("DELETE FROM oracle_decisions")).rejects.toThrow(
+      "oracle decisions are immutable",
+    );
+    await expect(rollbackSqliteMigrations(db, migrations, 2)).rejects.toThrow(
+      "has no down statements to roll back",
+    );
+
+    const row = await new Promise<{ decision: string }>((resolve, reject) =>
+      db!.get(
+        "SELECT decision FROM oracle_decisions WHERE gameId = 'game'",
+        (error, result: { decision: string }) =>
+          error ? reject(error) : resolve(result),
+      ),
+    );
+    expect(row.decision).toBe("{}");
+  });
+
   it("applies and rolls back every registered SQLite migration set", async () => {
     for (const migrations of Object.values(SQLITE_SCHEMA_MIGRATIONS)) {
       const database = new sqlite3.Database(":memory:");
       try {
         const applied = await applySqliteMigrations(database, migrations);
         expect(applied.currentVersion).toBe(migrations.length);
+        if (migrations.some((migration) => !migration.down?.length)) {
+          await expect(
+            rollbackSqliteMigrations(database, migrations, 0),
+          ).rejects.toThrow("has no down statements to roll back");
+          continue;
+        }
         const rolledBack = await rollbackSqliteMigrations(
           database,
           migrations,

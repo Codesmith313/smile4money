@@ -171,6 +171,22 @@ export const SQLITE_SCHEMA_MIGRATIONS: Record<string, SqliteMigration[]> = {
       ],
       down: ["DROP INDEX IF EXISTS oracle_decisions_game"],
     },
+    {
+      version: 3,
+      name: "make-oracle-decisions-append-only",
+      statements: [
+        `CREATE TRIGGER IF NOT EXISTS oracle_decisions_no_update
+          BEFORE UPDATE ON oracle_decisions
+          BEGIN
+            SELECT RAISE(ABORT, 'oracle decisions are immutable');
+          END`,
+        `CREATE TRIGGER IF NOT EXISTS oracle_decisions_no_delete
+          BEFORE DELETE ON oracle_decisions
+          BEGIN
+            SELECT RAISE(ABORT, 'oracle decisions are immutable');
+          END`,
+      ],
+    },
   ],
   settlement: [
     {

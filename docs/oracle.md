@@ -87,6 +87,20 @@ has_result(match_id: u64) -> bool
 - The oracle contract and escrow contract are separate deployments; a compromised oracle contract does not grant direct access to escrow funds.
 - The off-chain match record's player identities are bound to the match by a hash at creation time (see "Player Identity Binding" below), independently of the on-chain contracts.
 
+## Operator Decision Audit Trail
+
+Oracle review actions are persisted in the SQLite `oracle_decisions` ledger.
+Each operator retry decision records the authenticated operator's Stellar
+address, a required reason, and a server-generated ISO 8601 timestamp. The
+ledger accepts new entries only; SQLite triggers reject updates and deletes,
+and the migration that installs those protections is intentionally
+non-rollbackable through the migration runner.
+
+This prevents updates and deletes through normal SQL operations and backend
+code, but it is not protection against a privileged user with arbitrary DDL or
+database-file access. Production deployments must restrict database access
+and retain backups accordingly.
+
 ## Player Identity Binding
 
 `verifyPlayerIdentities` (`services/player-identity.ts`) checks the usernames
