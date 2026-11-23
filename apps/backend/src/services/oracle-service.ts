@@ -340,6 +340,53 @@ async function verifyGameResultCore(
   }
 
   if (apiResult.result !== null) {
+    const previousVerifiedFromOtherProvider = history
+      .slice()
+      .reverse()
+      .find((decision) => {
+        const decisionProvider =
+          decision.provider ?? decision.evidence?.provider;
+        return (
+          decision.state === 'verified' &&
+          decisionProvider !== undefined &&
+          decisionProvider !== provider &&
+          decision.evidence?.outcome !== undefined &&
+          decision.evidence.outcome !== null
+        );
+      });
+    const conflictingProvider =
+      previousVerifiedFromOtherProvider?.provider ??
+      previousVerifiedFromOtherProvider?.evidence?.provider;
+    const conflictingOutcome =
+      previousVerifiedFromOtherProvider?.evidence?.outcome;
+    if (
+      conflictingProvider !== undefined &&
+      conflictingOutcome !== undefined &&
+      conflictingOutcome !== null &&
+      conflictingOutcome !== apiResult.result
+    ) {
+      const reason =
+        `Provider outcome contradiction: ${conflictingProvider} reported ` +
+        `${conflictingOutcome}, while ${provider} reported ${apiResult.result}.`;
+      await ledger?.append({
+        matchId: match.matchId,
+        gameId,
+        state: 'review_required',
+        reason,
+        provider,
+        previousProvider: conflictingProvider,
+        evidence: apiResult.evidence,
+        previousEvidence: previousVerifiedFromOtherProvider.evidence,
+        recordedAt: evidence.evaluatedAt,
+      });
+      return {
+        ok: false,
+        status: 409,
+        error: 'Provider outcome contradiction',
+        details: reason,
+      };
+    }
+
     const previousVerified = history
       .slice()
       .reverse()

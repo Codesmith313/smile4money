@@ -365,6 +365,69 @@ describe('verifyGameResult', () => {
     ]);
   });
 
+  it('holds a contradiction when different providers report different outcomes', async () => {
+    await seedMatch(store);
+    const ledger = new MemoryEvidenceStore();
+    const previousEvidence = providerMetadata(
+      'chessdotcom',
+      'Player2Wins',
+    ).evidence;
+    await ledger.append({
+      matchId: 0,
+      gameId: 'lichess-game-abc',
+      state: 'verified',
+      reason: 'Result verified',
+      provider: 'chessdotcom',
+      evidence: previousEvidence,
+      recordedAt: previousEvidence.fetchedAt,
+    });
+    mockFetchLichess.mockResolvedValue(LICHESS_GAME);
+
+    const result = await verifyGameResult(
+      store,
+      {
+        matchId: 0,
+        gameId: 'lichess-game-abc',
+        platform: 'lichess',
+      },
+      ledger,
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      status: 409,
+      error: 'Provider outcome contradiction',
+      details:
+        'Provider outcome contradiction: chessdotcom reported Player2Wins, while lichess reported Player1Wins.',
+    });
+    const history = await ledger.history('lichess-game-abc');
+    expect(history.map((decision) => decision.state)).toEqual([
+      'verified',
+      'provider_changed',
+      'review_required',
+    ]);
+    expect(history[2]).toMatchObject({
+      provider: 'lichess',
+      previousProvider: 'chessdotcom',
+      previousEvidence: {
+        provider: 'chessdotcom',
+        outcome: 'Player2Wins',
+      },
+      evidence: {
+        provider: 'lichess',
+        outcome: 'Player1Wins',
+      },
+    });
+    expect(
+      await verifyGameResult(
+        store,
+        { matchId: 0, gameId: 'lichess-game-abc', platform: 'lichess' },
+        ledger,
+      ),
+    ).toMatchObject({ ok: false, status: 409 });
+    expect(mockFetchLichess).toHaveBeenCalledTimes(1);
+  });
+
   // #1721 — the fetcher used must match the platform the match was actually
   // created with (match.platform), never the caller-supplied request field.
   describe('platform consistency (#1721)', () => {

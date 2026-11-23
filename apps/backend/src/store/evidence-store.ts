@@ -14,6 +14,7 @@ export interface Decision {
   provider?: Evidence['provider'];
   previousProvider?: Evidence['provider'];
   evidence?: Evidence;
+  previousEvidence?: Evidence;
   recordedAt: string;
   operator?: string;
 }

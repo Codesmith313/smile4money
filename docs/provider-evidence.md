@@ -35,6 +35,11 @@ returns the provider with each decision. If the provider differs from an
 earlier decision for the same game, the append-only ledger records a separate
 `provider_changed` entry with both the previous and current provider.
 
+When verified results from different providers disagree, the ledger appends a
+`review_required` decision containing both providers and outcomes, with both
+provider evidence records. Automatic result verification is then held until
+an operator requests re-verification; no result is returned for payout.
+
 Result submission is permitted only after the provider reports a finished game
 and its end time is no later than the verification time. Premature attempts
 return HTTP 425 with a timing-violation message; polling treats these as
