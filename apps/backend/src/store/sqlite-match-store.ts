@@ -231,10 +231,10 @@ export class SqliteMatchStore {
   async saveSettlementEvidence(evidence: CanonicalSettlementEvidence): Promise<void> {
     await this.withConnection((db) => new Promise<void>((resolve, reject) => {
       db.run(`INSERT INTO settlement_evidence
-        (matchId, parserVersion, evaluatedAt, gameId, platform, whitePlayer, blackPlayer, result, status, decision)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (matchId, parserVersion, evaluatedAt, gameId, platform, provider, whitePlayer, blackPlayer, result, status, decision)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [evidence.matchId, evidence.parserVersion, evidence.evaluatedAt, evidence.gameId, evidence.platform,
-        evidence.whitePlayer, evidence.blackPlayer, evidence.result, evidence.status, evidence.decision],
+        evidence.provider, evidence.whitePlayer, evidence.blackPlayer, evidence.result, evidence.status, evidence.decision],
       (err: Error | null) => err ? reject(err) : resolve());
     }));
   }
@@ -245,7 +245,7 @@ export class SqliteMatchStore {
         if (err) { reject(err); return; }
         if (!row) { resolve(null); return; }
         resolve({ parserVersion: row.parserVersion, evaluatedAt: row.evaluatedAt, matchId,
-          gameId: row.gameId, platform: row.platform, whitePlayer: row.whitePlayer,
+          gameId: row.gameId, platform: row.platform, provider: row.provider, whitePlayer: row.whitePlayer,
           blackPlayer: row.blackPlayer, result: row.result ?? null, status: row.status, decision: row.decision });
       })));
   }
@@ -256,7 +256,7 @@ export class SqliteMatchStore {
       (err: Error | null, rows: any[]) => {
         if (err) { reject(err); return; }
         resolve(rows.map((row) => ({ parserVersion: row.parserVersion, evaluatedAt: row.evaluatedAt,
-          matchId, gameId: row.gameId, platform: row.platform, whitePlayer: row.whitePlayer,
+          matchId, gameId: row.gameId, platform: row.platform, provider: row.provider, whitePlayer: row.whitePlayer,
           blackPlayer: row.blackPlayer, result: row.result ?? null, status: row.status, decision: row.decision })));
       })));
   }

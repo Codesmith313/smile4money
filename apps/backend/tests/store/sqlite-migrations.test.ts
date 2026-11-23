@@ -83,4 +83,28 @@ describe("SQLite schema migrations", () => {
       }
     }
   });
+
+  it("adds and backfills the provider column in settlement evidence", async () => {
+    db = new sqlite3.Database(":memory:");
+    const migrations = SQLITE_SCHEMA_MIGRATIONS["match-store"];
+    await applySqliteMigrations(db, migrations.slice(0, 3));
+    await new Promise<void>((resolve, reject) =>
+      db!.run(
+        `INSERT INTO settlement_evidence
+          (matchId, parserVersion, evaluatedAt, gameId, platform, whitePlayer, blackPlayer, result, status, decision)
+         VALUES (1, 'v1', '2026-01-01T00:00:00.000Z', 'game', 'lichess', 'alice', 'bob', 'Player1Wins', 'mate', 'verified')`,
+        (error) => (error ? reject(error) : resolve()),
+      ),
+    );
+    await applySqliteMigrations(db, migrations);
+
+    const result = await new Promise<{ provider: string }>((resolve, reject) =>
+        db!.all(
+          "SELECT provider FROM settlement_evidence WHERE gameId = 'game'",
+          (error, rows: Array<{ provider: string }>) =>
+            error ? reject(error) : resolve(rows[0]),
+        ),
+    );
+    expect(result.provider).toBe("lichess");
+  });
 });

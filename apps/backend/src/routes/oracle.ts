@@ -76,6 +76,7 @@ router.post('/submit-result', async (req, res, next) => {
       matchId: result.matchId,
       gameId: result.gameId,
       result: result.result,
+      provider: result.provider,
       whitePlayer: result.whitePlayer,
       blackPlayer: result.blackPlayer,
       status: result.status,

@@ -75,6 +75,7 @@ describe('durable oracle evidence and operator review', () => {
     await ledger.initialize();
     const history = await ledger.history('game');
     expect(history.map((d) => d.state)).toEqual(['in_progress', 'verified']);
+    expect(history[1].provider).toBe('lichess');
     expect(history[1].evidence).toMatchObject({
       provider: 'lichess',
       parserVersion: '2',

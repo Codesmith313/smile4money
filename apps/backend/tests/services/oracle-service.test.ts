@@ -12,6 +12,7 @@ import {
   verifyGameResult,
 } from '../../src/services/oracle-service.js';
 import { MatchStore } from '../../src/store/match-store.js';
+import { MemoryEvidenceStore } from '../../src/store/evidence-store.js';
 
 // ---------------------------------------------------------------------------
 // Mock external dependencies
@@ -164,6 +165,7 @@ describe('verifyGameResult', () => {
         parserVersion: 'chess-result-v1',
         gameId: 'lichess-game-abc',
         platform: 'lichess',
+        provider: 'lichess',
         whitePlayer: 'alice',
         blackPlayer: 'bob',
         result: 'Player1Wins',
@@ -287,7 +289,11 @@ describe('verifyGameResult', () => {
 
   it('uses chessdotcom fetcher when platform is chessdotcom', async () => {
     await seedMatch(store, { platform: 'chessdotcom' });
-    mockFetchChess.mockResolvedValue({ ...LICHESS_GAME, gameId: 'lichess-game-abc' });
+    mockFetchChess.mockResolvedValue({
+      ...LICHESS_GAME,
+      ...providerMetadata('chessdotcom'),
+      gameId: 'lichess-game-abc',
+    });
 
     const result = await verifyGameResult(store, {
       matchId: 0,
@@ -299,6 +305,40 @@ describe('verifyGameResult', () => {
     expect(result.ok).toBe(true);
     expect(mockFetchChess).toHaveBeenCalledWith('alice', 'lichess-game-abc');
     expect(mockFetchLichess).not.toHaveBeenCalled();
+    if (result.ok) expect(result.provider).toBe('chessdotcom');
+  });
+
+  it('records provider changes as separate ledger entries', async () => {
+    await seedMatch(store);
+    const ledger = new MemoryEvidenceStore();
+    mockFetchLichess
+      .mockResolvedValueOnce(LICHESS_GAME)
+      .mockResolvedValueOnce({
+        ...LICHESS_GAME,
+        evidence: providerMetadata('chessdotcom').evidence,
+      });
+
+    await verifyGameResult(
+      store,
+      { matchId: 0, gameId: 'lichess-game-abc', platform: 'lichess' },
+      ledger,
+    );
+    const secondResult = await verifyGameResult(
+      store,
+      { matchId: 0, gameId: 'lichess-game-abc', platform: 'lichess' },
+      ledger,
+    );
+
+    expect(secondResult).toMatchObject({ ok: true, provider: 'chessdotcom' });
+    await expect(ledger.history('lichess-game-abc')).resolves.toMatchObject([
+      { state: 'verified', provider: 'lichess' },
+      {
+        state: 'provider_changed',
+        previousProvider: 'lichess',
+        provider: 'chessdotcom',
+      },
+      { state: 'verified', provider: 'chessdotcom' },
+    ]);
   });
 
   // #1721 — the fetcher used must match the platform the match was actually

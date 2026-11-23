@@ -29,6 +29,12 @@ calculation from base time alone. Lichess uses createdAt/lastMoveAt (millisecond
 Chess.com uses start_time/end_time (seconds); live games without start_time must
 supply UTCDate and UTCTime PGN tags. Missing chronology requires review.
 
+Each persisted settlement result and oracle decision records the provider that
+supplied it (`lichess` or `chessdotcom`). `GET /api/oracle/reviews/:gameId`
+returns the provider with each decision. If the provider differs from an
+earlier decision for the same game, the append-only ledger records a separate
+`provider_changed` entry with both the previous and current provider.
+
 Match identifiers start at zero, as in the escrow contract and local store. The
 number-based API accepts 0 through Number.MAX_SAFE_INTEGER, inclusive, which is
 the exactly representable subset of the contract's u64 identifiers. Larger IDs
