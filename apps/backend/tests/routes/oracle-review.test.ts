@@ -114,6 +114,21 @@ describe('oracle review workflow', () => {
     expect(
       (
         await request(server)
+          .post('/reviews/disputed-game/rollback')
+          .send({ reason: 'Retry' })
+      ).status,
+    ).toBe(401);
+    expect(
+      (
+        await request(server)
+          .post('/reviews/disputed-game/rollback')
+          .set('Authorization', `Bearer ${token('player')}`)
+          .send({ reason: 'Retry' })
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await request(server)
           .post('/reviews/disputed-game/decision')
           .set(adminHeader)
           .send({ decision: 'accept', result: 'invalid', reason: 'Check' })

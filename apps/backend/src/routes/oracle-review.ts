@@ -6,7 +6,9 @@ import {
   type EvidenceStore,
   type OperatorDecision,
 } from '../store/evidence-store.js';
-import { ErrorCode, errorEnvelope } from '../errors/errorResponse.js';
+import type { MatchStorePort } from '../store/match-store.js';
+import { verifyGameResult } from '../services/oracle-service.js';
+import { ErrorCode, errorEnvelope, statusToErrorCode } from '../errors/errorResponse.js';
 import logger from '../logger.js';
 
 const VALID_RESULTS = new Set(['Player1Wins', 'Player2Wins', 'Draw']);
@@ -19,9 +21,10 @@ function isAwaitingReview(state: string): boolean {
   return state === 'review_required' || state === 'retry_requested';
 }
 
-export function createReviewRouter(ledger?: EvidenceStore) {
+export function createReviewRouter(ledger?: EvidenceStore, matches?: MatchStorePort) {
   const router = Router();
   const getLedger = async () => ledger ?? (await import('../store/index.js')).evidenceStore;
+  const getMatchStore = async () => matches ?? (await import('../store/index.js')).matchStore;
 
   router.use(authenticate);
   router.use((req, res, next) => {
@@ -39,7 +42,8 @@ export function createReviewRouter(ledger?: EvidenceStore) {
 
   router.get('/', async (_req, res, next) => {
     try {
-      const decisions = await (await getLedger()).query();
+      const evidenceStore = await getLedger();
+      const decisions = await evidenceStore.query();
       const latestByGame = new Map<string, (typeof decisions)[number]>();
       for (const decision of decisions) {
         const latest = latestByGame.get(decision.gameId);
@@ -72,13 +76,96 @@ export function createReviewRouter(ledger?: EvidenceStore) {
 
   router.get('/:gameId', async (req, res, next) => {
     try {
-      const history = await (await getLedger()).history(req.params.gameId);
+      const evidenceStore = await getLedger();
+      const history = await evidenceStore.history(req.params.gameId);
       if (!history.length) {
         return res
           .status(404)
           .json(errorEnvelope(ErrorCode.NOT_FOUND, 'Evidence could not be found.'));
       }
       return res.json({ review: history[history.length - 1], history });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.post('/:gameId/rollback', async (req, res, next) => {
+    if (
+      !req.body ||
+      Object.keys(req.body).some((key) => key !== 'reason') ||
+      typeof req.body.reason !== 'string' ||
+      !req.body.reason.trim() ||
+      req.body.reason.length > 500
+    ) {
+      return res
+        .status(400)
+        .json(
+          errorEnvelope(
+            ErrorCode.VALIDATION_ERROR,
+            'Provide only a reason between 1 and 500 characters.',
+          ),
+        );
+    }
+
+    try {
+      const evidenceStore = await getLedger();
+      const matchStore = await getMatchStore();
+      const gameId = req.params.gameId;
+      const match = await matchStore.findByGameId(gameId);
+      if (!match) {
+        return res
+          .status(404)
+          .json(errorEnvelope(ErrorCode.NOT_FOUND, 'Match could not be found.'));
+      }
+
+      const rollback = await withGameLock(gameId, async () => {
+        const history = await evidenceStore.history(gameId);
+        const previous = history[history.length - 1];
+        const decisionId = await evidenceStore.append({
+          matchId: match.matchId,
+          gameId,
+          state: 'retry_requested',
+          reason: req.body.reason.trim(),
+          evidence: previous?.evidence,
+          operator: req.address,
+          recordedAt: new Date().toISOString(),
+        });
+        return { decisionId, previousDecisionId: previous?.id };
+      });
+
+      logger.warn(
+        {
+          game_id: gameId,
+          match_id: match.matchId,
+          decision_id: rollback.decisionId,
+          previous_decision_id: rollback.previousDecisionId,
+          operator: req.address,
+          reason: req.body.reason.trim(),
+        },
+        'oracle_result_rollback_requested',
+      );
+
+      const result = await verifyGameResult(
+        matchStore,
+        {
+          matchId: match.matchId,
+          gameId,
+          platform: match.platform,
+          username: match.player1Username ?? match.player2Username,
+        },
+        evidenceStore,
+      );
+      if (!result.ok) {
+        return res
+          .status(result.status)
+          .json(
+            errorEnvelope(
+              statusToErrorCode(result.status),
+              result.details ? `${result.error}: ${result.details}` : result.error,
+            ),
+          );
+      }
+      return res.status(200).json({ reverified: true, ...result });
     } catch (error) {
       next(error);
     }
@@ -118,11 +205,11 @@ export function createReviewRouter(ledger?: EvidenceStore) {
 
     try {
       const decisionId = await withGameLock(req.params.gameId, async () => {
-        const store = await getLedger();
-        const history = await store.history(req.params.gameId);
+        const evidenceStore = await getLedger();
+        const history = await evidenceStore.history(req.params.gameId);
         const latest = history[history.length - 1];
         if (!latest || !isAwaitingReview(latest.state)) return null;
-        return store.append({
+        return evidenceStore.append({
           matchId: latest.matchId,
           gameId: latest.gameId,
           state: 'operator_decided',
@@ -178,11 +265,11 @@ export function createReviewRouter(ledger?: EvidenceStore) {
     }
     try {
       const decisionId = await withGameLock(req.params.gameId, async () => {
-        const store = await getLedger();
-        const history = await store.history(req.params.gameId);
+        const evidenceStore = await getLedger();
+        const history = await evidenceStore.history(req.params.gameId);
         const latest = history[history.length - 1];
         if (!latest || !isAwaitingReview(latest.state)) return null;
-        return store.append({
+        return evidenceStore.append({
           matchId: latest.matchId,
           gameId: latest.gameId,
           state: 'retry_requested',

@@ -520,6 +520,121 @@
         }
       }
     },
+    "/api/oracle/reviews/{gameId}/rollback": {
+      "post": {
+        "operationId": "rollbackAndReverifyOracleResult",
+        "summary": "Request an audited fresh provider verification",
+        "description": "Appends a rollback request without deleting prior decisions, fetches provider data again, and records the new verification outcome. It does not reverse or submit an on-chain transaction.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "gameId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "reason"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Provider result fetched and recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RollbackResultResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid rollback reason or verification input",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Administrator access is required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Match or provider game not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Re-verification requires operator review",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Provider rate limited the re-verification",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/oracle/reviews/{gameId}/decision": {
       "post": {
         "operationId": "recordOracleReviewDecision",
@@ -1456,6 +1571,55 @@
               },
               "decision": {
                 "$ref": "#/components/schemas/OperatorReviewDecision"
+              }
+            }
+          },
+          "RollbackResultResponse": {
+            "type": "object",
+            "required": [
+              "reverified",
+              "ok",
+              "verified",
+              "matchId",
+              "gameId",
+              "result"
+            ],
+            "properties": {
+              "reverified": {
+                "type": "boolean",
+                "const": true
+              },
+              "ok": {
+                "type": "boolean",
+                "const": true
+              },
+              "verified": {
+                "type": "boolean",
+                "const": true
+              },
+              "decisionId": {
+                "type": "integer"
+              },
+              "matchId": {
+                "type": "integer"
+              },
+              "gameId": {
+                "type": "string"
+              },
+              "result": {
+                "$ref": "#/components/schemas/MatchResult"
+              },
+              "whitePlayer": {
+                "type": "string"
+              },
+              "blackPlayer": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
               }
             }
           },
