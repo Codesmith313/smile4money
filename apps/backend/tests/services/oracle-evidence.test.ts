@@ -67,7 +67,11 @@ describe('durable oracle evidence and operator review', () => {
         data: { ...payload, status: 'started', winner: undefined },
       })
       .mockResolvedValue({ status: 200, data: payload });
-    expect((await verifyGameResult(matches, input, ledger)).ok).toBe(true);
+    expect(await verifyGameResult(matches, input, ledger)).toMatchObject({
+      ok: false,
+      status: 425,
+      error: 'Result submission timing violation',
+    });
     const result = await verifyGameResult(matches, input, ledger);
     expect(result.ok).toBe(true);
     await ledger.close();

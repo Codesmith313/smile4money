@@ -174,6 +174,30 @@ describe('verifyGameResult', () => {
     }
   });
 
+  it('rejects a result whose provider end time is still in the future', async () => {
+    await seedMatch(store);
+    const futureEndTime = '2999-01-01T00:00:00.000Z';
+    mockFetchLichess.mockResolvedValue({
+      ...LICHESS_GAME,
+      endedAt: futureEndTime,
+      evidence: { ...LICHESS_GAME.evidence, endedAt: futureEndTime },
+    });
+
+    const result = await verifyGameResult(store, {
+      matchId: 0,
+      gameId: 'lichess-game-abc',
+      platform: 'lichess',
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      status: 425,
+      error: 'Result submission timing violation',
+      details: expect.stringContaining(futureEndTime),
+    });
+    await expect(store.getSettlementEvidence(0)).resolves.toBeNull();
+  });
+
   it('returns ok:false with 404 and persistence hint when store is empty', async () => {
     // Store is empty — do not seed anything
     const result = await verifyGameResult(store, {

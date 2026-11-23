@@ -252,6 +252,38 @@ async function verifyGameResultCore(
     status: apiResult.status,
   };
 
+  const submissionTime = Date.now();
+  const gameEndTime = apiResult.endedAt ? Date.parse(apiResult.endedAt) : NaN;
+  if (
+    apiResult.result === null ||
+    apiResult.status !== 'finished' ||
+    !Number.isFinite(gameEndTime) ||
+    submissionTime < gameEndTime
+  ) {
+    const details =
+      apiResult.result === null || apiResult.status !== 'finished'
+        ? `Provider ${provider} has not confirmed that the game is finished.`
+        : !Number.isFinite(gameEndTime)
+          ? `Provider ${provider} did not supply a valid game end time.`
+          : `Submission time ${new Date(submissionTime).toISOString()} precedes provider game end time ${apiResult.endedAt}.`;
+    const reason = `Result submission timing violation: ${details}`;
+    await ledger?.append({
+      matchId: match.matchId,
+      gameId,
+      state: 'in_progress',
+      reason,
+      provider,
+      evidence: apiResult.evidence,
+      recordedAt: new Date(submissionTime).toISOString(),
+    });
+    return {
+      ok: false,
+      status: 425,
+      error: 'Result submission timing violation',
+      details,
+    };
+  }
+
   // Build the identity map from the match record
   const identityMap: PlayerIdentityMap = {
     player1Address: match.player1,
