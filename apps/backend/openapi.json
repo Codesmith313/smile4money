@@ -414,6 +414,282 @@
         }
       }
     },
+    "/api/oracle/reviews": {
+      "get": {
+        "operationId": "getOracleReviewQueue",
+        "summary": "List disputed results awaiting operator review",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Open review queue, oldest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OracleReviewQueue"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Administrator access is required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/oracle/reviews/{gameId}": {
+      "get": {
+        "operationId": "getOracleReviewDetails",
+        "summary": "Get a game's full oracle review history",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "gameId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current review and append-only history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OracleReviewDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No evidence was found for this game",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Administrator access is required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/oracle/reviews/{gameId}/decision": {
+      "post": {
+        "operationId": "recordOracleReviewDecision",
+        "summary": "Record an operator's accept or reject decision",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "gameId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OracleReviewDecisionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Decision recorded in the append-only review ledger",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OracleReviewDecisionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid decision or reason",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Administrator access is required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The game is not awaiting review",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/oracle/reviews/{gameId}/retry": {
+      "post": {
+        "operationId": "retryOracleReview",
+        "summary": "Request a fresh provider verification for disputed evidence",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "gameId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "reason"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Retry request recorded"
+          },
+          "400": {
+            "description": "Invalid reason",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Administrator access is required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The game is not awaiting review",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/oracle/submit-result": {
       "post": {
         "operationId": "submitResult",
@@ -955,7 +1231,8 @@
                         "review_required",
                         "verified",
                         "in_progress",
-                        "retry_requested"
+                        "retry_requested",
+                        "operator_decided"
                       ]
                     },
                     "reason": {
@@ -974,9 +1251,211 @@
                     },
                     "operator": {
                       "type": "string"
+                    },
+                    "operatorDecision": {
+                      "$ref": "#/components/schemas/OperatorReviewDecision"
                     }
                   }
                 }
+              }
+            }
+          },
+          "OracleReviewQueue": {
+            "type": "object",
+            "required": [
+              "reviews"
+            ],
+            "properties": {
+              "reviews": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "decisionId",
+                    "matchId",
+                    "gameId",
+                    "reason",
+                    "recordedAt",
+                    "state"
+                  ],
+                  "properties": {
+                    "decisionId": {
+                      "type": "integer"
+                    },
+                    "matchId": {
+                      "type": "integer"
+                    },
+                    "gameId": {
+                      "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
+                    },
+                    "recordedAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "review_required",
+                        "retry_requested"
+                      ]
+                    },
+                    "provider": {
+                      "oneOf": [
+                        {
+                          "$ref": "#/components/schemas/Platform"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "evidence": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "OracleReviewDetail": {
+            "type": "object",
+            "required": [
+              "review",
+              "history"
+            ],
+            "properties": {
+              "review": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "history": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "OracleReviewDecisionRequest": {
+            "oneOf": [
+              {
+                "type": "object",
+                "required": [
+                  "decision",
+                  "result",
+                  "reason"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "decision": {
+                    "type": "string",
+                    "enum": [
+                      "accept"
+                    ]
+                  },
+                  "result": {
+                    "type": "string",
+                    "enum": [
+                      "Player1Wins",
+                      "Player2Wins",
+                      "Draw"
+                    ]
+                  },
+                  "reason": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "decision",
+                  "reason"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "decision": {
+                    "type": "string",
+                    "enum": [
+                      "reject"
+                    ]
+                  },
+                  "reason": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500
+                  }
+                }
+              }
+            ]
+          },
+          "OperatorReviewDecision": {
+            "oneOf": [
+              {
+                "type": "object",
+                "required": [
+                  "action",
+                  "result"
+                ],
+                "properties": {
+                  "action": {
+                    "type": "string",
+                    "enum": [
+                      "accept"
+                    ]
+                  },
+                  "result": {
+                    "type": "string",
+                    "enum": [
+                      "Player1Wins",
+                      "Player2Wins",
+                      "Draw"
+                    ]
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "action"
+                ],
+                "properties": {
+                  "action": {
+                    "type": "string",
+                    "enum": [
+                      "reject"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "OracleReviewDecisionResponse": {
+            "type": "object",
+            "required": [
+              "decisionId",
+              "state",
+              "decision"
+            ],
+            "properties": {
+              "decisionId": {
+                "type": "integer"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "operator_decided"
+                ]
+              },
+              "decision": {
+                "$ref": "#/components/schemas/OperatorReviewDecision"
               }
             }
           },

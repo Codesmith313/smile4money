@@ -28,18 +28,22 @@ and polling removes the held job without invoking submission or DLQ callbacks.
 Set `ORACLE_ADMIN_ADDRESSES` to a comma-separated allowlist of Stellar addresses.
 Administrators authenticate with the existing JWT flow and can:
 
-- `GET /api/oracle/reviews/:gameId` to inspect the decision and evidence history.
+- `GET /api/oracle/reviews` to list ambiguous results awaiting review.
+- `GET /api/oracle/reviews/:gameId` to inspect the current review and full evidence history.
+- `POST /api/oracle/reviews/:gameId/decision` with either
+  `{ "decision": "accept", "result": "Player1Wins", "reason": "..." }` or
+  `{ "decision": "reject", "reason": "..." }` to append an audited decision.
 - `POST /api/oracle/reviews/:gameId/retry` with only `{ "reason": "Provider corrected evidence" }`
   to append an audited retry request. Then call the regular submit-result endpoint
   to fetch and verify again (or explicitly recreate a removed polling job).
 
 The allowlist defaults to empty. Regular authenticated users cannot review or
-release holds. Retry requests cannot specify a winner, sign a transaction, or
-change on-chain authorization. Evidence still conflicting with an earlier verified
-outcome returns to review. The service serializes review and verification per game
-within one backend process; run one process per evidence database. Keep operator
-reasons free of personal data. Actual on-chain settlement continues to require the
-contract's privileged oracle authorization.
+release holds. Review decisions and reasons are append-only and identify the
+operator and timestamp; decisions do not submit results on-chain or sign
+transactions. Retry requests cannot specify a winner or change on-chain
+authorization. Evidence still conflicting with an earlier verified outcome
+returns to review. Keep operator reasons free of personal data. Actual on-chain
+settlement continues to require the contract's privileged oracle authorization.
 
 Authenticated match participants can query their submission history with
 `GET /api/oracle/history`. Optional `game_id`, `start_date`, and `end_date`

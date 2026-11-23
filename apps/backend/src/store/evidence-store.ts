@@ -2,16 +2,27 @@ import sqlite3 from 'sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Evidence } from '../fetchers/result.js';
+import type { MatchResult } from '../fetchers/lichess.js';
 import { applySqliteMigrations } from './sqlite-migrations.js';
 import { SQLITE_SCHEMA_MIGRATIONS } from './sqlite-schema-migrations.js';
+
+export type OperatorDecision =
+  | { action: 'accept'; result: Exclude<MatchResult, null> }
+  | { action: 'reject' };
 
 export interface Decision {
   id?: number;
   matchId: number;
   gameId: string;
-  state: 'review_required' | 'verified' | 'in_progress' | 'retry_requested';
+  state:
+    | 'review_required'
+    | 'verified'
+    | 'in_progress'
+    | 'retry_requested'
+    | 'operator_decided';
   reason: string;
   evidence?: Evidence;
+  operatorDecision?: OperatorDecision;
   recordedAt: string;
   operator?: string;
 }
