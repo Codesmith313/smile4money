@@ -27,6 +27,7 @@ export interface SubmitResultInput {
 export interface SubmitResultSuccess {
   ok: true;
   verified: true;
+  decisionId?: number;
   matchId: number;
   gameId: string;
   result: string | null;
@@ -143,6 +144,19 @@ async function verifyGameResultCore(
     };
   }
 
+  const priorHistory = evidenceStore ? await evidenceStore.history(gameId) : [];
+  const latestDecision = priorHistory[priorHistory.length - 1];
+  if (
+    latestDecision?.state === 'review_required' ||
+    latestDecision?.state === 'operator_decided'
+  ) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'Result is awaiting operator review',
+    };
+  }
+
   // Ensure player identities were captured at match creation
   if (!match.player1Username || !match.player2Username) {
     return {
@@ -189,6 +203,28 @@ async function verifyGameResultCore(
       };
     }
   } catch (error) {
+    if (error instanceof AmbiguousEvidenceError) {
+      if (evidenceStore) {
+        await evidenceStore.append({
+          matchId: match.matchId,
+          gameId,
+          state: 'review_required',
+          reason: error.message,
+          evidence: error.evidence,
+          recordedAt: new Date().toISOString(),
+        });
+      }
+      logger.warn(
+        { game_id: gameId, match_id: match.matchId, reason: error.message },
+        'oracle_ambiguous_result_requires_review',
+      );
+      return {
+        ok: false,
+        status: 409,
+        error: 'Result requires operator review',
+        details: error.message,
+      };
+    }
     if (error instanceof GameNotFoundError) {
       return {
         ok: false,
@@ -422,9 +458,24 @@ async function verifyGameResultCore(
     recordedAt: evidence.evaluatedAt,
   });
 
+  const decisionId = evidenceStore
+    ? await evidenceStore.append({
+        matchId: match.matchId,
+        gameId,
+        state: apiResult.result === null ? 'in_progress' : 'verified',
+        reason:
+          apiResult.result === null
+            ? 'Game is still in progress'
+            : 'Game result verified',
+        evidence: apiResult.evidence,
+        recordedAt: new Date().toISOString(),
+      })
+    : undefined;
+
   return {
     ok: true,
     verified: true,
+    decisionId,
     matchId: match.matchId,
     gameId: apiResult.gameId,
     result: apiResult.result,

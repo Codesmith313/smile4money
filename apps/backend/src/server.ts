@@ -16,6 +16,8 @@ import { retryDlqSubmission, type OracleSubmission } from './services/oracle-sub
 import { initializeValidateGameCache } from './services/validate-game-service.js';
 import { createShutdownHandler } from './shutdown.js';
 import { resolveNetworkConfig } from './config/network.js';
+import { startMatchStateSync } from './services/match-state-sync.js';
+import { startWebhookRetryWorker } from './services/webhooks.js';
 import logger from './logger.js';
 
 const port = Number(process.env.PORT || 4000);
@@ -84,6 +86,27 @@ async function main() {
     // Initialize the persistent match store (SQLite-backed)
     await initializeMatchStore();
     logger.info('Match store initialized');
+    const stopWebhookRetryWorker = startWebhookRetryWorker(matchStore);
+    let stopMatchStateSync: (() => Promise<void>) | undefined;
+    const chainConfigPresent = [
+      process.env.STELLAR_RPC_URL,
+      process.env.STELLAR_NETWORK_PASSPHRASE,
+      process.env.ORACLE_SECRET_KEY,
+      process.env.CONTRACT_ESCROW,
+    ].every((value) => !!value && !value.startsWith('YOUR_'));
+    if (chainConfigPresent) {
+      const stateSyncIntervalMs = Number(process.env.MATCH_STATE_SYNC_INTERVAL_MS ?? 15_000);
+      if (!Number.isSafeInteger(stateSyncIntervalMs) || stateSyncIntervalMs < 1_000 || stateSyncIntervalMs > 300_000) {
+        throw new Error('MATCH_STATE_SYNC_INTERVAL_MS must be an integer between 1000 and 300000');
+      }
+      stopMatchStateSync = startMatchStateSync(
+        matchStore,
+        SorobanSettlementClient.fromEnvironment(),
+        stateSyncIntervalMs,
+      );
+    } else {
+      logger.info({}, 'match_state_sync_disabled_missing_chain_configuration');
+    }
 
     // Initialize the circuit breaker with SQLite-backed persistence (#1716),
     // restoring its prior state (or resetting to CLOSED if it went stale
@@ -187,7 +210,14 @@ async function main() {
       stopPollingWorker,
       stopRetryWorker,
       stopDlqEviction,
+      stopOutboxDispatcher: async () => {
+        await Promise.all([
+          stopWebhookRetryWorker(),
+          stopMatchStateSync?.(),
+        ]);
+      },
       closeQueue,
+      closeMatchStore,
       closeCircuitBreakerStore,
       logger,
       shutdownTimeoutMs: Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 30_000),

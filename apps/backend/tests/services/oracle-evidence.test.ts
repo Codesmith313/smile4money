@@ -33,7 +33,7 @@ const token = (address: string) =>
 function app() {
   const server = express();
   server.use(express.json());
-  server.use('/reviews', createReviewRouter(ledger));
+  server.use('/reviews', createReviewRouter(ledger, matches));
   return server;
 }
 beforeEach(async () => {
@@ -161,6 +161,62 @@ describe('durable oracle evidence and operator review', () => {
       recordedAt: expect.stringMatching(
         /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
       ),
+    });
+  });
+  it('re-fetches provider data on rollback and preserves prior decisions', async () => {
+    const recordedAt = '2025-01-01T10:00:00.000Z';
+    const previousEvidence = {
+      provider: 'lichess' as const,
+      fetchedAt: recordedAt,
+      parserVersion: '2',
+      responseHash: 'previous-hash',
+      source: 'https://lichess.org/game/export/game',
+      outcome: 'Player1Wins' as const,
+      endedAt: recordedAt,
+    };
+    await ledger.append({
+      matchId: 0,
+      gameId: 'game',
+      state: 'verified',
+      reason: 'Previously verified',
+      evidence: previousEvidence,
+      recordedAt,
+    });
+    await ledger.append({
+      matchId: 0,
+      gameId: 'game',
+      state: 'review_required',
+      reason: 'Ambiguous provider evidence',
+      evidence: { ...previousEvidence, outcome: null, endedAt: null },
+      recordedAt,
+    });
+    get.mockResolvedValue({ status: 200, data: payload });
+
+    const response = await request(app())
+      .post('/reviews/game/rollback')
+      .set('Authorization', `Bearer ${token('operator')}`)
+      .send({ reason: 'Provider corrected its result' });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      reverified: true,
+      result: 'Player1Wins',
+    });
+    expect(get).toHaveBeenCalledTimes(1);
+    const history = await ledger.history('game');
+    expect(history.map((entry) => entry.state)).toEqual([
+      'verified',
+      'review_required',
+      'retry_requested',
+      'verified',
+    ]);
+    expect(history[0]).toMatchObject({
+      reason: 'Previously verified',
+      evidence: { responseHash: 'previous-hash', outcome: 'Player1Wins' },
+    });
+    expect(history[2]).toMatchObject({
+      operator: 'operator',
+      reason: 'Provider corrected its result',
     });
   });
   it('quarantines changed outcomes while retaining the earlier verified decision', async () => {

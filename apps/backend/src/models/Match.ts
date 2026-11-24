@@ -1,4 +1,5 @@
 import { matchStore } from '../store/index.js';
+import type { MatchState } from '../store/match-store.js';
 
 export interface MatchDocument {
   matchId: number;
@@ -8,7 +9,7 @@ export interface MatchDocument {
   token: string;
   gameId: string;
   platform: string;
-  state: 'Pending';
+  state: MatchState;
 }
 
 export class Match {
