@@ -72,6 +72,11 @@ export const recoverySuggestions: Record<string, RecoverySuggestion> = {
       'Provide a valid authentication token in the Authorization header (or refresh your token) and retry the request.',
     docsUrl: `${DOCS_BASE_URL}#unauthorized`,
   },
+  [ErrorCode.FORBIDDEN]: {
+    suggestion:
+      'Your credentials do not grant the permission required for this operation. Request the appropriate permission scope (read_only, submit_results, or admin) from the API administrator, or use credentials that have it, then retry.',
+    docsUrl: `${DOCS_BASE_URL}#forbidden`,
+  },
   [ErrorCode.NOT_FOUND]: {
     suggestion:
       'Verify the resource identifier in the request URL is correct and that the resource exists, then retry.',

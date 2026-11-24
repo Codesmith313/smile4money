@@ -11,14 +11,183 @@
 import { GameNotFoundError } from '../fetchers/lichess.js';
 import { getCachedProviderGameResult } from './game-validation-cache.js';
 import type { MatchRecord } from '../store/match-store.js';
-import type { MatchStorePort } from '../store/match-store.js';
-import { errorToHttpStatus, ValidationError, ConflictError, NotFoundError } from '../errors/errorToHttpStatus.js';
-import { logEvent } from './log-events.js';
+import type { MatchStorePort, MatchStatistics } from '../store/match-store.js';
+import { errorToHttpStatus, ValidationError, ConflictError } from '../errors/errorToHttpStatus.js';
+import { isMatchState } from '../types/match-state.js';
 
 // Mirrors contracts/escrow/src/constants.rs and contracts/smile4money-common.
 export const MIN_STAKE = 1;
 export const MAX_STAKE = 10_000_000_000_000;
 export const MAX_GAME_ID_LEN = 64;
+
+// Pagination defaults and bounds for match history queries.
+export const DEFAULT_MATCH_PAGE_SIZE = 20;
+export const MAX_MATCH_PAGE_SIZE = 100;
+
+export type { MatchStatistics };
+
+/**
+ * Normalized, validated options for querying match history.
+ */
+export interface MatchQueryOptions {
+  player?: string;
+  status?: string;
+  fromDate?: string;
+  toDate?: string;
+  minStake?: number;
+  maxStake?: number;
+  limit: number;
+  cursor?: string;
+}
+
+export type ParseMatchQuerySuccess = { ok: true; options: MatchQueryOptions };
+export type ParseMatchQueryFailure = { ok: false; status: number; error: string };
+export type ParseMatchQueryResult = ParseMatchQuerySuccess | ParseMatchQueryFailure;
+
+/**
+ * Decode an opaque pagination cursor (base64-encoded JSON of `{ matchId }`).
+ *
+ * Returns the matchId on success or null if the cursor is malformed.
+ */
+export function decodeMatchCursor(cursor: string): string | null {
+  try {
+    const decoded = Buffer.from(cursor, 'base64').toString('utf8');
+    const parsed = JSON.parse(decoded) as unknown;
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof (parsed as { matchId?: unknown }).matchId === 'string' &&
+      (parsed as { matchId: string }).matchId.length > 0
+    ) {
+      return (parsed as { matchId: string }).matchId;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Encode a pagination cursor from a matchId.
+ */
+export function encodeMatchCursor(matchId: string): string {
+  return Buffer.from(JSON.stringify({ matchId }), 'utf8').toString('base64');
+}
+
+function parseOptionalInteger(value: unknown): number | null | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value === 'number') {
+    return Number.isInteger(value) ? value : null;
+  }
+  if (typeof value === 'string') {
+    if (!/^-?\d+$/.test(value.trim())) return null;
+    const parsed = Number(value.trim());
+    return Number.isSafeInteger(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function parseOptionalDate(value: unknown): string | null | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value !== 'string') return null;
+  const time = Date.parse(value);
+  if (Number.isNaN(time)) return null;
+  return new Date(time).toISOString();
+}
+
+/**
+ * Validate and normalize match search/filter and pagination query params.
+ *
+ * Returns a typed `MatchQueryOptions` on success, or a validation failure
+ * carrying the HTTP status and error message.
+ */
+export function parseMatchQuery(query: Record<string, unknown>): ParseMatchQueryResult {
+  const fail = (error: string): ParseMatchQueryFailure => ({
+    ok: false,
+    status: errorToHttpStatus(new ValidationError(error)),
+    error,
+  });
+
+  const { player, status, fromDate, toDate, minStake, maxStake, limit, cursor } = query;
+
+  let normalizedPlayer: string | undefined;
+  if (player !== undefined && player !== null && player !== '') {
+    if (typeof player !== 'string') return fail('player must be a string address');
+    normalizedPlayer = player.trim();
+    if (normalizedPlayer.length === 0) return fail('player must be a non-empty address');
+  }
+
+  let normalizedStatus: string | undefined;
+  if (status !== undefined && status !== null && status !== '') {
+    if (typeof status !== 'string' || !isMatchState(status)) {
+      return fail('status must be a valid match state');
+    }
+    normalizedStatus = status;
+  }
+
+  const parsedFromDate = parseOptionalDate(fromDate);
+  if (parsedFromDate === null) return fail('fromDate must be a valid ISO date');
+  const parsedToDate = parseOptionalDate(toDate);
+  if (parsedToDate === null) return fail('toDate must be a valid ISO date');
+  if (parsedFromDate && parsedToDate && Date.parse(parsedFromDate) > Date.parse(parsedToDate)) {
+    return fail('fromDate must be before or equal to toDate');
+  }
+
+  const parsedMinStake = parseOptionalInteger(minStake);
+  if (parsedMinStake === null) return fail('minStake must be an integer');
+  const parsedMaxStake = parseOptionalInteger(maxStake);
+  if (parsedMaxStake === null) return fail('maxStake must be an integer');
+  if (parsedMinStake !== undefined && parsedMinStake < 0) {
+    return fail('minStake must be non-negative');
+  }
+  if (parsedMaxStake !== undefined && parsedMaxStake < 0) {
+    return fail('maxStake must be non-negative');
+  }
+  if (
+    parsedMinStake !== undefined &&
+    parsedMaxStake !== undefined &&
+    parsedMinStake > parsedMaxStake
+  ) {
+    return fail('minStake must be less than or equal to maxStake');
+  }
+
+  let pageSize = DEFAULT_MATCH_PAGE_SIZE;
+  if (limit !== undefined && limit !== null && limit !== '') {
+    const parsedLimit = parseOptionalInteger(limit);
+    if (parsedLimit === null || parsedLimit === undefined) return fail('limit must be an integer');
+    if (parsedLimit < 1) return fail('limit must be at least 1');
+    pageSize = Math.min(parsedLimit, MAX_MATCH_PAGE_SIZE);
+  }
+
+  let decodedCursor: string | undefined;
+  if (cursor !== undefined && cursor !== null && cursor !== '') {
+    if (typeof cursor !== 'string') return fail('cursor must be a string');
+    const matchId = decodeMatchCursor(cursor);
+    if (!matchId) return fail('cursor is invalid');
+    decodedCursor = matchId;
+  }
+
+  return {
+    ok: true,
+    options: {
+      player: normalizedPlayer,
+      status: normalizedStatus,
+      fromDate: parsedFromDate,
+      toDate: parsedToDate,
+      minStake: parsedMinStake,
+      maxStake: parsedMaxStake,
+      limit: pageSize,
+      cursor: decodedCursor,
+    },
+  };
+}
+
+/**
+ * Retrieve aggregated match statistics from the store.
+ */
+export async function getMatchStatistics(store: MatchStorePort): Promise<MatchStatistics> {
+  return store.getMatchStatistics();
+}
 
 export interface GameValidationResult {
   valid: boolean;

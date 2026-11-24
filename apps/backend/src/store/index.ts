@@ -1,19 +1,13 @@
 import { fileURLToPath } from 'node:url';
 import { SqliteEvidenceStore } from './evidence-store.js';
 import { SqliteMatchStore } from './sqlite-match-store.js';
-import { applySqliteMigrations, type SqliteMigration } from './migrations.js';
+import { SqliteSessionStore } from './session-store.js';
 
 export const matchStore = new SqliteMatchStore();
 
 export const evidenceStore = new SqliteEvidenceStore(process.env.ORACLE_EVIDENCE_DB ?? fileURLToPath(new URL('../../data/oracle-evidence.db', import.meta.url)));
 
-/**
- * Registered, versioned schema migrations for the match store database.
- * Each migration must have a unique, monotonically increasing version.
- */
-export const matchStoreMigrations: SqliteMigration[] = [
-  // Add versioned migrations here as the schema evolves.
-];
+export const sessionStore = new SqliteSessionStore(process.env.ORACLE_SESSION_DB ?? fileURLToPath(new URL('../../data/oracle-sessions.db', import.meta.url)));
 
 /** Initialize the match store's SQLite database. Call once at startup. */
 export async function initializeMatchStore(): Promise<void> {
@@ -33,8 +27,10 @@ export async function initializeMatchStore(): Promise<void> {
   }
 
   await evidenceStore.initialize();
+  await sessionStore.initialize();
 }
 
 export async function closeMatchStore(): Promise<void> {
   await matchStore.close();
+  await sessionStore.close();
 }

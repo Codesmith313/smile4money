@@ -5,6 +5,8 @@ export const LOG_EVENTS = new Set([
   "archival_completed",
   "archival_failed",
   "archival_started",
+  "auth_failure",
+  "auth_success",
   "backup_completed",
   "backup_failed",
   "backup_started",
