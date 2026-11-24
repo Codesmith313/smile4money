@@ -37,6 +37,83 @@ export interface OracleSubmission {
   gameId: string;
   /** Game outcome. */
   result: 'Player1Wins' | 'Player2Wins' | 'Draw';
+  /** Unique nonce for replay protection; each nonce may be used at most once. */
+  nonce: string;
+  /** Result timestamp (ms since epoch); must be after match creation and not in the future. */
+  timestamp: number;
+}
+
+/** Error raised when a submission fails pre-acceptance validation. */
+export class OracleSubmissionError extends Error {
+  constructor(
+    message: string,
+    readonly code:
+      | 'REPLAY_DETECTED'
+      | 'INVALID_TIMESTAMP'
+      | 'UNAUTHORIZED'
+      | 'MATCH_COMPLETED',
+  ) {
+    super(message);
+    this.name = 'OracleSubmissionError';
+  }
+}
+
+/** Context used to validate a submission before it is accepted. */
+export interface SubmissionValidationContext {
+  /** Match creation time (ms since epoch). */
+  matchCreatedAt: number;
+  /** Whether the match has already completed (results are immutable). */
+  matchCompleted?: boolean;
+  /** Current time provider; defaults to Date.now. */
+  now?: () => number;
+}
+
+/** In-memory set of nonces already accepted by this process. */
+const usedNonces = new Set<string>();
+
+/** Mark a nonce as used; exported for tests and cross-process seeding. */
+export function markNonceUsed(nonce: string): void {
+  usedNonces.add(nonce);
+}
+
+/** Clear the used-nonce set; exported for tests. */
+export function resetUsedNonces(): void {
+  usedNonces.clear();
+}
+
+/**
+ * Validate a submission before acceptance.
+ *
+ * Rejects completed matches (finality), replayed nonces (replay protection),
+ * and timestamps that are in the future or before match creation.
+ */
+export function validateSubmission(
+  submission: OracleSubmission,
+  context: SubmissionValidationContext,
+): void {
+  if (context.matchCompleted) {
+    throw new OracleSubmissionError(
+      'Match already completed; result is immutable and cannot be overridden',
+      'MATCH_COMPLETED',
+    );
+  }
+  if (!submission.nonce || usedNonces.has(submission.nonce)) {
+    throw new OracleSubmissionError(
+      `Replay detected: nonce ${submission.nonce ?? '<missing>'} has already been used`,
+      'REPLAY_DETECTED',
+    );
+  }
+  const now = (context.now ?? Date.now)();
+  if (
+    !Number.isFinite(submission.timestamp) ||
+    submission.timestamp <= context.matchCreatedAt ||
+    submission.timestamp > now
+  ) {
+    throw new OracleSubmissionError(
+      `Invalid timestamp: ${submission.timestamp} must be after match creation (${context.matchCreatedAt}) and not in the future (${now})`,
+      'INVALID_TIMESTAMP',
+    );
+  }
 }
 
 /** Handler to check if a result already exists on-chain. */
@@ -97,13 +174,20 @@ export function calculateBackoffDelay(
 export async function submitWithRetry(
   submission: OracleSubmission,
   handler: (sub: OracleSubmission) => Promise<void>,
-  config: RetryConfig
+  config: RetryConfig,
+  validation?: SubmissionValidationContext
 ): Promise<DlqEntry | undefined> {
   let lastError: Error | undefined;
+
+  if (validation) {
+    // Validation errors are terminal: never retried or written to the DLQ.
+    validateSubmission(submission, validation);
+  }
 
   for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
     try {
       await handler(submission);
+      markNonceUsed(submission.nonce);
       if (attempt > 0) {
         logger.info(
           { matchId: submission.matchId, attempt },
@@ -113,6 +197,13 @@ export async function submitWithRetry(
       return undefined;
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
+      if (err instanceof OracleSubmissionError) {
+        logger.error(
+          { matchId: submission.matchId, code: err.code, error: err.message },
+          'oracle_submit: submission rejected'
+        );
+        throw err;
+      }
       
       if (attempt < config.maxRetries) {
         const nextDelay = calculateBackoffDelay(attempt + 1, config);
@@ -199,8 +290,13 @@ export async function submitWithIdempotence(
   submission: OracleSubmission,
   handler: (sub: OracleSubmission) => Promise<void>,
   existenceChecker: ExistenceChecker,
-  config: RetryConfig
+  config: RetryConfig,
+  validation?: SubmissionValidationContext
 ): Promise<DlqEntry | undefined> {
+  if (validation) {
+    validateSubmission(submission, validation);
+  }
+
   try {
     const alreadyExists = await existenceChecker(submission.matchId);
     if (alreadyExists) {
@@ -221,7 +317,7 @@ export async function submitWithIdempotence(
     // Continue with submission attempt even if existence check fails
   }
 
-  return submitWithRetry(submission, handler, config);
+  return submitWithRetry(submission, handler, config, validation);
 }
 
 /** Sleep for a given number of milliseconds. */
@@ -343,6 +439,8 @@ export class SorobanSettlementClient implements SettlementClient {
           nativeToScVal(submission.gameId, { type: "string" }),
           xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(winner)]),
           new Address(this.signer.publicKey()).toScVal(),
+          nativeToScVal(submission.nonce, { type: "string" }),
+          nativeToScVal(BigInt(Math.floor(submission.timestamp)), { type: "u64" }),
         ),
       ),
     );

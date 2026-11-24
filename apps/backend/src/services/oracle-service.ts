@@ -144,7 +144,30 @@ async function verifyGameResultCore(
     };
   }
 
-  const priorHistory = evidenceStore ? await evidenceStore.history(gameId) : [];
+  // #2094 — finality guarantee: once a match has transitioned to Completed,
+  // its outcome is immutable. Reject any further result submission and log the
+  // override attempt so it can be audited.
+  if (match.status === 'Completed') {
+    logger.warn(
+      { game_id: gameId, match_id: match.matchId, status: match.status },
+      'oracle_result_override_rejected_match_completed',
+    );
+    await ledger?.append({
+      matchId: match.matchId,
+      gameId,
+      state: 'review_required',
+      reason: 'Result override attempt rejected: match already completed',
+      recordedAt: new Date().toISOString(),
+    });
+    return {
+      ok: false,
+      status: 409,
+      error: 'Match already completed',
+      details: `Match ${match.matchId} has already completed; its result is immutable and cannot be overridden.`,
+    };
+  }
+
+  const priorHistory = ledger ? await ledger.history(gameId) : [];
   const latestDecision = priorHistory[priorHistory.length - 1];
   if (
     latestDecision?.state === 'review_required' ||
@@ -320,6 +343,66 @@ async function verifyGameResultCore(
     };
   }
 
+  // #2093 — validate that the result timestamp falls within the valid window:
+  // after the match was created and before the current time. Future timestamps
+  // and timestamps predating match creation are rejected before reaching the
+  // chain.
+  const matchCreatedAt = match.createdAt ? Date.parse(match.createdAt) : NaN;
+  if (!Number.isFinite(matchCreatedAt)) {
+    const details = `Match ${match.matchId} does not have a valid creation timestamp.`;
+    await ledger?.append({
+      matchId: match.matchId,
+      gameId,
+      state: 'review_required',
+      reason: `Invalid result timestamp: ${details}`,
+      provider,
+      evidence: apiResult.evidence,
+      recordedAt: new Date(submissionTime).toISOString(),
+    });
+    return {
+      ok: false,
+      status: errorToHttpStatus(new ValidationError('Invalid result timestamp')),
+      error: 'Invalid result timestamp',
+      details,
+    };
+  }
+  if (gameEndTime <= matchCreatedAt) {
+    const details = `Result timestamp ${new Date(gameEndTime).toISOString()} precedes match creation time ${new Date(matchCreatedAt).toISOString()}.`;
+    await ledger?.append({
+      matchId: match.matchId,
+      gameId,
+      state: 'review_required',
+      reason: `Invalid result timestamp: ${details}`,
+      provider,
+      evidence: apiResult.evidence,
+      recordedAt: new Date(submissionTime).toISOString(),
+    });
+    return {
+      ok: false,
+      status: errorToHttpStatus(new ValidationError('Invalid result timestamp')),
+      error: 'Invalid result timestamp',
+      details,
+    };
+  }
+  if (gameEndTime > submissionTime) {
+    const details = `Result timestamp ${new Date(gameEndTime).toISOString()} is in the future (current time ${new Date(submissionTime).toISOString()}).`;
+    await ledger?.append({
+      matchId: match.matchId,
+      gameId,
+      state: 'review_required',
+      reason: `Invalid result timestamp: ${details}`,
+      provider,
+      evidence: apiResult.evidence,
+      recordedAt: new Date(submissionTime).toISOString(),
+    });
+    return {
+      ok: false,
+      status: errorToHttpStatus(new ValidationError('Invalid result timestamp')),
+      error: 'Invalid result timestamp',
+      details,
+    };
+  }
+
   // Build the identity map from the match record
   const identityMap: PlayerIdentityMap = {
     player1Address: match.player1,
@@ -448,27 +531,18 @@ async function verifyGameResultCore(
     }
     await store.saveSettlementEvidence({ ...evidence, decision: 'verified' });
   }
-  const decisionId = await ledger?.append({
-    matchId: match.matchId,
-    gameId,
-    state: apiResult.result === null ? 'in_progress' : 'verified',
-    reason: apiResult.result === null ? 'Game is still in progress' : 'Result verified',
-    provider,
-    evidence: apiResult.evidence,
-    recordedAt: evidence.evaluatedAt,
-  });
-
-  const decisionId = evidenceStore
-    ? await evidenceStore.append({
+  const decisionId = ledger
+    ? await ledger.append({
         matchId: match.matchId,
         gameId,
         state: apiResult.result === null ? 'in_progress' : 'verified',
         reason:
           apiResult.result === null
             ? 'Game is still in progress'
-            : 'Game result verified',
+            : 'Result verified',
+        provider,
         evidence: apiResult.evidence,
-        recordedAt: new Date().toISOString(),
+        recordedAt: evidence.evaluatedAt,
       })
     : undefined;
 
@@ -480,7 +554,6 @@ async function verifyGameResultCore(
     gameId: apiResult.gameId,
     result: apiResult.result,
     provider,
-    decisionId,
     whitePlayer: apiResult.whitePlayer,
     blackPlayer: apiResult.blackPlayer,
     status: apiResult.status,

@@ -26,6 +26,9 @@ pub use smile4money_common::SharedError;
 /// | 15   | TransferFailed     | ✓       | Token transfer in withdraw failed                        |
 /// | 23   | InvalidAdmin       | ✓       | new_admin is the zero/burn address                       |
 /// | 24   | NoPendingAdmin     |         | accept_admin/cancel called with no pending proposal      |
+/// | 25   | ReplayDetected     |         | Result nonce has already been used (replay attack)       |
+/// | 26   | InvalidTimestamp   |         | Result timestamp outside match-creation..ledger window   |
+/// | 27   | MatchAlreadyCompleted |      | Match is Completed; result is final and cannot change    |
 ///
 /// > **Note**: Error codes for shared variants were unified with the escrow contract.
 /// > Previously `Unauthorized` was 1, `AlreadyInitialized` was 4, `InvalidGameId` was 5,
@@ -69,6 +72,19 @@ pub enum Error {
     /// [E024] `accept_admin` or `cancel_admin_transfer` was called but there is no
     /// pending admin proposal outstanding.
     NoPendingAdmin = 24,
+
+    /// [E025] The supplied result nonce has already been consumed for this match.
+    /// Re-submitting an identical result (replay attack) is rejected.
+    ReplayDetected = 25,
+
+    /// [E026] The result timestamp is outside the valid window: it must be strictly
+    /// after the match creation time and not in the future (before the current
+    /// ledger time).
+    InvalidTimestamp = 26,
+
+    /// [E027] The match has already transitioned to `Completed`. Its result is final
+    /// and cannot be overwritten by a new submission.
+    MatchAlreadyCompleted = 27,
 }
 
 /// Convert a [`SharedError`] into an oracle [`Error`].

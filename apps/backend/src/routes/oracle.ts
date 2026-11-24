@@ -57,6 +57,9 @@ router.post('/submit-result', async (req, res, next) => {
       gameId: payload.gameId,
       platform: payload.platform,
       username: typeof payload.username === 'string' ? payload.username : undefined,
+      nonce: typeof payload.nonce === 'string' ? payload.nonce : undefined,
+      timestamp: typeof payload.timestamp === 'number' ? payload.timestamp : undefined,
+      oracleAddress: typeof payload.oracleAddress === 'string' ? payload.oracleAddress : undefined,
     }, evidenceStore);
 
     if (!result.ok) {

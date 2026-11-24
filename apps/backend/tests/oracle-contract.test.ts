@@ -39,10 +39,66 @@ it("prepares and signs submit_result with the supplied current signer and waits 
   expect(tx.source).toBe(signer.publicKey());
   const invoke = tx.operations[0].func.invokeContract();
   expect(invoke.functionName().toString()).toBe("submit_result");
-  expect(invoke.args().map(scValToNative)).toEqual([42n, "game_42", ["Draw"]]);
+  const args = invoke.args().map(scValToNative);
+  expect(args.slice(0, 3)).toEqual([42n, "game_42", ["Draw"]]);
+  expect(typeof args[3]).toBe("bigint");
+  expect(typeof args[4]).toBe("bigint");
   expect(signer.verify(tx.hash(), tx.signatures[0].signature())).toBe(true);
   expect(wait).toHaveBeenCalledOnce();
 });
+
+it("uses a fresh nonce for each submission", async () => {
+  const signer = Keypair.random();
+  const server = {
+    getAccount: vi.fn(async () => new Account(signer.publicKey(), "1")),
+    prepareTransaction: vi.fn(async (tx) => tx),
+    sendTransaction: vi.fn(async () => ({ status: "PENDING", hash: "hash" })),
+    getTransaction: vi.fn(async () => ({ status: "SUCCESS" })),
+  };
+  const transport = new OracleContractTransport(
+    server as any,
+    contractId,
+    Networks.TESTNET,
+    async () => {},
+  );
+  await transport.submit(submission, signer);
+  await transport.submit(submission, signer);
+  const nonces = server.prepareTransaction.mock.calls.map(([tx]) =>
+    scValToNative(tx.operations[0].func.invokeContract().args()[3]),
+  );
+  expect(nonces[0]).not.toBe(nonces[1]);
+});
+
+it.each([
+  ["Unauthorized", "unauthorized"],
+  ["ReplayDetected", "replay"],
+  ["InvalidTimestamp", "timestamp"],
+  ["MatchAlreadyCompleted", "already completed"],
+])(
+  "surfaces contract error %s as a distinct non-retryable error",
+  async (code, message) => {
+    const signer = Keypair.random();
+    const server = {
+      getAccount: vi.fn(async () => new Account(signer.publicKey(), "1")),
+      prepareTransaction: vi.fn(async (tx) => tx),
+      sendTransaction: vi.fn(async () => ({
+        status: "ERROR",
+        hash: "hash",
+        errorResult: { result: () => ({ switch: () => ({ name: code }) }) },
+      })),
+    };
+    const error = await new OracleContractTransport(
+      server as any,
+      contractId,
+      Networks.TESTNET,
+    )
+      .submit(submission, signer)
+      .catch((e: unknown) => e as Error & { retryable?: boolean });
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message.toLowerCase()).toContain(message);
+    expect(error.retryable).toBe(false);
+  },
+);
 
 it.each(["ERROR", "TRY_AGAIN_LATER"])(
   "rejects RPC %s without reporting the durable job complete",
