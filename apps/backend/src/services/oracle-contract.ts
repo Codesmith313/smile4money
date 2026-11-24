@@ -12,6 +12,14 @@ import {
 } from "@stellar/stellar-sdk";
 import type { OracleSubmission } from "./oracle-submit.js";
 
+/** Cryptographic proof accompanying a result submission. */
+export interface OracleResultProof {
+  /** Hex-encoded signature over the canonical result payload. */
+  signature: string;
+  /** Hex-encoded hash of the canonical result payload. */
+  hash: string;
+}
+
 /** A transport accepts the already authorized signer for this attempt only. */
 export class OracleContractTransport {
   constructor(
@@ -47,7 +55,11 @@ export class OracleContractTransport {
     return exists;
   }
 
-  async submit(submission: OracleSubmission, signer: Keypair): Promise<void> {
+  async submit(
+    submission: OracleSubmission,
+    signer: Keypair,
+    proof?: OracleResultProof,
+  ): Promise<void> {
     if (
       !Number.isSafeInteger(submission.matchId) ||
       submission.matchId <= 0 ||
@@ -56,18 +68,40 @@ export class OracleContractTransport {
     ) {
       throw new Error("Invalid oracle submission");
     }
+    if (proof) {
+      if (
+        !/^[0-9a-fA-F]+$/.test(proof.signature) ||
+        !/^[0-9a-fA-F]+$/.test(proof.hash)
+      ) {
+        throw new Error("Invalid oracle result proof");
+      }
+    }
     const source = await this.server.getAccount(signer.publicKey());
+    const args = [
+      nativeToScVal(BigInt(submission.matchId), { type: "u64" }),
+      nativeToScVal(submission.gameId, { type: "string" }),
+      xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(submission.result)]),
+    ];
+    if (proof) {
+      args.push(
+        xdr.ScVal.scvMap([
+          new xdr.ScMapEntry({
+            key: xdr.ScVal.scvSymbol("signature"),
+            val: nativeToScVal(proof.signature, { type: "string" }),
+          }),
+          new xdr.ScMapEntry({
+            key: xdr.ScVal.scvSymbol("hash"),
+            val: nativeToScVal(proof.hash, { type: "string" }),
+          }),
+        ]),
+      );
+    }
     const transaction = new TransactionBuilder(source, {
       fee: BASE_FEE,
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(
-        new Contract(this.contractId).call(
-          "submit_result",
-          nativeToScVal(BigInt(submission.matchId), { type: "u64" }),
-          nativeToScVal(submission.gameId, { type: "string" }),
-          xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(submission.result)]),
-        ),
+        new Contract(this.contractId).call("submit_result", ...args),
       )
       .setTimeout(60)
       .build();

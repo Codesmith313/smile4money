@@ -376,6 +376,82 @@ let globalCircuitBreaker: CircuitBreaker | null = null;
 let circuitBreakerStore: SqliteCircuitBreakerStore | null = null;
 
 /**
+ * Global circuit breaker instance for the Lichess API (#2107).
+ *
+ * Kept separate from the RPC breaker above: a degraded Stellar RPC endpoint
+ * must not stop Lichess syncs, and a Lichess outage must not stop RPC work.
+ * Lichess failures are typically rate limits (HTTP 429) and timeouts, so the
+ * defaults are tuned to open quickly and back off aggressively.
+ */
+let lichessCircuitBreaker: CircuitBreaker | null = null;
+
+const LICHESS_CIRCUIT_BREAKER_DEFAULTS: Partial<CircuitBreakerConfig> = {
+  failureThreshold: 3,
+  cooldownMs: 15_000, // 15 seconds initial cooldown
+  backoffMultiplier: 2,
+  maxCooldownMs: 300_000, // 5 minutes max cooldown
+  successThreshold: 2,
+};
+
+/**
+ * Get or create the global Lichess circuit breaker (#2107).
+ *
+ * Callers should check `allowRequest()` before hitting the Lichess API, then
+ * report the outcome via `recordSuccess()` / `recordFailure()` so the breaker
+ * can open on repeated rate limits, timeouts or schema errors.
+ */
+export function getLichessCircuitBreaker(
+  config?: Partial<CircuitBreakerConfig>,
+): CircuitBreaker {
+  if (!lichessCircuitBreaker) {
+    lichessCircuitBreaker = new CircuitBreaker({
+      ...LICHESS_CIRCUIT_BREAKER_DEFAULTS,
+      ...config,
+      onStateChange: (from, to) => {
+        logger.warn(
+          { provider: 'lichess', from, to },
+          'circuit_breaker: lichess state changed',
+        );
+        config?.onStateChange?.(from, to);
+      },
+    });
+  }
+  return lichessCircuitBreaker;
+}
+
+/**
+ * Whether the Lichess circuit currently permits a request (#2107).
+ */
+export function isLichessCircuitOpen(): boolean {
+  return !getLichessCircuitBreaker().allowRequest();
+}
+
+/**
+ * Record a successful Lichess API interaction (#2107).
+ */
+export function recordLichessSuccess(): void {
+  getLichessCircuitBreaker().recordSuccess();
+}
+
+/**
+ * Record a failed Lichess API interaction (#2107).
+ * @returns true if the failure caused the circuit to open
+ */
+export function recordLichessFailure(): boolean {
+  return getLichessCircuitBreaker().recordFailure();
+}
+
+/**
+ * Reset the global Lichess circuit breaker (mainly for testing).
+ */
+export function resetLichessCircuitBreaker(): void {
+  if (lichessCircuitBreaker) {
+    lichessCircuitBreaker.reset();
+  }
+  lichessCircuitBreaker = null;
+}
+
+/**
  * Get or create the global circuit breaker instance.
  *
  * If `initializeCircuitBreaker()` has not been called yet, this lazily

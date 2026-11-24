@@ -12,6 +12,11 @@
  * - ORACLE_MAX_RETRIES: Maximum number of retry attempts (default: 5)
  * - ORACLE_RETRY_BASE_MS: Base interval for exponential backoff in milliseconds (default: 1000)
  * - ORACLE_RETRY_MAX_MS: Maximum interval between retries in milliseconds (default: 60000)
+ * - ORACLE_PRIMARY_SECRET_KEY: Secret key of the primary oracle (falls back to ORACLE_SECRET_KEY)
+ * - ORACLE_FALLBACK_SECRET_KEYS: Comma-separated secret keys of authorized fallback oracles
+ * - ORACLE_PRIMARY_UNAVAILABLE_ERRORS: Comma-separated error substrings that indicate the
+ *   primary oracle is unavailable and the fallback should be used (default: "insufficient balance,
+ *   account not found,unauthorized,op_underfunded,op_no_source_account")
  */
 
 import logger from '../logger.js';
@@ -27,6 +32,9 @@ export interface RetryConfig {
   maxDelayMs: number;
 }
 
+/** Identifies which authorized oracle submitted (or is submitting) a result. */
+export type OracleRole = 'primary' | 'fallback';
+
 /** Submission details sent to the retry handler. */
 export interface OracleSubmission {
   /** Durable verification evidence reference, retained unchanged across retries/DLQ. */
@@ -37,6 +45,62 @@ export interface OracleSubmission {
   gameId: string;
   /** Game outcome. */
   result: 'Player1Wins' | 'Player2Wins' | 'Draw';
+  /** Which authorized oracle is submitting this result. */
+  oracleRole?: OracleRole;
+  /** Public key of the oracle that submitted (or is submitting) this result. */
+  oracleAddress?: string;
+}
+
+/** Configuration for the set of authorized oracles. */
+export interface OracleConfig {
+  /** Public key of the primary oracle. */
+  primaryAddress: string;
+  /** Public keys of authorized fallback oracles, in preference order. */
+  fallbackAddresses: string[];
+  /** Error substrings (lowercased) that indicate the primary oracle is unavailable. */
+  primaryUnavailableErrors: string[];
+}
+
+/** Load oracle configuration (primary + fallback addresses) from environment. */
+export function loadOracleConfig(): OracleConfig {
+  const primarySecret =
+    process.env.ORACLE_PRIMARY_SECRET_KEY ?? process.env.ORACLE_SECRET_KEY;
+  if (!primarySecret) {
+    throw new Error(
+      'ORACLE_PRIMARY_SECRET_KEY (or ORACLE_SECRET_KEY) is required for oracle settlement'
+    );
+  }
+  const fallbackAddresses = (process.env.ORACLE_FALLBACK_SECRET_KEYS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((secret) => Keypair.fromSecret(secret).publicKey());
+  const primaryUnavailableErrors = (
+    process.env.ORACLE_PRIMARY_UNAVAILABLE_ERRORS ??
+    'insufficient balance,account not found,unauthorized,op_underfunded,op_no_source_account'
+  )
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  return {
+    primaryAddress: Keypair.fromSecret(primarySecret).publicKey(),
+    fallbackAddresses,
+    primaryUnavailableErrors,
+  };
+}
+
+/**
+ * Determine whether an error indicates the primary oracle is unavailable and
+ * a fallback oracle should be used instead.
+ */
+export function isPrimaryUnavailable(
+  err: unknown,
+  config: OracleConfig
+): boolean {
+  const message = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return config.primaryUnavailableErrors.some((needle) =>
+    message.includes(needle)
+  );
 }
 
 /** Handler to check if a result already exists on-chain. */
@@ -97,29 +161,69 @@ export function calculateBackoffDelay(
 export async function submitWithRetry(
   submission: OracleSubmission,
   handler: (sub: OracleSubmission) => Promise<void>,
-  config: RetryConfig
+  config: RetryConfig,
+  oracleConfig?: OracleConfig
 ): Promise<DlqEntry | undefined> {
   let lastError: Error | undefined;
+  let current: OracleSubmission = {
+    ...submission,
+    oracleRole: submission.oracleRole ?? 'primary',
+    oracleAddress: submission.oracleAddress ?? oracleConfig?.primaryAddress,
+  };
+  let switchedToFallback = false;
 
   for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
     try {
-      await handler(submission);
-      if (attempt > 0) {
+      await handler(current);
+      if (attempt > 0 || switchedToFallback) {
         logger.info(
-          { matchId: submission.matchId, attempt },
+          {
+            matchId: current.matchId,
+            attempt,
+            oracleRole: current.oracleRole,
+            oracleAddress: current.oracleAddress,
+          },
           'oracle_submit: success after retries'
         );
       }
       return undefined;
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
-      
+
+      // If the primary oracle is unavailable and a fallback is authorized,
+      // switch to the fallback oracle and retry immediately.
+      if (
+        !switchedToFallback &&
+        current.oracleRole === 'primary' &&
+        oracleConfig &&
+        oracleConfig.fallbackAddresses.length > 0 &&
+        isPrimaryUnavailable(lastError, oracleConfig)
+      ) {
+        switchedToFallback = true;
+        current = {
+          ...current,
+          oracleRole: 'fallback',
+          oracleAddress: oracleConfig.fallbackAddresses[0],
+        };
+        logger.warn(
+          {
+            matchId: current.matchId,
+            attempt,
+            oracleAddress: current.oracleAddress,
+            error: lastError.message,
+          },
+          'oracle_submit: primary oracle unavailable, switching to fallback oracle'
+        );
+        continue;
+      }
+
       if (attempt < config.maxRetries) {
         const nextDelay = calculateBackoffDelay(attempt + 1, config);
         logger.warn(
           {
-            matchId: submission.matchId,
+            matchId: current.matchId,
             attempt,
+            oracleRole: current.oracleRole,
             nextRetryDelayMs: nextDelay,
             error: lastError.message,
           },
@@ -131,12 +235,14 @@ export async function submitWithRetry(
   }
 
   // All retries exhausted — write to DLQ
-  const dlqEntry = await writeToDlq(submission, lastError?.message ?? 'Unknown error');
+  const dlqEntry = await writeToDlq(current, lastError?.message ?? 'Unknown error');
   logger.error(
     {
-      matchId: submission.matchId,
+      matchId: current.matchId,
       dlqId: dlqEntry.id,
       attempts: config.maxRetries + 1,
+      oracleRole: current.oracleRole,
+      oracleAddress: current.oracleAddress,
       lastError: lastError?.message,
     },
     'oracle_submit: exhausted retries, written to DLQ'
@@ -199,7 +305,8 @@ export async function submitWithIdempotence(
   submission: OracleSubmission,
   handler: (sub: OracleSubmission) => Promise<void>,
   existenceChecker: ExistenceChecker,
-  config: RetryConfig
+  config: RetryConfig,
+  oracleConfig?: OracleConfig
 ): Promise<DlqEntry | undefined> {
   try {
     const alreadyExists = await existenceChecker(submission.matchId);
@@ -221,7 +328,7 @@ export async function submitWithIdempotence(
     // Continue with submission attempt even if existence check fails
   }
 
-  return submitWithRetry(submission, handler, config);
+  return submitWithRetry(submission, handler, config, oracleConfig);
 }
 
 /** Sleep for a given number of milliseconds. */
@@ -269,6 +376,7 @@ export interface SettlementClient {
 export class SorobanSettlementClient implements SettlementClient {
   readonly server: rpc.Server;
   readonly signer: Keypair;
+  readonly fallbackSigner?: Keypair;
   readonly contract: Contract;
   constructor(
     readonly config: {
@@ -276,9 +384,13 @@ export class SorobanSettlementClient implements SettlementClient {
       networkPassphrase: string;
       secretKey: string;
       escrowContract: string;
+      fallbackSecretKey?: string;
     },
   ) {
     this.signer = Keypair.fromSecret(config.secretKey);
+    this.fallbackSigner = config.fallbackSecretKey
+      ? Keypair.fromSecret(config.fallbackSecretKey)
+      : undefined;
     this.contract = new Contract(config.escrowContract);
     const url = new URL(config.rpcUrl);
     const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
@@ -299,8 +411,14 @@ export class SorobanSettlementClient implements SettlementClient {
     return new SorobanSettlementClient({
       rpcUrl: required("STELLAR_RPC_URL"),
       networkPassphrase: required("STELLAR_NETWORK_PASSPHRASE"),
-      secretKey: required("ORACLE_SECRET_KEY"),
+      secretKey:
+        process.env.ORACLE_PRIMARY_SECRET_KEY ??
+        required("ORACLE_SECRET_KEY"),
       escrowContract: required("CONTRACT_ESCROW"),
+      fallbackSecretKey: (process.env.ORACLE_FALLBACK_SECRET_KEYS ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)[0],
     });
   }
 
@@ -335,6 +453,11 @@ export class SorobanSettlementClient implements SettlementClient {
       Player2Wins: "Player2",
       Draw: "Draw",
     }[submission.result];
+    // Fallback oracle submissions are signed by the fallback signer when configured.
+    const signer =
+      submission.oracleRole === "fallback" && this.fallbackSigner
+        ? this.fallbackSigner
+        : this.signer;
     const tx = await this.server.prepareTransaction(
       await this.build(
         this.contract.call(
@@ -342,11 +465,11 @@ export class SorobanSettlementClient implements SettlementClient {
           nativeToScVal(BigInt(submission.matchId), { type: "u64" }),
           nativeToScVal(submission.gameId, { type: "string" }),
           xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(winner)]),
-          new Address(this.signer.publicKey()).toScVal(),
+          new Address(signer.publicKey()).toScVal(),
         ),
       ),
     );
-    tx.sign(this.signer);
+    tx.sign(signer);
     return {
       hash: tx.hash().toString("hex"),
       envelope: tx.toXDR(),

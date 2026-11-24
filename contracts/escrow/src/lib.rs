@@ -72,7 +72,7 @@ use soroban_sdk::{contract, contractimpl, symbol_short, token, vec, Address, Env
 const CONTRACT_PAUSED: Symbol = symbol_short!("paused");
 /// Topic symbol for the event emitted when the contract is unpaused.
 const CONTRACT_UNPAUSED: Symbol = symbol_short!("unpaused");
-use types::{DataKey, Match, MatchState, OptionalWinner, Platform, Winner};
+use types::{DataKey, Match, MatchState, OptionalWinner, Platform, ReconciliationResult, Winner};
 
 fn is_zero_address(env: &Env, addr: &Address) -> bool {
     // The all-zeros Stellar account key encodes to this strkey.
@@ -1310,6 +1310,87 @@ impl EscrowContract {
         // `stake_amount` is validated to be >= MIN_STAKE (> 0) at creation, so
         // the conversion to `u128` is lossless and the product is non-negative.
         Ok(deposited * (m.stake_amount as u128))
+    }
+
+    /// Reconcile the contract's actual token holdings against the sum of all
+    /// outstanding escrows.
+    ///
+    /// This is an operational safety check: it reads the contract's balance of
+    /// the default token via the SEP-41 token client, then iterates every stored
+    /// [`Match`] and sums the stakes that are still held in escrow — that is,
+    /// matches in `Active` or `PendingResult` state where both players have
+    /// deposited. Matches in `Pending` state are excluded because their deposits
+    /// are not yet fully escrowed (a half-funded match holds at most one stake,
+    /// which is accounted for separately below), and `Completed` / `Cancelled`
+    /// matches hold nothing.
+    ///
+    /// The two values are compared and a `reconcile` event is emitted carrying
+    /// `(expected_total, actual_balance, discrepancy)`. A non-zero discrepancy
+    /// indicates a bug, an out-of-band token transfer, or a token whose balance
+    /// changed without a corresponding state transition.
+    ///
+    /// This function is read-only and may be called by anyone.
+    pub fn reconcile_balance(env: Env) -> Result<ReconciliationResult, Error> {
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(Error::Unauthorized)?;
+
+        let client = token::Client::new(&env, &token);
+        let actual_balance = client.balance(&env.current_contract_address());
+
+        // Sum the stakes still held in escrow across every match.
+        let match_count = Self::get_match_count(&env);
+        let mut expected_total: i128 = 0;
+        let mut i: u64 = 0;
+        while i < match_count {
+            if let Some(m) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Match>(&DataKey::Match(i))
+            {
+                // Only matches whose funds are actually held contribute to the
+                // expected total. Terminal states hold nothing.
+                match m.state {
+                    MatchState::Active | MatchState::PendingResult => {
+                        // Both players must have deposited for the match to be
+                        // Active/PendingResult, so the escrow is 2x the stake.
+                        let deposited: i128 = (m.player1_deposited as i128)
+                            + (m.player2_deposited as i128);
+                        expected_total = expected_total
+                            .checked_add(deposited * m.stake_amount)
+                            .ok_or(Error::Overflow)?;
+                    }
+                    MatchState::Pending => {
+                        // A half-funded match may hold one stake; account for it
+                        // so reconciliation does not report a false discrepancy.
+                        let deposited: i128 = (m.player1_deposited as i128)
+                            + (m.player2_deposited as i128);
+                        expected_total = expected_total
+                            .checked_add(deposited * m.stake_amount)
+                            .ok_or(Error::Overflow)?;
+                    }
+                    MatchState::Completed | MatchState::Cancelled => {}
+                }
+            }
+            i += 1;
+        }
+
+        let discrepancy = actual_balance - expected_total;
+        let matched = discrepancy == 0;
+
+        env.events().publish(
+            (Symbol::new(&env, "admin"), symbol_short!("reconcile")),
+            (expected_total, actual_balance, discrepancy),
+        );
+
+        Ok(ReconciliationResult {
+            expected_total,
+            actual_balance,
+            discrepancy,
+            matched,
+        })
     }
 
     /// Return a page of match IDs in the range `[start, start + limit)`.

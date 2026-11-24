@@ -22,6 +22,159 @@ export interface SubmitResultInput {
   gameId: string;
   platform: string;
   username?: string;
+  /**
+   * #2106 — address of the oracle submitting this result. When omitted the
+   * primary oracle is assumed. Used to attribute authority per submission.
+   */
+  oracleAddress?: string;
+}
+
+/**
+ * #2106 — a single authorized oracle signer.
+ */
+export interface OracleKeypair {
+  /** Stellar public key (G...) identifying this oracle. */
+  address: string;
+  /** Secret key used to sign submissions. Never logged. */
+  secret: string;
+  /** Whether this oracle is the configured primary. Exactly one should be primary. */
+  primary?: boolean;
+}
+
+/**
+ * #2106 — configuration for the fallback oracle mechanism.
+ */
+export interface OracleConfig {
+  /** All authorized oracles (primary + fallbacks). */
+  oracles: OracleKeypair[];
+  /**
+   * Optional explicit primary address. When set it takes precedence over the
+   * `primary` flag on individual keypairs.
+   */
+  primaryAddress?: string;
+}
+
+/**
+ * #2106 — the resolved signer for a submission, including whether it is the
+ * primary oracle and why it was selected.
+ */
+export interface ResolvedOracle {
+  address: string;
+  secret: string;
+  isPrimary: boolean;
+  reason: 'primary' | 'fallback' | 'explicit';
+}
+
+/**
+ * #2106 — error raised when no authorized oracle can be selected.
+ */
+export class OracleUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'OracleUnavailableError';
+  }
+}
+
+/**
+ * #2106 — resolve which oracle should sign a submission.
+ *
+ * Selection rules:
+ *   1. If `requestedAddress` is provided it must be an authorized oracle;
+ *      otherwise the request is rejected (no silent fallback to another key).
+ *   2. Otherwise the configured primary oracle is used when available.
+ *   3. If the primary is unavailable (not configured, or reported down via
+ *      `isAvailable`), the first available fallback oracle is used.
+ *
+ * @param config     Oracle configuration (multiple keypairs + primary indicator).
+ * @param requestedAddress Optional address the caller explicitly wants to use.
+ * @param isAvailable Optional predicate to probe liveness of an oracle.
+ */
+export function resolveOracle(
+  config: OracleConfig,
+  requestedAddress?: string,
+  isAvailable?: (address: string) => boolean,
+): ResolvedOracle {
+  const { oracles, primaryAddress } = config;
+  if (!oracles || oracles.length === 0) {
+    throw new OracleUnavailableError('No oracle keypairs configured');
+  }
+
+  const available = (address: string): boolean =>
+    isAvailable ? isAvailable(address) : true;
+
+  const primary =
+    (primaryAddress
+      ? oracles.find((o) => o.address === primaryAddress)
+      : oracles.find((o) => o.primary)) ?? oracles.find((o) => o.primary);
+
+  if (requestedAddress) {
+    const requested = oracles.find((o) => o.address === requestedAddress);
+    if (!requested) {
+      throw new OracleUnavailableError(
+        `Requested oracle ${requestedAddress} is not authorized`,
+      );
+    }
+    if (!available(requested.address)) {
+      throw new OracleUnavailableError(
+        `Requested oracle ${requestedAddress} is unavailable`,
+      );
+    }
+    return {
+      address: requested.address,
+      secret: requested.secret,
+      isPrimary: primary?.address === requested.address,
+      reason: 'explicit',
+    };
+  }
+
+  if (primary && available(primary.address)) {
+    return {
+      address: primary.address,
+      secret: primary.secret,
+      isPrimary: true,
+      reason: 'primary',
+    };
+  }
+
+  const fallback = oracles.find(
+    (o) => o.address !== primary?.address && available(o.address),
+  );
+  if (fallback) {
+    return {
+      address: fallback.address,
+      secret: fallback.secret,
+      isPrimary: false,
+      reason: 'fallback',
+    };
+  }
+
+  throw new OracleUnavailableError(
+    'No available oracle: primary is down and no fallback oracle is available',
+  );
+}
+
+/**
+ * #2106 — build the on-chain submission payload, attributing the submitting
+ * oracle's authority to the result.
+ */
+export function buildOracleSubmissionPayload(
+  resolved: ResolvedOracle,
+  input: SubmitResultInput,
+  result: string | null,
+): {
+  matchId: number;
+  gameId: string;
+  result: string | null;
+  oracleAddress: string;
+  isPrimaryOracle: boolean;
+} {
+  return {
+    matchId: input.matchId,
+    gameId: input.gameId,
+    result,
+    oracleAddress: resolved.address,
+    isPrimaryOracle: resolved.isPrimary,
+  };
 }
 
 export interface SubmitResultSuccess {
@@ -32,11 +185,14 @@ export interface SubmitResultSuccess {
   gameId: string;
   result: string | null;
   provider: 'lichess' | 'chessdotcom';
-  decisionId?: number;
   whitePlayer: string;
   blackPlayer: string;
   status: string;
   message: string;
+  /** #2106 — address of the oracle that authorized this submission. */
+  oracleAddress?: string;
+  /** #2106 — whether the submitting oracle was the primary. */
+  isPrimaryOracle?: boolean;
 }
 
 export interface SubmitResultFailure {
@@ -91,8 +247,28 @@ export function verifyGameResult(
   store: MatchStorePort,
   input: SubmitResultInput,
   ledger?: EvidenceStore,
+  oracleConfig?: OracleConfig,
 ): Promise<SubmitResultOutcome> {
-  const verify = () => verifyGameResultCore(store, input, ledger);
+  // #2106 — resolve the signing oracle up front so an unauthorized or
+  // unavailable oracle is rejected before any verification work happens.
+  let resolvedOracle: ResolvedOracle | undefined;
+  if (oracleConfig) {
+    try {
+      resolvedOracle = resolveOracle(oracleConfig, input.oracleAddress);
+    } catch (error) {
+      if (error instanceof OracleUnavailableError) {
+        return Promise.resolve({
+          ok: false,
+          status: 403,
+          error: 'Oracle unavailable',
+          details: error.message,
+        });
+      }
+      throw error;
+    }
+  }
+
+  const verify = () => verifyGameResultCore(store, input, ledger, resolvedOracle);
   return ledger ? withGameLock(input.gameId, verify) : verify();
 }
 
@@ -100,6 +276,7 @@ async function verifyGameResultCore(
   store: MatchStorePort,
   input: SubmitResultInput,
   ledger?: EvidenceStore,
+  resolvedOracle?: ResolvedOracle,
 ): Promise<SubmitResultOutcome> {
   const { matchId, gameId, platform, username } = input;
   const history = ledger ? await ledger.history(gameId) : [];
@@ -144,11 +321,11 @@ async function verifyGameResultCore(
     };
   }
 
-  const priorHistory = evidenceStore ? await evidenceStore.history(gameId) : [];
-  const latestDecision = priorHistory[priorHistory.length - 1];
+  const priorHistory = ledger ? await ledger.history(gameId) : [];
+  const latestPriorDecision = priorHistory[priorHistory.length - 1];
   if (
-    latestDecision?.state === 'review_required' ||
-    latestDecision?.state === 'operator_decided'
+    latestPriorDecision?.state === 'review_required' ||
+    latestPriorDecision?.state === 'operator_decided'
   ) {
     return {
       ok: false,
@@ -204,16 +381,15 @@ async function verifyGameResultCore(
     }
   } catch (error) {
     if (error instanceof AmbiguousEvidenceError) {
-      if (evidenceStore) {
-        await evidenceStore.append({
-          matchId: match.matchId,
-          gameId,
-          state: 'review_required',
-          reason: error.message,
-          evidence: error.evidence,
-          recordedAt: new Date().toISOString(),
-        });
-      }
+      await ledger?.append({
+        matchId,
+        gameId,
+        state: 'review_required',
+        reason: error.message,
+        provider: error.evidence.provider,
+        evidence: error.evidence,
+        recordedAt: new Date().toISOString(),
+      });
       logger.warn(
         { game_id: gameId, match_id: match.matchId, reason: error.message },
         'oracle_ambiguous_result_requires_review',
@@ -230,23 +406,6 @@ async function verifyGameResultCore(
         ok: false,
         status: errorToHttpStatus(error),
         error: 'Game not found on platform',
-        details: error.message,
-      };
-    }
-    if (error instanceof AmbiguousEvidenceError) {
-      await ledger?.append({
-        matchId,
-        gameId,
-        state: 'review_required',
-        reason: error.message,
-        provider: error.evidence.provider,
-        evidence: error.evidence,
-        recordedAt: new Date().toISOString(),
-      });
-      return {
-        ok: false,
-        status: 409,
-        error: 'Evidence requires operator review',
         details: error.message,
       };
     }
@@ -448,6 +607,23 @@ async function verifyGameResultCore(
     }
     await store.saveSettlementEvidence({ ...evidence, decision: 'verified' });
   }
+
+  // #2106 — attribute the submitting oracle's authority to this decision.
+  const oracleAddress = resolvedOracle?.address;
+  const isPrimaryOracle = resolvedOracle?.isPrimary;
+  if (resolvedOracle) {
+    logger.info(
+      {
+        game_id: gameId,
+        match_id: match.matchId,
+        oracle_address: resolvedOracle.address,
+        is_primary_oracle: resolvedOracle.isPrimary,
+        selection_reason: resolvedOracle.reason,
+      },
+      'oracle_submission_authority',
+    );
+  }
+
   const decisionId = await ledger?.append({
     matchId: match.matchId,
     gameId,
@@ -456,21 +632,9 @@ async function verifyGameResultCore(
     provider,
     evidence: apiResult.evidence,
     recordedAt: evidence.evaluatedAt,
+    oracleAddress,
+    isPrimaryOracle,
   });
-
-  const decisionId = evidenceStore
-    ? await evidenceStore.append({
-        matchId: match.matchId,
-        gameId,
-        state: apiResult.result === null ? 'in_progress' : 'verified',
-        reason:
-          apiResult.result === null
-            ? 'Game is still in progress'
-            : 'Game result verified',
-        evidence: apiResult.evidence,
-        recordedAt: new Date().toISOString(),
-      })
-    : undefined;
 
   return {
     ok: true,
@@ -480,10 +644,11 @@ async function verifyGameResultCore(
     gameId: apiResult.gameId,
     result: apiResult.result,
     provider,
-    decisionId,
     whitePlayer: apiResult.whitePlayer,
     blackPlayer: apiResult.blackPlayer,
     status: apiResult.status,
     message: 'Game result verified. Players match registered identities.',
+    oracleAddress,
+    isPrimaryOracle,
   };
 }

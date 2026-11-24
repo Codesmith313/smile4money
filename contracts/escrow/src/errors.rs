@@ -45,6 +45,7 @@ pub use smile4money_common::SharedError;
 /// | 26   | InsufficientReserve   |         | contract balance too low to cover payout + Stellar minimum reserve |
 /// | 27   | InvalidAddress        |         | a player address is invalid (zero address / burn address) |
 /// | 28   | DisputeWindowExpired  |         | override_result called after the dispute window expired |
+/// | 35   | BalanceDiscrepancy    |         | reconcile_balance found contract balance != sum of escrows |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -180,6 +181,16 @@ pub enum Error {
 
     /// [E034] `override_result` was called after the dispute window expired.
     DisputeWindowExpired = 34,
+
+    /// [E035] `reconcile_balance` detected that the contract's token balance
+    /// does not equal the sum of all recorded match escrows.
+    ///
+    /// Returned by `reconcile_balance` when the total holdings of the contract
+    /// diverge from the sum of the stakes recorded across all matches. A
+    /// discrepancy indicates funds were added or removed outside the normal
+    /// escrow flow (e.g. a direct transfer, a failed payout, or a bug) and
+    /// should be investigated before further operations.
+    BalanceDiscrepancy = 35,
 }
 
 /// Convert a [`SharedError`] into an escrow [`Error`].

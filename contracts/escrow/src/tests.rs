@@ -4910,3 +4910,114 @@ fn result_correction_keeps_original_submission_in_audit_events() {
         Err(Ok(Error::InvalidState))
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #2098 — balance reconciliation
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_reconcile_balance_matched() {
+    let (env, contract_id, _oracle, player1, player2, token, _admin, _safe_address) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let token_client = TokenClient::new(&env, &token);
+
+    // Two funded matches: escrow total = 200 + 200 = 400.
+    let id1 = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &Some(token.clone()),
+        &String::from_str(&env, "reconcile_ok_1"),
+        &Platform::Lichess,
+    );
+    client.deposit(&id1, &player1);
+    client.deposit(&id1, &player2);
+
+    let id2 = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &Some(token.clone()),
+        &String::from_str(&env, "reconcile_ok_2"),
+        &Platform::Lichess,
+    );
+    client.deposit(&id2, &player1);
+    client.deposit(&id2, &player2);
+
+    // The reserve buffer minted in setup() is not part of any escrow, so the
+    // contract balance is expected to exceed the escrow sum by exactly that.
+    let contract_balance = token_client.balance(&contract_id);
+    assert_eq!(contract_balance, crate::ESCROW_RESERVE_BUFFER_STROOPS + 400);
+
+    let (matched, total_balance, total_escrows, discrepancy) = client.reconcile_balance();
+    assert!(matched, "balance should reconcile when no discrepancy exists");
+    assert_eq!(total_balance, contract_balance);
+    assert_eq!(total_escrows, 400);
+    assert_eq!(discrepancy, 0);
+
+    // The reconciliation event must be emitted.
+    let events = env.events().all();
+    let reconcile_topics = vec![
+        &env,
+        Symbol::new(&env, "admin").into_val(&env),
+        symbol_short!("reconcil").into_val(&env),
+    ];
+    let event = events
+        .iter()
+        .find(|(_, topics, _)| *topics == reconcile_topics)
+        .expect("reconciliation event emitted");
+    let (ev_matched, ev_balance, ev_escrows, ev_discrepancy): (bool, i128, i128, i128) =
+        TryFromVal::try_from_val(&env, &event.2).unwrap();
+    assert!(ev_matched);
+    assert_eq!(ev_balance, contract_balance);
+    assert_eq!(ev_escrows, 400);
+    assert_eq!(ev_discrepancy, 0);
+}
+
+#[test]
+fn test_reconcile_balance_detects_discrepancy() {
+    let (env, contract_id, _oracle, player1, player2, token, _admin, _safe_address) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let token_client = TokenClient::new(&env, &token);
+
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &Some(token.clone()),
+        &String::from_str(&env, "reconcile_bad"),
+        &Platform::Lichess,
+    );
+    client.deposit(&id, &player1);
+    client.deposit(&id, &player2);
+
+    let expected_balance = token_client.balance(&contract_id);
+
+    // Artificially inflate the contract balance by minting directly to it.
+    let asset_client = StellarAssetClient::new(&env, &token);
+    asset_client.mint(&contract_id, &500);
+
+    let (matched, total_balance, total_escrows, discrepancy) = client.reconcile_balance();
+    assert!(!matched, "balance should not reconcile after an artificial mint");
+    assert_eq!(total_balance, expected_balance + 500);
+    assert_eq!(total_escrows, 200);
+    assert_eq!(discrepancy, 500);
+
+    // The discrepancy must be reported in the emitted event.
+    let events = env.events().all();
+    let reconcile_topics = vec![
+        &env,
+        Symbol::new(&env, "admin").into_val(&env),
+        symbol_short!("reconcil").into_val(&env),
+    ];
+    let event = events
+        .iter()
+        .find(|(_, topics, _)| *topics == reconcile_topics)
+        .expect("reconciliation event emitted");
+    let (ev_matched, ev_balance, ev_escrows, ev_discrepancy): (bool, i128, i128, i128) =
+        TryFromVal::try_from_val(&env, &event.2).unwrap();
+    assert!(!ev_matched);
+    assert_eq!(ev_balance, expected_balance + 500);
+    assert_eq!(ev_escrows, 200);
+    assert_eq!(ev_discrepancy, 500);
+}

@@ -292,6 +292,55 @@ pub struct Match {
     pub completed_ledger: Option<u32>,
 }
 
+/// The outcome of a balance reconciliation check.
+///
+/// Produced by the contract's reconciliation function, which compares the
+/// contract's actual token holdings against the sum of all outstanding match
+/// escrows. A non-zero [`discrepancy`](ReconciliationResult::discrepancy)
+/// indicates that the contract holds more or less than it should, which may
+/// point to a bug, an unexpected transfer, or a token with non-standard
+/// behaviour (e.g. rebasing or fee-on-transfer).
+///
+/// # Fields
+///
+/// | Field             | Meaning                                                        |
+/// |-------------------|----------------------------------------------------------------|
+/// | `expected_total`  | Sum of all escrowed stakes across every non-terminal match     |
+/// | `actual_balance`  | The contract's real token balance as reported by the token     |
+/// | `discrepancy`     | `actual_balance - expected_total` (positive = surplus)         |
+/// | `matched`         | `true` iff `discrepancy == 0`                                  |
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconciliationResult {
+    /// The total amount of tokens the contract *should* be holding, computed
+    /// as the sum of every outstanding escrow.
+    ///
+    /// Only matches that currently hold funds are counted — i.e. matches in
+    /// [`MatchState::Active`] and [`MatchState::PendingResult`], plus
+    /// [`MatchState::Pending`] matches where at least one player has already
+    /// deposited. Terminal states ([`MatchState::Completed`] and
+    /// [`MatchState::Cancelled`]) hold no funds and are excluded.
+    pub expected_total: i128,
+
+    /// The contract's actual token balance, as reported by the token contract
+    /// at reconciliation time.
+    pub actual_balance: i128,
+
+    /// The signed difference `actual_balance - expected_total`.
+    ///
+    /// - `0` — the books balance.
+    /// - `> 0` — the contract holds more than it owes (surplus).
+    /// - `< 0` — the contract holds less than it owes (shortfall).
+    pub discrepancy: i128,
+
+    /// Whether the reconciliation succeeded, i.e. `discrepancy == 0`.
+    ///
+    /// Provided as a convenience so callers do not have to compare
+    /// [`discrepancy`](ReconciliationResult::discrepancy) against zero
+    /// themselves.
+    pub matched: bool,
+}
+
 /// Storage keys used by the escrow contract.
 ///
 /// All contract state is accessed through these keys. The variants map to

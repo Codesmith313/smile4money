@@ -5,7 +5,8 @@ import { traceHeaders } from '../tracing/trace-context.js';
 export type ProviderFailureKind =
   | 'unavailable'
   | 'invalid_data'
-  | 'access_denied';
+  | 'access_denied'
+  | 'schema_changed';
 export class ProviderFetchError extends Error {
   readonly policy: 'retry' | 'review';
   constructor(
@@ -15,6 +16,66 @@ export class ProviderFetchError extends Error {
     super(message);
     this.name = 'ProviderFetchError';
     this.policy = kind === 'unavailable' ? 'retry' : 'review';
+  }
+}
+
+export class ProviderSchemaError extends ProviderFetchError {
+  constructor(
+    readonly provider: string,
+    readonly field: string,
+  ) {
+    super(
+      'schema_changed',
+      `${provider} response schema changed (missing/invalid ${field}); operator review required`,
+    );
+    this.name = 'ProviderSchemaError';
+  }
+}
+
+export interface LichessGameResponse {
+  id: string;
+  status: string;
+  players: {
+    white: { user?: { name?: string } };
+    black: { user?: { name?: string } };
+  };
+  [key: string]: unknown;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Detects axios timeout errors. Timeouts are transient and safe to retry with
+ * exponential backoff. Never inspects config/headers to avoid leaking secrets.
+ */
+export function isTimeoutError(error: unknown): boolean {
+  if (!axios.isAxiosError(error)) return false;
+  return error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT';
+}
+
+export function validateLichessGameSchema(
+  data: unknown,
+): asserts data is LichessGameResponse {
+  const provider = 'lichess';
+  if (!isRecord(data)) {
+    throw new ProviderSchemaError(provider, 'root');
+  }
+  if (typeof data.id !== 'string' || data.id.length === 0) {
+    throw new ProviderSchemaError(provider, 'id');
+  }
+  if (typeof data.status !== 'string' || data.status.length === 0) {
+    throw new ProviderSchemaError(provider, 'status');
+  }
+  if (!isRecord(data.players)) {
+    throw new ProviderSchemaError(provider, 'players');
+  }
+  if (!isRecord(data.players.white)) {
+    throw new ProviderSchemaError(provider, 'players.white');
+  }
+  if (!isRecord(data.players.black)) {
+    throw new ProviderSchemaError(provider, 'players.black');
   }
 }
 
