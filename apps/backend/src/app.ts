@@ -34,6 +34,10 @@ app.use(express.json());
 app.use(requestLogging());
 app.use('/metrics', metricsRouter);
 app.use('/health', healthRouter);
+// #2133/#2134/#2135 — match search/filter, cursor pagination, and statistics
+// routes are all served by matchRouter under /api/matches. The router must
+// register its specific paths (e.g. GET /statistics) before any parameterized
+// routes (e.g. GET /:id) so they are not shadowed; no extra wiring is needed here.
 app.use('/api/matches', matchRouter);
 app.use('/api/validate-game', validateGameRouter);
 app.use('/api/oracle/reviews', reviewRouter);

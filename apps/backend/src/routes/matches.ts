@@ -6,6 +6,8 @@ import { requirePermission, Permission } from '../middleware/permissions.js';
 import {
   validateCreateMatchInput,
   createMatchForPlayer,
+  searchMatches,
+  getMatchStatistics,
 } from '../services/match-service.js';
 import {
   ErrorCode,
