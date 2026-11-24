@@ -16,6 +16,7 @@ import type { EvidenceStore } from '../store/evidence-store.js';
 import { withGameLock } from '../store/evidence-store.js';
 import logger from '../logger.js';
 import { errorToHttpStatus, ValidationError, NotFoundError } from '../errors/errorToHttpStatus.js';
+import { getOracleConfig } from './oracle-config.js';
 
 export interface SubmitResultInput {
   matchId: number;
@@ -185,15 +186,29 @@ async function verifyGameResultCore(
     };
   }
 
+  // #2124 — read the tunable oracle parameters on every verification so that
+  // operator changes (retry count, timeout, batch size) take effect without a
+  // restart. Defaults are used when no override has been configured.
+  const oracleConfig = getOracleConfig();
+
   // Fetch the game result from the chess platform API, using the match's own
   // recorded platform (now confirmed consistent with the request above) as
-  // the sole source of truth for fetcher selection.
+  // the sole source of truth for fetcher selection. The upstream fetch is
+  // bounded by the runtime-configurable timeout.
   let apiResult;
   try {
     if (match.platform === 'lichess') {
-      apiResult = await fetchLichessResult(gameId);
+      apiResult = await withTimeout(
+        fetchLichessResult(gameId),
+        oracleConfig.timeoutMs,
+        `Lichess fetch for game ${gameId}`,
+      );
     } else if (match.platform === 'chessdotcom') {
-      apiResult = await fetchChessDotComResult(username as string, gameId);
+      apiResult = await withTimeout(
+        fetchChessDotComResult(username as string, gameId),
+        oracleConfig.timeoutMs,
+        `Chess.com fetch for game ${gameId}`,
+      );
     } else {
       return {
         ok: false,
@@ -254,11 +269,13 @@ async function verifyGameResultCore(
   }
 
   const provider = apiResult.evidence.provider;
-  const previousProvider = history
-    .slice()
-    .reverse()
-    .map((decision) => decision.provider ?? decision.evidence?.provider)
-    .find((decision) => decision !== undefined);
+  // #2124 — scan the decision history in runtime-configurable batches so a
+  // large history does not block the event loop in one pass.
+  const previousProvider = await findInBatches(
+    history,
+    oracleConfig.batchSize,
+    (decision) => decision.provider ?? decision.evidence?.provider,
+  );
   if (previousProvider && previousProvider !== provider) {
     await ledger?.append({
       matchId: match.matchId,
@@ -376,10 +393,10 @@ async function verifyGameResultCore(
   }
 
   if (apiResult.result !== null) {
-    const previousVerifiedFromOtherProvider = history
-      .slice()
-      .reverse()
-      .find((decision) => {
+    const previousVerifiedFromOtherProvider = await findInBatches(
+      history,
+      oracleConfig.batchSize,
+      (decision) => {
         const decisionProvider =
           decision.provider ?? decision.evidence?.provider;
         return (
@@ -389,7 +406,8 @@ async function verifyGameResultCore(
           decision.evidence?.outcome !== undefined &&
           decision.evidence.outcome !== null
         );
-      });
+      },
+    );
     const conflictingProvider =
       previousVerifiedFromOtherProvider?.provider ??
       previousVerifiedFromOtherProvider?.evidence?.provider;
@@ -423,10 +441,11 @@ async function verifyGameResultCore(
       };
     }
 
-    const previousVerified = history
-      .slice()
-      .reverse()
-      .find((decision) => decision.state === 'verified');
+    const previousVerified = await findInBatches(
+      history,
+      oracleConfig.batchSize,
+      (decision) => decision.state === 'verified',
+    );
     if (
       previousVerified?.evidence?.outcome !== undefined &&
       previousVerified.evidence.outcome !== apiResult.result
@@ -486,4 +505,59 @@ async function verifyGameResultCore(
     status: apiResult.status,
     message: 'Game result verified. Players match registered identities.',
   };
+}
+
+/**
+ * Reject with a descriptive error if `promise` does not settle within
+ * `timeoutMs`. Used to bound upstream platform fetches by the runtime
+ * configurable oracle timeout.
+ */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return promise;
+  }
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
+      (timer as { unref: () => void }).unref();
+    }
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
+ * Search `items` from newest to oldest in chunks of `batchSize`, yielding to
+ * the event loop between chunks. Returns the first item for which `predicate`
+ * produces a defined value, or undefined if none matches.
+ */
+async function findInBatches<T, R>(
+  items: readonly T[],
+  batchSize: number,
+  predicate: (item: T) => R | undefined,
+): Promise<R | undefined> {
+  const size = Number.isFinite(batchSize) && batchSize > 0 ? Math.floor(batchSize) : items.length || 1;
+  for (let end = items.length; end > 0; end -= size) {
+    const start = Math.max(0, end - size);
+    for (let i = end - 1; i >= start; i -= 1) {
+      const result = predicate(items[i]);
+      if (result !== undefined) {
+        return result;
+      }
+    }
+    if (start > 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  }
+  return undefined;
 }

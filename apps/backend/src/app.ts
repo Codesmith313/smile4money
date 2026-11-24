@@ -9,6 +9,9 @@ import historyRouter from './routes/oracle-history.js';
 import playerIdentityRouter from './routes/player-identity.js';
 import metricsRouter from './routes/metrics.js';
 import statusRouter from './routes/status.js';
+import authRouter from './routes/auth.js';
+import apiKeysRouter from './routes/api-keys.js';
+import { rateLimit } from './middleware/rate-limit.js';
 import {
   ErrorCode,
   errorEnvelope,
@@ -68,6 +71,10 @@ app.use(
       'x-request-id',
       'x-correlation-id',
       'x-trace-id',
+      'X-RateLimit-Limit',
+      'X-RateLimit-Remaining',
+      'X-RateLimit-Reset',
+      'Retry-After',
     ],
     credentials: true,
   })
@@ -79,12 +86,17 @@ app.use(express.json());
 app.use(requestLogging());
 app.use('/metrics', metricsRouter);
 app.use('/health', healthRouter);
-app.use('/api/matches', matchRouter);
-app.use('/api/validate-game', validateGameRouter);
-app.use('/api/oracle/reviews', reviewRouter);
-app.use('/api/oracle/history', historyRouter);
-app.use('/api/oracle', oracleRouter);
-app.use('/api/player-identity', playerIdentityRouter);
+// #2125 — token refresh/revocation (no re-authentication required)
+app.use('/auth', authRouter);
+// #2127 — API key management (machine-to-machine auth)
+app.use('/api-keys', apiKeysRouter);
+// #2126 — per-user rate limiting applied after authentication on protected routers
+app.use('/api/matches', rateLimit(), matchRouter);
+app.use('/api/validate-game', rateLimit(), validateGameRouter);
+app.use('/api/oracle/reviews', rateLimit(), reviewRouter);
+app.use('/api/oracle/history', rateLimit(), historyRouter);
+app.use('/api/oracle', rateLimit(), oracleRouter);
+app.use('/api/player-identity', rateLimit(), playerIdentityRouter);
 app.use('/status', statusRouter);
 
 app.use((_req, res) => {

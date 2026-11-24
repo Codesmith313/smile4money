@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { matchStore, evidenceStore } from '../store/index.js';
 import { authenticate } from '../middleware/auth.js';
 import { validateSubmitResultInput, verifyGameResult } from '../services/oracle-service.js';
+import { oracleConfigStore } from '../services/oracle-config.js';
 import { errorToHttpStatus } from '../errors/errorToHttpStatus.js';
 import {
   errorEnvelope,
@@ -15,6 +16,68 @@ const store = matchStore;
 
 // Oracle endpoints require authentication
 router.use(authenticate);
+
+/**
+ * GET /api/oracle/config
+ *
+ * Read the current oracle runtime parameters (retry count, timeout, batch size).
+ */
+router.get('/config', (_req, res) => {
+  return res.status(200).json(oracleConfigStore.get());
+});
+
+/**
+ * PUT /api/oracle/config
+ *
+ * Update oracle runtime parameters without redeployment. All fields are
+ * optional; only the provided ones are validated and applied.
+ *
+ * Request body:
+ * ```json
+ * {
+ *   "retryCount": 3,
+ *   "timeoutMs": 5000,
+ *   "batchSize": 50
+ * }
+ * ```
+ */
+router.put('/config', (req, res) => {
+  const payload = req.body;
+
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return res.status(400).json(errorEnvelope(ErrorCode.VALIDATION_ERROR, 'Request body must be a JSON object'));
+  }
+
+  const fields = ['retryCount', 'timeoutMs', 'batchSize'] as const;
+  const updates: Partial<Record<(typeof fields)[number], number>> = {};
+
+  for (const field of fields) {
+    if (payload[field] === undefined) continue;
+    const value = payload[field];
+    if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+      return res
+        .status(400)
+        .json(errorEnvelope(ErrorCode.VALIDATION_ERROR, `${field} must be a positive integer`));
+    }
+    updates[field] = value;
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return res
+      .status(400)
+      .json(errorEnvelope(ErrorCode.VALIDATION_ERROR, 'At least one of retryCount, timeoutMs, batchSize is required'));
+  }
+
+  try {
+    const config = oracleConfigStore.update(updates);
+    return res.status(200).json(config);
+  } catch (error) {
+    const status = errorToHttpStatus(error);
+    return res
+      .status(status)
+      .json(errorEnvelope(statusToErrorCode(status), userFacingErrorMessage(status)));
+  }
+});
 
 /**
  * POST /api/oracle/submit-result

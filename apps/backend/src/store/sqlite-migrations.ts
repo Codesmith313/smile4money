@@ -27,8 +27,75 @@ export const createDlqEntriesMigration: SqliteMigration = {
   ],
 };
 
+/** Runtime-tunable oracle parameters (retry counts, timeouts, batch sizes).
+ * Stored as key/value pairs so values can be updated without redeployment. */
+export const createOracleConfigMigration: SqliteMigration = {
+  version: 2,
+  name: 'create_oracle_config',
+  statements: [
+    `CREATE TABLE IF NOT EXISTS oracle_config (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    )`,
+  ],
+  down: ['DROP TABLE IF EXISTS oracle_config'],
+};
+
+/** Hashed refresh tokens for JWT rotation. Only the hash of the refresh token
+ * is stored; the revoked flag allows invalidating individual tokens. */
+export const createRefreshTokensMigration: SqliteMigration = {
+  version: 3,
+  name: 'create_refresh_tokens',
+  statements: [
+    `CREATE TABLE IF NOT EXISTS refresh_tokens (
+      id TEXT PRIMARY KEY,
+      token_hash TEXT NOT NULL UNIQUE,
+      user_address TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      revoked INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    )`,
+    'CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_address ON refresh_tokens(user_address)',
+    'CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires_at ON refresh_tokens(expires_at)',
+  ],
+  down: [
+    'DROP INDEX IF EXISTS idx_refresh_tokens_expires_at',
+    'DROP INDEX IF EXISTS idx_refresh_tokens_user_address',
+    'DROP TABLE IF EXISTS refresh_tokens',
+  ],
+};
+
+/** Hashed API keys for machine-to-machine auth. Permissions are stored as a
+ * JSON array; the revoked flag allows revoking keys without deletion. */
+export const createApiKeysMigration: SqliteMigration = {
+  version: 4,
+  name: 'create_api_keys',
+  statements: [
+    `CREATE TABLE IF NOT EXISTS api_keys (
+      id TEXT PRIMARY KEY,
+      key_hash TEXT NOT NULL UNIQUE,
+      owner TEXT NOT NULL,
+      permissions TEXT NOT NULL DEFAULT '[]',
+      revoked INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER
+    )`,
+    'CREATE INDEX IF NOT EXISTS idx_api_keys_owner ON api_keys(owner)',
+  ],
+  down: [
+    'DROP INDEX IF EXISTS idx_api_keys_owner',
+    'DROP TABLE IF EXISTS api_keys',
+  ],
+};
+
 /** Ordered list of all known migrations, applied in version order. */
-export const sqliteMigrations: SqliteMigration[] = [createDlqEntriesMigration];
+export const sqliteMigrations: SqliteMigration[] = [
+  createDlqEntriesMigration,
+  createOracleConfigMigration,
+  createRefreshTokensMigration,
+  createApiKeysMigration,
+];
 
 function run(db: sqlite3.Database, sql: string): Promise<void> {
   return new Promise((resolve, reject) =>

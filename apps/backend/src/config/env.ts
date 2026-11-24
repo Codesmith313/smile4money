@@ -35,6 +35,15 @@ const DEFAULT_BACKUP_RETENTION_DAYS = 7;
 /** Default number of jobs processed in a single database transaction. */
 const DEFAULT_BATCH_SIZE = 50;
 
+/** Default oracle retry count used to seed the runtime-tunable config (#2124). */
+const DEFAULT_ORACLE_RETRY_COUNT = DEFAULT_POLLING_MAX_RETRIES;
+
+/** Default oracle request timeout in milliseconds (#2124). */
+const DEFAULT_ORACLE_TIMEOUT_MS = 30_000;
+
+/** Default oracle batch size used to seed the runtime-tunable config (#2124). */
+const DEFAULT_ORACLE_BATCH_SIZE = DEFAULT_BATCH_SIZE;
+
 /** Default number of days to keep records before they are archived. */
 const DEFAULT_RETENTION_DAYS = 90;
 
@@ -362,6 +371,31 @@ export interface Env {
 
   /** Idle timeout in milliseconds for pooled SQLite connections (#2196). */
   sqlitePoolIdleTimeoutMs: number;
+
+  /**
+   * Seed value for the runtime-tunable oracle retry count (#2124).
+   *
+   * Sourced from ORACLE_RETRY_COUNT. Defaults to the polling max retries (5).
+   * Persisted runtime overrides take precedence and apply without a restart.
+   */
+  oracleRetryCount: number;
+
+  /**
+   * Seed value for the runtime-tunable oracle request timeout in milliseconds
+   * (#2124).
+   *
+   * Sourced from ORACLE_TIMEOUT_MS. Defaults to 30000.
+   * Persisted runtime overrides take precedence and apply without a restart.
+   */
+  oracleTimeoutMs: number;
+
+  /**
+   * Seed value for the runtime-tunable oracle batch size (#2124).
+   *
+   * Sourced from ORACLE_BATCH_SIZE. Defaults to the batch size (50).
+   * Persisted runtime overrides take precedence and apply without a restart.
+   */
+  oracleBatchSize: number;
 }
 
 /**
@@ -428,6 +462,18 @@ function loadEnv(): Env {
     sqlitePoolIdleTimeoutMs: parsePositiveInt(
       'SQLITE_POOL_IDLE_TIMEOUT_MS',
       DEFAULT_SQLITE_POOL_IDLE_TIMEOUT_MS
+    ),
+    oracleRetryCount: parsePositiveInt(
+      'ORACLE_RETRY_COUNT',
+      DEFAULT_ORACLE_RETRY_COUNT
+    ),
+    oracleTimeoutMs: parsePositiveInt(
+      'ORACLE_TIMEOUT_MS',
+      DEFAULT_ORACLE_TIMEOUT_MS
+    ),
+    oracleBatchSize: parsePositiveInt(
+      'ORACLE_BATCH_SIZE',
+      DEFAULT_ORACLE_BATCH_SIZE
     ),
   };
 }

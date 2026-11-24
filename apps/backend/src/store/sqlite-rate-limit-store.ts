@@ -31,6 +31,19 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** Queries slower than this are logged as `db_slow_query` (#2203). */
 const SLOW_QUERY_THRESHOLD_MS = 100;
 
+/**
+ * Per-client bucket parameters. Callers that enforce tiered limits (e.g. per
+ * authenticated user tier, #2126) can pass an override to `isAllowed` so the
+ * same store enforces a different capacity/refill for that bucket while
+ * keeping the atomic refill-consume UPDATE. IP-keyed callers omit the
+ * override and keep the store's default parameters.
+ */
+export interface RateLimitBucketOptions {
+  capacity?: number;
+  refillIntervalMs?: number;
+  refillAmount?: number;
+}
+
 export class SqliteRateLimitStore implements RateLimitBackend {
   private db: sqlite3.Database | null = null;
   private dbPath: string;
@@ -42,6 +55,22 @@ export class SqliteRateLimitStore implements RateLimitBackend {
     dbPath?: string,
   ) {
     this.dbPath = dbPath || path.join(__dirname, '../../data/rate-limit.db');
+  }
+
+  /** Resolve the effective bucket parameters for a call, applying overrides. */
+  private resolveBucket(options?: RateLimitBucketOptions): {
+    capacity: number;
+    refillIntervalMs: number;
+    refillAmount: number;
+  } {
+    const capacity = options?.capacity ?? this.capacity;
+    const refillIntervalMs = options?.refillIntervalMs ?? this.refillIntervalMs;
+    const refillAmount = options?.refillAmount ?? this.refillAmount;
+    return {
+      capacity: Math.max(1, capacity),
+      refillIntervalMs: Math.max(1, refillIntervalMs),
+      refillAmount: Math.max(0, refillAmount),
+    };
   }
 
   private getDb(): sqlite3.Database {
@@ -89,8 +118,9 @@ export class SqliteRateLimitStore implements RateLimitBackend {
    * same file — eliminating the read-then-write race a SELECT followed by
    * an UPDATE would have.
    */
-  async isAllowed(clientId: string): Promise<RateLimitResult> {
+  async isAllowed(clientId: string, options?: RateLimitBucketOptions): Promise<RateLimitResult> {
     const now = Date.now();
+    const { capacity, refillIntervalMs, refillAmount } = this.resolveBucket(options);
 
     // Ensure a row exists before the UPDATE below; a brand new client starts
     // at capacity - 1 (one token consumed by this very request), matching
@@ -100,7 +130,7 @@ export class SqliteRateLimitStore implements RateLimitBackend {
         `INSERT INTO rate_limit_buckets (clientId, tokens, lastRefill)
          VALUES (?, ?, ?)
          ON CONFLICT(clientId) DO NOTHING`,
-        [clientId, this.capacity - 1, now],
+        [clientId, capacity - 1, now],
         function (this: sqlite3.RunResult, err: Error | null) {
           if (err) cb(err);
           else cb(null, this.changes);
@@ -116,7 +146,7 @@ export class SqliteRateLimitStore implements RateLimitBackend {
     // time since `lastRefill` and immediately stamps `lastRefill = now`, so
     // there is no separate "did a whole interval pass?" branch to get out of
     // sync with what was just written.
-    const refillExpr = `MIN(${this.capacity}, tokens + (CAST((? - lastRefill) AS REAL) / ${this.refillIntervalMs}) * ${this.refillAmount})`;
+    const refillExpr = `MIN(${capacity}, tokens + (CAST((? - lastRefill) AS REAL) / ${refillIntervalMs}) * ${refillAmount})`;
     const startedAt = Date.now();
     const result = await withRetry<{ changes: number }>('rate_limit:isAllowed:consume', (cb) =>
       this.getDb().run(
@@ -159,13 +189,15 @@ export class SqliteRateLimitStore implements RateLimitBackend {
     );
 
     const lastRefill = row?.lastRefill ?? now;
-    const timeUntilNextRefillMs = this.refillIntervalMs - (now - lastRefill);
+    const timeUntilNextRefillMs = refillIntervalMs - (now - lastRefill);
     const retryAfterSeconds = Math.max(1, Math.ceil(timeUntilNextRefillMs / 1000));
 
     return { allowed: false, retryAfterSeconds };
   }
 
-  async getRemainingTokens(clientId: string): Promise<number> {
+  async getRemainingTokens(clientId: string, options?: RateLimitBucketOptions): Promise<number> {
+    const { capacity, refillIntervalMs, refillAmount } = this.resolveBucket(options);
+
     const row = await withRetry<{ tokens: number; lastRefill: number } | undefined>(
       'rate_limit:getRemainingTokens',
       (cb) =>
@@ -177,12 +209,12 @@ export class SqliteRateLimitStore implements RateLimitBackend {
     );
 
     if (!row) {
-      return this.capacity;
+      return capacity;
     }
 
     const now = Date.now();
-    const refilled = row.tokens + ((now - row.lastRefill) / this.refillIntervalMs) * this.refillAmount;
-    return Math.min(this.capacity, Math.max(0, refilled));
+    const refilled = row.tokens + ((now - row.lastRefill) / refillIntervalMs) * refillAmount;
+    return Math.min(capacity, Math.max(0, refilled));
   }
 
   async destroy(): Promise<void> {

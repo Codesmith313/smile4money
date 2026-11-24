@@ -8,14 +8,19 @@
  * Implements idempotent submission: if a result already exists on-chain for a match_id,
  * the submission is skipped and logged as informational, not an error.
  *
- * Configurable via environment variables:
+ * Configurable via environment variables (used as fallback defaults):
  * - ORACLE_MAX_RETRIES: Maximum number of retry attempts (default: 5)
  * - ORACLE_RETRY_BASE_MS: Base interval for exponential backoff in milliseconds (default: 1000)
  * - ORACLE_RETRY_MAX_MS: Maximum interval between retries in milliseconds (default: 60000)
+ * - ORACLE_TIMEOUT_MS: Per-attempt submission timeout in milliseconds (default: 30000)
+ *
+ * Runtime-tunable parameters (retry count and timeout) are read from the oracle
+ * parameter store on every invocation, so changes apply without a restart.
  */
 
 import logger from '../logger.js';
 import { DlqEntry, writeToDlq } from '../queue.js';
+import { getOracleParams } from './oracle-params.js';
 
 /** Configuration for retry behavior. */
 export interface RetryConfig {
@@ -25,6 +30,8 @@ export interface RetryConfig {
   baseDelayMs: number;
   /** Maximum interval (ms) between retries; prevents unbounded growth. */
   maxDelayMs: number;
+  /** Per-attempt timeout (ms) applied to the submission handler. */
+  timeoutMs: number;
 }
 
 /** Submission details sent to the retry handler. */
@@ -52,12 +59,22 @@ export interface SubmissionAttempt {
   nextRetryDelayMs?: number;
 }
 
-/** Load retry configuration from environment. */
+/**
+ * Load retry configuration.
+ *
+ * Retry count and timeout are read from the runtime oracle parameter store
+ * (cached, refreshed without restart) and fall back to environment variables.
+ * Backoff intervals remain environment-driven.
+ */
 export function loadRetryConfig(): RetryConfig {
+  const params = getOracleParams();
   return {
-    maxRetries: parseInt(process.env.ORACLE_MAX_RETRIES ?? '5', 10),
+    maxRetries:
+      params?.retryCount ?? parseInt(process.env.ORACLE_MAX_RETRIES ?? '5', 10),
     baseDelayMs: parseInt(process.env.ORACLE_RETRY_BASE_MS ?? '1000', 10),
     maxDelayMs: parseInt(process.env.ORACLE_RETRY_MAX_MS ?? '60000', 10),
+    timeoutMs:
+      params?.timeoutMs ?? parseInt(process.env.ORACLE_TIMEOUT_MS ?? '30000', 10),
   };
 }
 
@@ -89,21 +106,24 @@ export function calculateBackoffDelay(
  * retries with exponential backoff up to maxRetries times. After all retries are
  * exhausted, the submission is written to the dead-letter queue for manual inspection.
  *
+ * Retry count and timeout are re-read from the runtime parameter store on each
+ * invocation so tuning applies without a restart.
+ *
  * @param submission - The result to submit
  * @param handler - Async function to execute the actual blockchain submission
- * @param config - Retry configuration
+ * @param config - Optional retry configuration override; defaults to runtime config
  * @returns A DLQ entry if written, undefined if successful or still retrying
  */
 export async function submitWithRetry(
   submission: OracleSubmission,
   handler: (sub: OracleSubmission) => Promise<void>,
-  config: RetryConfig
+  config: RetryConfig = loadRetryConfig()
 ): Promise<DlqEntry | undefined> {
   let lastError: Error | undefined;
 
   for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
     try {
-      await handler(submission);
+      await withTimeout(handler(submission), config.timeoutMs);
       if (attempt > 0) {
         logger.info(
           { matchId: submission.matchId, attempt },
@@ -189,17 +209,20 @@ export async function retryDlqEntry(
  * This protects against duplicate submissions when the oracle service crashes and
  * restarts mid-submission cycle.
  *
+ * Retry count and timeout are re-read from the runtime parameter store on each
+ * invocation so tuning applies without a restart.
+ *
  * @param submission - The result to submit
  * @param handler - Async function to execute the actual blockchain submission
  * @param existenceChecker - Async function to check if result already exists on-chain
- * @param config - Retry configuration
+ * @param config - Optional retry configuration override; defaults to runtime config
  * @returns A DLQ entry if written, undefined if successful (including idempotent skips)
  */
 export async function submitWithIdempotence(
   submission: OracleSubmission,
   handler: (sub: OracleSubmission) => Promise<void>,
   existenceChecker: ExistenceChecker,
-  config: RetryConfig
+  config: RetryConfig = loadRetryConfig()
 ): Promise<DlqEntry | undefined> {
   try {
     const alreadyExists = await existenceChecker(submission.matchId);
@@ -227,6 +250,24 @@ export async function submitWithIdempotence(
 /** Sleep for a given number of milliseconds. */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Race a promise against a timeout. Rejects with a timeout error if the
+ * promise does not settle within `ms` milliseconds.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  if (!Number.isFinite(ms) || ms <= 0) return promise;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`oracle_submit: timed out after ${ms}ms`)),
+      ms
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 // The escrow contract's submit_result starts its dispute window. The separate
