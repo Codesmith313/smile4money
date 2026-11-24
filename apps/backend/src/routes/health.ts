@@ -11,10 +11,10 @@ const startTime = Date.now();
 
 router.get('/', async (req, res) => {
   const uptimeSeconds = Math.floor((Date.now() - startTime) / 1000);
-  const version = process.env.BACKEND_VERSION ?? process.env.npm_package_version ?? 'unknown';
+  const version =
+    process.env.BACKEND_VERSION ?? process.env.npm_package_version ?? 'unknown';
 
   const result = await runHealthCheck({
-    deepCheck: process.env.DEEP_HEALTH === 'true',
     includeLimiters: process.env.HEALTH_INCLUDE_LIMITERS === 'true',
     includeSettlement: process.env.HEALTH_INCLUDE_SETTLEMENT === 'true',
     includeQueue: process.env.HEALTH_INCLUDE_QUEUE === 'true',
@@ -25,14 +25,15 @@ router.get('/', async (req, res) => {
 
   if (!result.ok) {
     const { error, ...details } = result.payload;
-    return res
-      .status(503)
-      .json(
-        errorEnvelope(ErrorCode.SERVICE_UNAVAILABLE, userFacingErrorMessage(503), {
-          ...details,
-          healthError: error,
-        }),
-      );
+    return res.status(503).json(
+      errorEnvelope(
+        ErrorCode.SERVICE_UNAVAILABLE,
+        userFacingErrorMessage(503),
+        {
+          details: { ...details, healthError: error },
+        },
+      ),
+    );
   }
 
   return res.status(200).json(result.payload);

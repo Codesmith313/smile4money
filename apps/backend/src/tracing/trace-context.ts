@@ -1,10 +1,9 @@
 /**
  * W3C Trace Context propagation (issue #123).
  *
- * Carries a `traceparent` / `tracestate` pair from an incoming HTTP request
- * through durable queue work (the oracle DLQ, polling jobs) and on to the
- * provider and Stellar RPC calls that work makes, so one trace id ties the
- * whole lifecycle of a match together, including retries hours later.
+ * Carries a W3C `traceparent` / `tracestate` pair, bridged to `X-Trace-ID`,
+ * from an incoming HTTP request through durable queue work and downstream
+ * provider and Stellar RPC calls.
  *
  * Deliberately dependency-free: this is the propagation format only, not an
  * exporter. The trace and span ids land in every structured log line (see
@@ -42,6 +41,7 @@ export interface PersistedTraceContext {
 
 const TRACEPARENT_RE =
   /^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/;
+const TRACE_ID_RE = /^[0-9a-f]{32}$/;
 const ZERO_TRACE_ID = "0".repeat(32);
 const ZERO_SPAN_ID = "0".repeat(16);
 
@@ -89,6 +89,13 @@ export function parseTraceparent(
   if (version === "ff" || traceId === ZERO_TRACE_ID || spanId === ZERO_SPAN_ID)
     return null;
   return { traceId, spanId, flags };
+}
+
+function parseTraceId(header: string | undefined | null): string | null {
+  if (typeof header !== "string") return null;
+  const traceId = header.trim().toLowerCase();
+  if (!TRACE_ID_RE.test(traceId) || traceId === ZERO_TRACE_ID) return null;
+  return traceId;
 }
 
 export function formatTraceparent(
@@ -162,9 +169,14 @@ export function childContext(parent: TraceContext): TraceContext {
 export function contextFromHeaders(
   traceparent: string | undefined | null,
   tracestate: string | undefined | null,
+  xTraceId?: string | null,
 ): TraceContext {
   const parsed = parseTraceparent(traceparent);
-  if (!parsed) return newTraceContext();
+  if (!parsed) {
+    const ctx = newTraceContext();
+    const traceId = parseTraceId(xTraceId);
+    return traceId ? { ...ctx, traceId } : ctx;
+  }
   // tracestate is only meaningful alongside a valid traceparent.
   return childContext({
     ...parsed,
@@ -215,6 +227,7 @@ export function traceHeaders(
   if (!ctx) return {};
   const headers: Record<string, string> = {
     traceparent: formatTraceparent(ctx),
+    "x-trace-id": ctx.traceId,
   };
   const state = sanitizeTraceState(ctx.traceState);
   if (state) headers.tracestate = state;

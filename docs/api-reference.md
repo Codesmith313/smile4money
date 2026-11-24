@@ -4,6 +4,10 @@ Complete reference for all smart contract functions, types, and errors.
 
 > The backend HTTP API (`/health`, `/status`, `/api/...`) is specified separately in [`apps/backend/openapi.json`](../apps/backend/openapi.json), under the versioning rules in [api-compatibility.md](api-compatibility.md).
 
+`GET /health` is a readiness check: it returns `200` with `ready: true` only
+when the match database and Stellar RPC are reachable. Otherwise it returns
+`503` and reports each dependency's status and any probe error.
+
 ## Escrow Contract
 
 ### Initialization
@@ -1573,7 +1577,7 @@ Errors from API endpoints use the following envelope:
 - `error.requestId` — the request span ID, which can be shared with support.
 - `error.correlationId` — the trace ID included in related structured logs.
 - `error.timestamp` — the UTC time when the error response was created.
-- `X-Request-ID` and `X-Correlation-ID` response headers expose the same identifiers; `traceparent` also carries the W3C trace context.
+- `X-Request-ID` identifies the server span. `X-Correlation-ID` and `X-Trace-ID` expose the trace ID; `traceparent` carries the W3C trace context. A valid incoming `X-Trace-ID` is continued when `traceparent` is absent or invalid; otherwise the backend generates a trace ID. The backend sends trace headers to downstream HTTP services and writes the ID as `trace_id` in structured logs for querying.
 
 `code`, `message`, `suggestion`, and `docsUrl` are always present. Some error responses include additional fields inside `error` (e.g. `error.hint`) for extra machine-readable context.
 

@@ -23,6 +23,21 @@ export interface EvidenceStore {
   append(decision: Decision): Promise<number>;
 }
 
+function validateDecision(decision: Decision): void {
+  if (!decision.reason.trim()) {
+    throw new Error('Decision reason is required');
+  }
+  if (
+    !Number.isFinite(Date.parse(decision.recordedAt)) ||
+    new Date(decision.recordedAt).toISOString() !== decision.recordedAt
+  ) {
+    throw new Error('A valid ISO 8601 timestamp is required for decisions');
+  }
+  if (decision.state === 'retry_requested' && !decision.operator?.trim()) {
+    throw new Error('Operator identity is required for operator decisions');
+  }
+}
+
 export class MemoryEvidenceStore implements EvidenceStore {
   private entries: Decision[] = [];
   async history(gameId: string): Promise<Decision[]> {
@@ -31,6 +46,7 @@ export class MemoryEvidenceStore implements EvidenceStore {
       .map((e) => structuredClone(e));
   }
   async append(decision: Decision): Promise<number> {
+    validateDecision(decision);
     const id = this.entries.length + 1;
     this.entries.push(structuredClone({ ...decision, id }));
     return id;
@@ -67,6 +83,7 @@ export class SqliteEvidenceStore implements EvidenceStore {
   }
   async append(decision: Decision): Promise<number> {
     if (!this.db) throw new Error('Evidence store not initialized');
+    validateDecision(decision);
     return new Promise((resolve, reject) =>
       this.db!.run(
         'INSERT INTO oracle_decisions(gameId, decision) VALUES (?, ?)',

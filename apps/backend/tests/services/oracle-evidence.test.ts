@@ -155,7 +155,13 @@ describe('durable oracle evidence and operator review', () => {
       'retry_requested',
       'verified',
     ]);
-    expect(history[1].operator).toBe('operator');
+    expect(history[1]).toMatchObject({
+      operator: 'operator',
+      reason: 'Provider corrected evidence',
+      recordedAt: expect.stringMatching(
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+      ),
+    });
   });
   it('quarantines changed outcomes while retaining the earlier verified decision', async () => {
     get

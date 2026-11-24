@@ -55,8 +55,19 @@ app.use(
       }
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    exposedHeaders: ['traceparent', 'x-request-id', 'x-correlation-id'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'traceparent',
+      'tracestate',
+      'x-trace-id',
+    ],
+    exposedHeaders: [
+      'traceparent',
+      'x-request-id',
+      'x-correlation-id',
+      'x-trace-id',
+    ],
     credentials: true,
   })
 );

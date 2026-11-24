@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 
 vi.mock("../../src/logger.js", () => ({
   default: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -7,17 +7,27 @@ vi.mock("../../src/services/stellar.js", () => ({ checkStellarRpc: vi.fn() }));
 vi.mock("../../src/services/bottleneck-limiters.js", () => ({
   getAllLimiterStats: vi.fn(() => ({})),
 }));
+vi.mock("../../src/store/index.js", () => ({
+  matchStore: { getSchemaVersion: vi.fn().mockResolvedValue(1) },
+}));
 
 import { runHealthCheck } from "../../src/services/health-service.js";
+import { checkStellarRpc } from "../../src/services/stellar.js";
 import {
   SettlementAgeMonitor,
   setSettlementAgeMonitor,
 } from "../../src/services/settlement-age-monitor.js";
+import { matchStore } from "../../src/store/index.js";
 
 const BASE = { uptimeSeconds: 1, version: "test" };
 
 afterEach(() => {
   setSettlementAgeMonitor(null);
+});
+
+beforeEach(() => {
+  vi.mocked(checkStellarRpc).mockResolvedValue(undefined);
+  vi.mocked(matchStore.getSchemaVersion).mockResolvedValue(1);
 });
 
 describe("runHealthCheck settlement metrics", () => {

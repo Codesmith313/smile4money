@@ -10,6 +10,7 @@ import logger from '../logger.js';
 import { RateLimitError } from '../errors/RateLimitError.js';
 import { ProviderFetchError } from './provider-validation.js';
 import type { MatchResult, GameResult } from './lichess.js';
+import { traceHeaders } from '../tracing/trace-context.js';
 
 export { GameNotFoundError } from './lichess.js';
 export { RateLimitError } from '../errors/RateLimitError.js';
@@ -85,6 +86,7 @@ async function fetchArchive(
     try {
       const response = await axios.get(url, {
         timeout: 10_000,
+        headers: traceHeaders(),
         validateStatus: (s) => s < 500,
       });
 
