@@ -125,6 +125,29 @@ describe("SQLite schema migrations", () => {
     }
   });
 
+  it("applies and rolls back the cancellation reason migration", async () => {
+    db = new sqlite3.Database(":memory:");
+    const migrations = SQLITE_SCHEMA_MIGRATIONS["match-cancellation-reason"];
+    const applied = await applySqliteMigrations(db, migrations);
+    expect(applied.currentVersion).toBe(migrations.length);
+    await expect(getCurrentSchemaVersion(db)).resolves.toBe(migrations.length);
+
+    const columns = await new Promise<Array<{ name: string }>>(
+      (resolve, reject) =>
+        db!.all(
+          "PRAGMA table_info(matches)",
+          (error, rows: Array<{ name: string }>) =>
+            error ? reject(error) : resolve(rows),
+        ),
+    );
+    expect(columns.map((column) => column.name)).toContain("cancellationReason");
+
+    const rolledBack = await rollbackSqliteMigrations(db, migrations, 0);
+    expect(rolledBack.currentVersion).toBe(0);
+    expect(rolledBack.rolledBackMigrations).toHaveLength(migrations.length);
+    await expect(getCurrentSchemaVersion(db)).resolves.toBe(0);
+  });
+
   it("adds and backfills the provider column in settlement evidence", async () => {
     db = new sqlite3.Database(":memory:");
     const migrations = SQLITE_SCHEMA_MIGRATIONS["match-store"];

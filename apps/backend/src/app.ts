@@ -57,7 +57,13 @@ app.post('/auth/logout', authenticate, (req, res) => {
 app.use((_req, res) => {
   res
     .status(404)
-    .json(errorEnvelope(ErrorCode.NOT_FOUND, userFacingErrorMessage(404)));
+    .json(
+      errorEnvelope(
+        ErrorCode.NOT_FOUND,
+        userFacingErrorMessage(404),
+        { method: req.method, path: req.originalUrl ?? req.url },
+      ),
+    );
 });
 
 app.use(apiErrorHandler);
