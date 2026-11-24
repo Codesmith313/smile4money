@@ -13,6 +13,11 @@ import {
   getGameResultWithPlayerIdentities,
   createMatchForPlayer,
 } from '../../src/services/match-service.js';
+import { validateGame } from '../../src/services/validate-game-service.js';
+import {
+  clearGameValidationCache,
+  GAME_VALIDATION_CACHE_TTL_MS,
+} from '../../src/services/game-validation-cache.js';
 import { MatchStore } from '../../src/store/match-store.js';
 
 // ---------------------------------------------------------------------------
@@ -159,7 +164,10 @@ describe('validateCreateMatchInput', () => {
 // validateGameExists
 // ---------------------------------------------------------------------------
 describe('validateGameExists', () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearGameValidationCache();
+  });
 
   it('returns { valid: true } when lichess game is found', async () => {
     mockFetchLichess.mockResolvedValue(LICHESS_GAME);
@@ -172,6 +180,20 @@ describe('validateGameExists', () => {
     const result = await validateGameExists('lichess', 'game-abc');
     expect(result.valid).toBe(false);
     expect(result.error).toContain('game-abc');
+  });
+
+  it('does not cache failed provider lookups', async () => {
+    mockFetchLichess
+      .mockRejectedValueOnce(new GameNotFoundError('game-abc'))
+      .mockResolvedValueOnce(LICHESS_GAME);
+
+    expect(await validateGameExists('lichess', 'game-abc')).toMatchObject({
+      valid: false,
+    });
+    expect(await validateGameExists('lichess', 'game-abc')).toEqual({
+      valid: true,
+    });
+    expect(mockFetchLichess).toHaveBeenCalledTimes(2);
   });
 
   it('returns { valid: false, error } on unexpected lichess error', async () => {
@@ -204,12 +226,31 @@ describe('validateGameExists', () => {
 // getGameResultWithPlayerIdentities
 // ---------------------------------------------------------------------------
 describe('getGameResultWithPlayerIdentities', () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearGameValidationCache();
+  });
 
   it('returns player names from lichess result', async () => {
     mockFetchLichess.mockResolvedValue(LICHESS_GAME);
     const result = await getGameResultWithPlayerIdentities('lichess', 'game-abc');
     expect(result).toEqual({ whitePlayer: 'alice', blackPlayer: 'bob' });
+  });
+
+  it('caches successful provider lookups briefly', async () => {
+    vi.useFakeTimers();
+    try {
+      mockFetchLichess.mockResolvedValue(LICHESS_GAME);
+      await getGameResultWithPlayerIdentities('lichess', 'game-abc');
+      await getGameResultWithPlayerIdentities('lichess', 'game-abc');
+      expect(mockFetchLichess).toHaveBeenCalledTimes(1);
+
+      vi.advanceTimersByTime(GAME_VALIDATION_CACHE_TTL_MS + 1);
+      await getGameResultWithPlayerIdentities('lichess', 'game-abc');
+      expect(mockFetchLichess).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('returns error when lichess fetch fails', async () => {
@@ -246,6 +287,7 @@ describe('createMatchForPlayer', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    clearGameValidationCache();
     store = new MatchStore();
   });
 
@@ -274,6 +316,26 @@ describe('createMatchForPlayer', () => {
     }
   });
 
+  it('reuses recent provider validation when creating a match', async () => {
+    mockFetchLichess.mockResolvedValue(LICHESS_GAME);
+    const validation = await validateGame({
+      gameId: 'game-abc',
+      platform: 'lichess',
+    });
+
+    expect(validation.ok).toBe(true);
+    const result = await createMatchForPlayer(store, PLAYER1, {
+      player2: PLAYER2,
+      stakeAmount: 100,
+      token: 'XLM',
+      gameId: 'game-abc',
+      platform: 'lichess',
+    });
+
+    expect(result.ok).toBe(true);
+    expect(mockFetchLichess).toHaveBeenCalledTimes(1);
+  });
+
   it('returns ok:false with 400 when input validation fails', async () => {
     const result = await createMatchForPlayer(store, PLAYER1, {
       player2: PLAYER2,
@@ -290,6 +352,7 @@ describe('createMatchForPlayer', () => {
 
   it('returns ok:false with 400 when game is not found', async () => {
     mockFetchLichess.mockRejectedValue(new GameNotFoundError('game-abc'));
+    const createMatch = vi.spyOn(store, 'createMatch');
 
     const result = await createMatchForPlayer(store, PLAYER1, {
       player2: PLAYER2,
@@ -304,6 +367,7 @@ describe('createMatchForPlayer', () => {
       expect(result.status).toBe(400);
       expect(result.error).toBe('Invalid game');
     }
+    expect(createMatch).not.toHaveBeenCalled();
   });
 
   it('returns ok:false with 409 for duplicate gameId', async () => {

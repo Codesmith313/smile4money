@@ -12,6 +12,7 @@ import {
   verifyGameResult,
 } from '../../src/services/oracle-service.js';
 import { MatchStore } from '../../src/store/match-store.js';
+import { MemoryEvidenceStore } from '../../src/store/evidence-store.js';
 
 // ---------------------------------------------------------------------------
 // Mock external dependencies
@@ -164,12 +165,37 @@ describe('verifyGameResult', () => {
         parserVersion: 'chess-result-v1',
         gameId: 'lichess-game-abc',
         platform: 'lichess',
+        provider: 'lichess',
         whitePlayer: 'alice',
         blackPlayer: 'bob',
         result: 'Player1Wins',
         decision: 'verified',
       });
     }
+  });
+
+  it('rejects a result whose provider end time is still in the future', async () => {
+    await seedMatch(store);
+    const futureEndTime = '2999-01-01T00:00:00.000Z';
+    mockFetchLichess.mockResolvedValue({
+      ...LICHESS_GAME,
+      endedAt: futureEndTime,
+      evidence: { ...LICHESS_GAME.evidence, endedAt: futureEndTime },
+    });
+
+    const result = await verifyGameResult(store, {
+      matchId: 0,
+      gameId: 'lichess-game-abc',
+      platform: 'lichess',
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      status: 425,
+      error: 'Result submission timing violation',
+      details: expect.stringContaining(futureEndTime),
+    });
+    await expect(store.getSettlementEvidence(0)).resolves.toBeNull();
   });
 
   it('returns ok:false with 404 and persistence hint when store is empty', async () => {
@@ -287,7 +313,11 @@ describe('verifyGameResult', () => {
 
   it('uses chessdotcom fetcher when platform is chessdotcom', async () => {
     await seedMatch(store, { platform: 'chessdotcom' });
-    mockFetchChess.mockResolvedValue({ ...LICHESS_GAME, gameId: 'lichess-game-abc' });
+    mockFetchChess.mockResolvedValue({
+      ...LICHESS_GAME,
+      ...providerMetadata('chessdotcom'),
+      gameId: 'lichess-game-abc',
+    });
 
     const result = await verifyGameResult(store, {
       matchId: 0,
@@ -299,6 +329,103 @@ describe('verifyGameResult', () => {
     expect(result.ok).toBe(true);
     expect(mockFetchChess).toHaveBeenCalledWith('alice', 'lichess-game-abc');
     expect(mockFetchLichess).not.toHaveBeenCalled();
+    if (result.ok) expect(result.provider).toBe('chessdotcom');
+  });
+
+  it('records provider changes as separate ledger entries', async () => {
+    await seedMatch(store);
+    const ledger = new MemoryEvidenceStore();
+    mockFetchLichess
+      .mockResolvedValueOnce(LICHESS_GAME)
+      .mockResolvedValueOnce({
+        ...LICHESS_GAME,
+        evidence: providerMetadata('chessdotcom').evidence,
+      });
+
+    await verifyGameResult(
+      store,
+      { matchId: 0, gameId: 'lichess-game-abc', platform: 'lichess' },
+      ledger,
+    );
+    const secondResult = await verifyGameResult(
+      store,
+      { matchId: 0, gameId: 'lichess-game-abc', platform: 'lichess' },
+      ledger,
+    );
+
+    expect(secondResult).toMatchObject({ ok: true, provider: 'chessdotcom' });
+    await expect(ledger.history('lichess-game-abc')).resolves.toMatchObject([
+      { state: 'verified', provider: 'lichess' },
+      {
+        state: 'provider_changed',
+        previousProvider: 'lichess',
+        provider: 'chessdotcom',
+      },
+      { state: 'verified', provider: 'chessdotcom' },
+    ]);
+  });
+
+  it('holds a contradiction when different providers report different outcomes', async () => {
+    await seedMatch(store);
+    const ledger = new MemoryEvidenceStore();
+    const previousEvidence = providerMetadata(
+      'chessdotcom',
+      'Player2Wins',
+    ).evidence;
+    await ledger.append({
+      matchId: 0,
+      gameId: 'lichess-game-abc',
+      state: 'verified',
+      reason: 'Result verified',
+      provider: 'chessdotcom',
+      evidence: previousEvidence,
+      recordedAt: previousEvidence.fetchedAt,
+    });
+    mockFetchLichess.mockResolvedValue(LICHESS_GAME);
+
+    const result = await verifyGameResult(
+      store,
+      {
+        matchId: 0,
+        gameId: 'lichess-game-abc',
+        platform: 'lichess',
+      },
+      ledger,
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      status: 409,
+      error: 'Provider outcome contradiction',
+      details:
+        'Provider outcome contradiction: chessdotcom reported Player2Wins, while lichess reported Player1Wins.',
+    });
+    const history = await ledger.history('lichess-game-abc');
+    expect(history.map((decision) => decision.state)).toEqual([
+      'verified',
+      'provider_changed',
+      'review_required',
+    ]);
+    expect(history[2]).toMatchObject({
+      provider: 'lichess',
+      previousProvider: 'chessdotcom',
+      previousEvidence: {
+        provider: 'chessdotcom',
+        outcome: 'Player2Wins',
+      },
+      evidence: {
+        provider: 'lichess',
+        outcome: 'Player1Wins',
+      },
+    });
+    expect(
+      await verifyGameResult(
+        store,
+        { matchId: 0, gameId: 'lichess-game-abc', platform: 'lichess' },
+        ledger,
+      ),
+    ).toMatchObject({ ok: false, status: 409 });
+    expect(mockFetchLichess).toHaveBeenCalledTimes(1);
   });
 
   // #1721 — the fetcher used must match the platform the match was actually

@@ -9,9 +9,12 @@ export interface Decision {
   id?: number;
   matchId: number;
   gameId: string;
-  state: 'review_required' | 'verified' | 'in_progress' | 'retry_requested';
+  state: 'review_required' | 'verified' | 'in_progress' | 'retry_requested' | 'provider_changed';
   reason: string;
+  provider?: Evidence['provider'];
+  previousProvider?: Evidence['provider'];
   evidence?: Evidence;
+  previousEvidence?: Evidence;
   recordedAt: string;
   operator?: string;
 }

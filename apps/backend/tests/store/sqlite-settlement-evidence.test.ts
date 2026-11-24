@@ -18,12 +18,12 @@ describe('SQLite settlement evidence', () => {
     await first.initialize();
     await first.saveSettlementEvidence({
       parserVersion: 'chess-result-v1', evaluatedAt: new Date().toISOString(), matchId: 7,
-      gameId: 'abc_123', platform: 'lichess', whitePlayer: 'alice', blackPlayer: 'bob',
+      gameId: 'abc_123', platform: 'lichess', provider: 'lichess', whitePlayer: 'alice', blackPlayer: 'bob',
       result: 'Player1Wins', status: 'mate', decision: 'player_identity_mismatch',
     });
     await first.saveSettlementEvidence({
       parserVersion: 'chess-result-v1', evaluatedAt: new Date().toISOString(), matchId: 7,
-      gameId: 'abc_123', platform: 'lichess', whitePlayer: 'alice', blackPlayer: 'bob',
+      gameId: 'abc_123', platform: 'lichess', provider: 'chessdotcom', whitePlayer: 'alice', blackPlayer: 'bob',
       result: 'Player1Wins', status: 'mate', decision: 'verified',
     });
     await first.close();
@@ -31,7 +31,7 @@ describe('SQLite settlement evidence', () => {
     const reopened = new SqliteMatchStore(dbPath);
     await reopened.initialize();
     await expect(reopened.getSettlementEvidence(7)).resolves.toMatchObject({
-      parserVersion: 'chess-result-v1', gameId: 'abc_123', whitePlayer: 'alice', result: 'Player1Wins', decision: 'verified',
+      parserVersion: 'chess-result-v1', gameId: 'abc_123', provider: 'chessdotcom', whitePlayer: 'alice', result: 'Player1Wins', decision: 'verified',
     });
     await expect(reopened.getSettlementEvidenceHistory(7)).resolves.toMatchObject([
       { decision: 'player_identity_mismatch' },

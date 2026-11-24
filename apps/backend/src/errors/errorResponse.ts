@@ -170,6 +170,7 @@ export function statusToErrorCode(status: number): ErrorCode {
     case 404:
       return ErrorCode.NOT_FOUND;
     case 409:
+    case 425:
       return ErrorCode.CONFLICT;
     case 422:
       return ErrorCode.VALIDATION_ERROR;
@@ -201,6 +202,8 @@ export function userFacingErrorMessage(status: number): string {
       return 'The requested resource could not be found.';
     case 409:
       return 'The request conflicts with the current state. Refresh and try again.';
+    case 425:
+      return 'The provider has not confirmed that the game has ended. Retry after it reports a final result.';
     case 422:
       return 'The provided information could not be verified. Check it and try again.';
     case 429:

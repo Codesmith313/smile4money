@@ -69,6 +69,15 @@ export const SQLITE_SCHEMA_MIGRATIONS: Record<string, SqliteMigration[]> = {
         "DROP INDEX IF EXISTS idx_settlement_evidence_matchId",
       ],
     },
+    {
+      version: 4,
+      name: "add-settlement-evidence-provider",
+      statements: [
+        "ALTER TABLE settlement_evidence ADD COLUMN provider TEXT",
+        "UPDATE settlement_evidence SET provider = platform WHERE provider IS NULL",
+      ],
+      down: ["ALTER TABLE settlement_evidence DROP COLUMN provider"],
+    },
   ],
   "oracle-queue": [
     {

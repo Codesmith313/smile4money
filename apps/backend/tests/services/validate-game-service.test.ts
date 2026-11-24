@@ -12,11 +12,7 @@ import {
   validateGame,
   resetValidateGameCache,
 } from '../../src/services/validate-game-service.js';
-import { ProviderFetchError } from '../../src/fetchers/provider-validation.js';
-import {
-  ProviderResultCache,
-  providerCacheConfigFromEnv,
-} from '../../src/services/provider-result-cache.js';
+import { clearGameValidationCache } from '../../src/services/game-validation-cache.js';
 
 // ---------------------------------------------------------------------------
 // Mock external fetchers
@@ -131,89 +127,7 @@ describe('validateGameInput', () => {
 describe('validateGame (lichess)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    resetValidateGameCache();
-  });
-
-  it('serves stale data and retries the provider in the background', async () => {
-    let now = 1_000;
-    const backgroundTasks: Array<() => Promise<void>> = [];
-    const cache = new ProviderResultCache({
-      staleToleranceMs: 1_000,
-      backgroundRetryDelayMs: 5_000,
-      now: () => now,
-      scheduleBackground: (task) => backgroundTasks.push(task),
-    });
-    mockFetchLichess.mockResolvedValue(LICHESS_GAME);
-
-    await validateGame({ gameId: 'abc123', platform: 'lichess' }, cache);
-    now += 500;
-    mockFetchLichess.mockRejectedValue(
-      new ProviderFetchError('unavailable', 'Provider unavailable'),
-    );
-
-    const stale = await validateGame(
-      { gameId: 'abc123', platform: 'lichess' },
-      cache,
-    );
-    expect(stale).toMatchObject({
-      ok: true,
-      stale: true,
-      cacheAgeMs: 500,
-      result: 'Player1Wins',
-    });
-    expect(mockFetchLichess).toHaveBeenCalledTimes(2);
-
-    const whileRefreshing = await validateGame(
-      { gameId: 'abc123', platform: 'lichess' },
-      cache,
-    );
-    expect(whileRefreshing).toMatchObject({ ok: true, stale: true });
-    expect(mockFetchLichess).toHaveBeenCalledTimes(2);
-    expect(backgroundTasks).toHaveLength(1);
-
-    mockFetchLichess.mockResolvedValue({ ...LICHESS_GAME, whitePlayer: 'new-alice' });
-    await backgroundTasks[0]();
-    expect(mockFetchLichess).toHaveBeenCalledTimes(3);
-  });
-
-  it('does not use a cache entry older than the configured tolerance', async () => {
-    let now = 1_000;
-    const backgroundTasks: Array<() => Promise<void>> = [];
-    const cache = new ProviderResultCache({
-      staleToleranceMs: 500,
-      now: () => now,
-      scheduleBackground: (task) => backgroundTasks.push(task),
-    });
-    mockFetchLichess.mockResolvedValueOnce(LICHESS_GAME);
-    await validateGame({ gameId: 'abc123', platform: 'lichess' }, cache);
-    now += 501;
-    mockFetchLichess.mockRejectedValue(
-      new ProviderFetchError('unavailable', 'Provider unavailable'),
-    );
-
-    const result = await validateGame(
-      { gameId: 'abc123', platform: 'lichess' },
-      cache,
-    );
-
-    expect(result).toMatchObject({ ok: false, status: 503 });
-    expect(backgroundTasks).toHaveLength(0);
-  });
-
-  it('disables stale fallback when the configured tolerance is zero', async () => {
-    const cache = new ProviderResultCache({ staleToleranceMs: 0 });
-    mockFetchLichess.mockResolvedValueOnce(LICHESS_GAME);
-    await validateGame({ gameId: 'abc123', platform: 'lichess' }, cache);
-    mockFetchLichess.mockRejectedValueOnce(
-      new ProviderFetchError('unavailable', 'Provider unavailable'),
-    );
-
-    const result = await validateGame(
-      { gameId: 'abc123', platform: 'lichess' },
-      cache,
-    );
-
-    expect(result).toMatchObject({ ok: false, status: 503 });
+    clearGameValidationCache();
   });
 
   it('returns ok:true with game details when lichess game exists', async () => {
@@ -278,7 +192,7 @@ describe('validateGame (lichess)', () => {
 describe('validateGame (chessdotcom)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    resetValidateGameCache();
+    clearGameValidationCache();
   });
 
   it('returns ok:true with game details when chess.com game exists', async () => {

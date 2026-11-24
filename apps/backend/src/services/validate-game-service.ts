@@ -6,9 +6,9 @@
  * the logic can be tested independently of HTTP concerns.
  */
 
-import { fetchLichessResult, GameNotFoundError } from '../fetchers/lichess.js';
-import { fetchChessDotComResult } from '../fetchers/chessdotcom.js';
+import { GameNotFoundError } from '../fetchers/lichess.js';
 import type { MatchResult, GameResult } from '../fetchers/lichess.js';
+import { getCachedProviderGameResult } from './game-validation-cache.js';
 import { errorToHttpStatus } from '../errors/errorToHttpStatus.js';
 import {
   checkGameEligibility,
@@ -179,18 +179,8 @@ export async function validateGame(
 
   try {
     if (platform === 'lichess') {
-      const cached = await cache.get(
-        JSON.stringify(['lichess', gameId]),
-        'lichess',
-        () => fetchLichessResult(gameId),
-      );
-      const result = cached.value;
-      const ineligible = ineligibleResponse(
-        'lichess',
-        result.gameId,
-        result,
-        cached,
-      );
+      const result = await getCachedProviderGameResult('lichess', gameId);
+      const ineligible = ineligibleResponse('lichess', result.gameId, result);
       if (ineligible) return ineligible;
       return {
         ok: true,
@@ -205,18 +195,8 @@ export async function validateGame(
       };
     } else {
       // chessdotcom — username already validated by validateGameInput
-      const cached = await cache.get(
-        JSON.stringify(['chessdotcom', username?.toLowerCase(), gameId]),
-        'chessdotcom',
-        () => fetchChessDotComResult(username as string, gameId),
-      );
-      const result = cached.value;
-      const ineligible = ineligibleResponse(
-        'chessdotcom',
-        result.gameId,
-        result,
-        cached,
-      );
+      const result = await getCachedProviderGameResult('chessdotcom', gameId, username);
+      const ineligible = ineligibleResponse('chessdotcom', result.gameId, result);
       if (ineligible) return ineligible;
       return {
         ok: true,

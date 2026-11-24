@@ -8,9 +8,12 @@
 
 import { fetchLichessResult, GameNotFoundError } from '../fetchers/lichess.js';
 import { fetchChessDotComResult } from '../fetchers/chessdotcom.js';
+import { AmbiguousEvidenceError } from '../fetchers/result.js';
 import { verifyPlayerIdentities, verifyIdentityHash } from './player-identity.js';
 import type { PlayerIdentityMap } from './player-identity.js';
 import type { MatchStorePort } from '../store/match-store.js';
+import type { EvidenceStore } from '../store/evidence-store.js';
+import { withGameLock } from '../store/evidence-store.js';
 import logger from '../logger.js';
 import { errorToHttpStatus, ValidationError, NotFoundError } from '../errors/errorToHttpStatus.js';
 
@@ -27,6 +30,8 @@ export interface SubmitResultSuccess {
   matchId: number;
   gameId: string;
   result: string | null;
+  provider: 'lichess' | 'chessdotcom';
+  decisionId?: number;
   whitePlayer: string;
   blackPlayer: string;
   status: string;
@@ -81,11 +86,31 @@ export function validateSubmitResultInput(input: Partial<SubmitResultInput>): st
  * Returns a discriminated union so the route handler only needs to map the
  * result to an HTTP response.
  */
-export async function verifyGameResult(
+export function verifyGameResult(
   store: MatchStorePort,
   input: SubmitResultInput,
+  ledger?: EvidenceStore,
+): Promise<SubmitResultOutcome> {
+  const verify = () => verifyGameResultCore(store, input, ledger);
+  return ledger ? withGameLock(input.gameId, verify) : verify();
+}
+
+async function verifyGameResultCore(
+  store: MatchStorePort,
+  input: SubmitResultInput,
+  ledger?: EvidenceStore,
 ): Promise<SubmitResultOutcome> {
   const { matchId, gameId, platform, username } = input;
+  const history = ledger ? await ledger.history(gameId) : [];
+  const latestDecision = history[history.length - 1];
+  if (latestDecision?.state === 'review_required') {
+    return {
+      ok: false,
+      status: 409,
+      error: 'Evidence requires operator review',
+      details: latestDecision.reason,
+    };
+  }
 
   // Fetch the match record
   const match = await store.findByGameId(gameId);
@@ -172,7 +197,43 @@ export async function verifyGameResult(
         details: error.message,
       };
     }
+    if (error instanceof AmbiguousEvidenceError) {
+      await ledger?.append({
+        matchId,
+        gameId,
+        state: 'review_required',
+        reason: error.message,
+        provider: error.evidence.provider,
+        evidence: error.evidence,
+        recordedAt: new Date().toISOString(),
+      });
+      return {
+        ok: false,
+        status: 409,
+        error: 'Evidence requires operator review',
+        details: error.message,
+      };
+    }
     throw error;
+  }
+
+  const provider = apiResult.evidence.provider;
+  const previousProvider = history
+    .slice()
+    .reverse()
+    .map((decision) => decision.provider ?? decision.evidence?.provider)
+    .find((decision) => decision !== undefined);
+  if (previousProvider && previousProvider !== provider) {
+    await ledger?.append({
+      matchId: match.matchId,
+      gameId,
+      state: 'provider_changed',
+      reason: 'Result provider changed',
+      provider,
+      previousProvider,
+      evidence: apiResult.evidence,
+      recordedAt: new Date().toISOString(),
+    });
   }
 
   // Retain only normalized fields used for the decision; raw provider data is
@@ -184,11 +245,44 @@ export async function verifyGameResult(
     matchId: match.matchId,
     gameId: apiResult.gameId,
     platform: match.platform,
+    provider,
     whitePlayer: apiResult.whitePlayer.trim().toLowerCase(),
     blackPlayer: apiResult.blackPlayer.trim().toLowerCase(),
     result: apiResult.result,
     status: apiResult.status,
   };
+
+  const submissionTime = Date.now();
+  const gameEndTime = apiResult.endedAt ? Date.parse(apiResult.endedAt) : NaN;
+  if (
+    apiResult.result === null ||
+    apiResult.status !== 'finished' ||
+    !Number.isFinite(gameEndTime) ||
+    submissionTime < gameEndTime
+  ) {
+    const details =
+      apiResult.result === null || apiResult.status !== 'finished'
+        ? `Provider ${provider} has not confirmed that the game is finished.`
+        : !Number.isFinite(gameEndTime)
+          ? `Provider ${provider} did not supply a valid game end time.`
+          : `Submission time ${new Date(submissionTime).toISOString()} precedes provider game end time ${apiResult.endedAt}.`;
+    const reason = `Result submission timing violation: ${details}`;
+    await ledger?.append({
+      matchId: match.matchId,
+      gameId,
+      state: 'in_progress',
+      reason,
+      provider,
+      evidence: apiResult.evidence,
+      recordedAt: new Date(submissionTime).toISOString(),
+    });
+    return {
+      ok: false,
+      status: 425,
+      error: 'Result submission timing violation',
+      details,
+    };
+  }
 
   // Build the identity map from the match record
   const identityMap: PlayerIdentityMap = {
@@ -203,6 +297,15 @@ export async function verifyGameResult(
   const verification = verifyPlayerIdentities(match, apiResult, identityMap);
   if (!verification.valid) {
     await store.saveSettlementEvidence({ ...evidence, decision: 'player_identity_mismatch' });
+    await ledger?.append({
+      matchId: match.matchId,
+      gameId,
+      state: 'review_required',
+      reason: 'Player identity verification failed',
+      provider,
+      evidence: apiResult.evidence,
+      recordedAt: evidence.evaluatedAt,
+    });
     return {
       ok: false,
       status: errorToHttpStatus(new ValidationError('Player identity verification failed')),
@@ -219,6 +322,15 @@ export async function verifyGameResult(
   const identityHashCheck = verifyIdentityHash(match);
   if (!identityHashCheck.valid) {
     await store.saveSettlementEvidence({ ...evidence, decision: 'identity_hash_mismatch' });
+    await ledger?.append({
+      matchId: match.matchId,
+      gameId,
+      state: 'review_required',
+      reason: 'Identity hash verification failed',
+      provider,
+      evidence: apiResult.evidence,
+      recordedAt: evidence.evaluatedAt,
+    });
     return {
       ok: false,
       status: errorToHttpStatus(new ValidationError('Identity hash verification failed')),
@@ -227,7 +339,88 @@ export async function verifyGameResult(
     };
   }
 
-  await store.saveSettlementEvidence({ ...evidence, decision: 'verified' });
+  if (apiResult.result !== null) {
+    const previousVerifiedFromOtherProvider = history
+      .slice()
+      .reverse()
+      .find((decision) => {
+        const decisionProvider =
+          decision.provider ?? decision.evidence?.provider;
+        return (
+          decision.state === 'verified' &&
+          decisionProvider !== undefined &&
+          decisionProvider !== provider &&
+          decision.evidence?.outcome !== undefined &&
+          decision.evidence.outcome !== null
+        );
+      });
+    const conflictingProvider =
+      previousVerifiedFromOtherProvider?.provider ??
+      previousVerifiedFromOtherProvider?.evidence?.provider;
+    const conflictingOutcome =
+      previousVerifiedFromOtherProvider?.evidence?.outcome;
+    if (
+      conflictingProvider !== undefined &&
+      conflictingOutcome !== undefined &&
+      conflictingOutcome !== null &&
+      conflictingOutcome !== apiResult.result
+    ) {
+      const reason =
+        `Provider outcome contradiction: ${conflictingProvider} reported ` +
+        `${conflictingOutcome}, while ${provider} reported ${apiResult.result}.`;
+      await ledger?.append({
+        matchId: match.matchId,
+        gameId,
+        state: 'review_required',
+        reason,
+        provider,
+        previousProvider: conflictingProvider,
+        evidence: apiResult.evidence,
+        previousEvidence: previousVerifiedFromOtherProvider.evidence,
+        recordedAt: evidence.evaluatedAt,
+      });
+      return {
+        ok: false,
+        status: 409,
+        error: 'Provider outcome contradiction',
+        details: reason,
+      };
+    }
+
+    const previousVerified = history
+      .slice()
+      .reverse()
+      .find((decision) => decision.state === 'verified');
+    if (
+      previousVerified?.evidence?.outcome !== undefined &&
+      previousVerified.evidence.outcome !== apiResult.result
+    ) {
+      await ledger?.append({
+        matchId: match.matchId,
+        gameId,
+        state: 'review_required',
+        reason: 'Provider outcome changed after verification',
+        provider,
+        evidence: apiResult.evidence,
+        recordedAt: evidence.evaluatedAt,
+      });
+      return {
+        ok: false,
+        status: 409,
+        error: 'Provider outcome changed after verification',
+      };
+    }
+    await store.saveSettlementEvidence({ ...evidence, decision: 'verified' });
+  }
+  const decisionId = await ledger?.append({
+    matchId: match.matchId,
+    gameId,
+    state: apiResult.result === null ? 'in_progress' : 'verified',
+    reason: apiResult.result === null ? 'Game is still in progress' : 'Result verified',
+    provider,
+    evidence: apiResult.evidence,
+    recordedAt: evidence.evaluatedAt,
+  });
 
   return {
     ok: true,
@@ -235,6 +428,8 @@ export async function verifyGameResult(
     matchId: match.matchId,
     gameId: apiResult.gameId,
     result: apiResult.result,
+    provider,
+    decisionId,
     whitePlayer: apiResult.whitePlayer,
     blackPlayer: apiResult.blackPlayer,
     status: apiResult.status,

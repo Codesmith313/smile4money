@@ -54,7 +54,10 @@ export class ChessPlatformPoller implements GamePoller {
           },
           this.evidence,
         );
-        if (!verified.ok)
+        if (!verified.ok) {
+          if (verified.status === 425) {
+            return { status: 'in_progress', reason: verified.error };
+          }
           return {
             status:
               verified.status === 409 || verified.status === 400
@@ -62,6 +65,7 @@ export class ChessPlatformPoller implements GamePoller {
                 : 'failed',
             reason: verified.error,
           };
+        }
         return verified.result === null
           ? { status: 'in_progress' }
           : {
