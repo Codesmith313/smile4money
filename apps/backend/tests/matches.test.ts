@@ -4,6 +4,7 @@ import express from 'express';
 import matchRouter from '../src/routes/matches.js';
 import jwt from 'jsonwebtoken';
 import axios from 'axios';
+import { clearGameValidationCache } from '../src/services/game-validation-cache.js';
 
 vi.mock('axios');
 const mockedAxios = vi.mocked(axios);
@@ -67,6 +68,7 @@ describe('POST /api/matches', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    clearGameValidationCache();
     app = createApp();
   });
 

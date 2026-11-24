@@ -7,6 +7,8 @@ import { providerMetadata } from './helpers/provider-metadata.js';
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import ChessPlatformPoller from '../src/services/game-poller.js';
+import { MatchStore } from '../src/store/match-store.js';
+import { MemoryEvidenceStore } from '../src/store/evidence-store.js';
 import type { PollJob } from '../src/services/polling.js';
 
 vi.mock('../src/fetchers/lichess.js', () => ({
@@ -91,6 +93,37 @@ describe('ChessPlatformPoller platform selection (#1721)', () => {
     expect(status.status).toBe('completed');
     expect(mockFetchChess).toHaveBeenCalledWith('alice', '123456789');
     expect(mockFetchLichess).not.toHaveBeenCalled();
+  });
+
+  it('retries polling when provider has not confirmed the game end time', async () => {
+    const matches = new MatchStore();
+    await matches.createMatch({
+      player1: 'G1',
+      player2: 'G2',
+      player1Username: 'alice',
+      player2Username: 'bob',
+      stakeAmount: 1,
+      token: 'XLM',
+      gameId: 'game-abc',
+      platform: 'lichess',
+    });
+    const evidence = new MemoryEvidenceStore();
+    const pollerWithEvidence = new ChessPlatformPoller(matches, evidence);
+    mockFetchLichess.mockResolvedValue({
+      gameId: 'game-abc',
+      ...providerMetadata('lichess', null),
+      status: 'in_progress',
+      whitePlayer: 'alice',
+      blackPlayer: 'bob',
+      result: null,
+    });
+
+    await expect(
+      pollerWithEvidence.poll(makeJob({ matchId: 0 })),
+    ).resolves.toMatchObject({
+      status: 'in_progress',
+      reason: 'Result submission timing violation',
+    });
   });
 
   it('fails immediately with a descriptive reason for an unrecognized platform, without calling either fetcher', async () => {

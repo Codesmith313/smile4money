@@ -81,6 +81,11 @@ describe('statusToErrorCode (#50)', () => {
     expect(statusToErrorCode(409)).toBe(ErrorCode.CONFLICT);
   });
 
+  it('maps 425 to CONFLICT', () => {
+    expect(statusToErrorCode(425)).toBe(ErrorCode.CONFLICT);
+    expect(userFacingErrorMessage(425)).toMatch(/provider.*game has ended/i);
+  });
+
   it('maps 429 to RATE_LIMITED', () => {
     expect(statusToErrorCode(429)).toBe(ErrorCode.RATE_LIMITED);
   });

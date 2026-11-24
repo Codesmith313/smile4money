@@ -2,6 +2,7 @@ import request from 'supertest';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import express from 'express';
 import axios from 'axios';
+import { clearGameValidationCache } from '../src/services/game-validation-cache.js';
 import validateGameRouter from '../src/routes/validate-game.js';
 
 vi.mock('axios');
@@ -39,6 +40,7 @@ const makeChessGame = (gameId: string, whiteResult: string, blackResult: string)
 
 beforeEach(() => {
   vi.clearAllMocks();
+  clearGameValidationCache();
 });
 
 describe('POST /api/validate-game', () => {
