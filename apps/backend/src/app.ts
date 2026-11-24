@@ -9,6 +9,7 @@ import historyRouter from './routes/oracle-history.js';
 import playerIdentityRouter from './routes/player-identity.js';
 import metricsRouter from './routes/metrics.js';
 import statusRouter from './routes/status.js';
+import adminCredentialsRouter from './routes/admin-credentials.js';
 import {
   ErrorCode,
   errorEnvelope,
@@ -86,6 +87,7 @@ app.use('/api/oracle/history', historyRouter);
 app.use('/api/oracle', oracleRouter);
 app.use('/api/player-identity', playerIdentityRouter);
 app.use('/status', statusRouter);
+app.use('/api/admin/credentials', adminCredentialsRouter);
 
 app.use((_req, res) => {
   res

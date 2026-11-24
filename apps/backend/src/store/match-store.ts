@@ -21,6 +21,18 @@ export interface MatchRecord {
    */
   identityHash?: string;
   evidence?: CanonicalSettlementEvidence;
+  /**
+   * Timestamp (epoch ms) at which the match result was submitted. Used as the
+   * anchor for the dispute window (#2115). Undefined until a result is
+   * submitted.
+   */
+  resultSubmittedAt?: number;
+  /**
+   * Timestamp (epoch ms) after which disputes are no longer accepted (#2115).
+   * Computed from `resultSubmittedAt` plus the configured dispute window
+   * duration. Undefined until a result is submitted.
+   */
+  disputeDeadline?: number;
 }
 
 export type MatchState = 'Pending' | 'Active' | 'PendingResult' | 'Completed' | 'Cancelled';

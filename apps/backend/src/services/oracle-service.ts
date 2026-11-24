@@ -15,6 +15,7 @@ import type { MatchStorePort } from '../store/match-store.js';
 import type { EvidenceStore } from '../store/evidence-store.js';
 import { withGameLock } from '../store/evidence-store.js';
 import logger from '../logger.js';
+import { logProviderInteraction } from '../lib/provider-request-logger.js';
 import { errorToHttpStatus, ValidationError, NotFoundError } from '../errors/errorToHttpStatus.js';
 
 export interface SubmitResultInput {
@@ -191,9 +192,25 @@ async function verifyGameResultCore(
   let apiResult;
   try {
     if (match.platform === 'lichess') {
-      apiResult = await fetchLichessResult(gameId);
+      apiResult = await logProviderInteraction(
+        {
+          provider: 'lichess',
+          operation: 'fetch_result',
+          request: { gameId },
+          context: { matchId: match.matchId, gameId },
+        },
+        () => fetchLichessResult(gameId),
+      );
     } else if (match.platform === 'chessdotcom') {
-      apiResult = await fetchChessDotComResult(username as string, gameId);
+      apiResult = await logProviderInteraction(
+        {
+          provider: 'chessdotcom',
+          operation: 'fetch_result',
+          request: { gameId, username },
+          context: { matchId: match.matchId, gameId },
+        },
+        () => fetchChessDotComResult(username as string, gameId),
+      );
     } else {
       return {
         ok: false,

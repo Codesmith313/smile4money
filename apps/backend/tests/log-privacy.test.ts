@@ -3,6 +3,11 @@ import express from "express";
 import request from "supertest";
 import logger from "../src/logger.js";
 import { requestLogging } from "../src/middleware/request-logging.js";
+import {
+  logProviderRequest,
+  logProviderResponse,
+} from "../src/provider-logging.js";
+import { rotateLogs } from "../src/log-rotation.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -94,4 +99,72 @@ it("redacts PII and sensitive values from error logs", () => {
     status: 598,
   });
   expect(JSON.parse(log.mock.calls[0][0]).error_code).toBeUndefined();
+});
+
+it("logs provider requests with a timestamp and sanitized parameters", () => {
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  logProviderRequest({
+    provider: "openai",
+    method: "POST",
+    url: "https://api.example.com/v1/chat?token=token-secret",
+    headers: { Authorization: "Bearer token-secret" },
+    body: {
+      model: "gpt-4",
+      apiKey: "token-secret",
+      walletAddress: "wallet-secret",
+      messages: [{ role: "user", content: "hello" }],
+    },
+  });
+
+  const entry = JSON.parse(log.mock.calls[0][0]);
+  expect(entry.message).toBe("provider_request");
+  expect(entry.provider).toBe("openai");
+  expect(entry.method).toBe("POST");
+  expect(entry.timestamp).toEqual(expect.any(String));
+  expect(Number.isNaN(Date.parse(entry.timestamp))).toBe(false);
+  expect(entry.params).toMatchObject({ model: "gpt-4" });
+  expect(log.mock.calls[0][0]).not.toMatch(/token-secret|wallet-secret/);
+});
+
+it("logs provider responses with status and sanitized body", () => {
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  logProviderResponse({
+    provider: "openai",
+    method: "POST",
+    url: "https://api.example.com/v1/chat",
+    status: 200,
+    durationMs: 42,
+    body: {
+      id: "chatcmpl-1",
+      token: "token-secret",
+      email: "person@example.com",
+      choices: [{ message: { content: "hi" } }],
+    },
+  });
+
+  const entry = JSON.parse(log.mock.calls[0][0]);
+  expect(entry.message).toBe("provider_response");
+  expect(entry.provider).toBe("openai");
+  expect(entry.status).toBe(200);
+  expect(entry.durationMs).toBe(42);
+  expect(entry.timestamp).toEqual(expect.any(String));
+  expect(entry.body).toMatchObject({ id: "chatcmpl-1" });
+  expect(log.mock.calls[0][0]).not.toMatch(
+    /token-secret|person@example\.com/,
+  );
+});
+
+it("rotates and archives logs using the configured retention", async () => {
+  vi.stubEnv("LOG_RETENTION_DAYS", "7");
+  vi.stubEnv("LOG_ARCHIVE_DIR", "/tmp/archive");
+  const rotate = vi.fn().mockResolvedValue({ rotated: true });
+  const result = await rotateLogs({ rotate });
+
+  expect(rotate).toHaveBeenCalledWith(
+    expect.objectContaining({
+      retentionDays: 7,
+      archiveDir: "/tmp/archive",
+    }),
+  );
+  expect(result.rotated).toBe(true);
 });

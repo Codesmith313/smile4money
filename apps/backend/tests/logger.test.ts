@@ -172,6 +172,110 @@ describe('Structured JSON Logger', () => {
     });
   });
 
+  // #2113 — provider request logging relies on the logger's sanitizer and
+  // rotation helpers to redact credentials and keep provider logs bounded.
+  describe('provider request logging support', () => {
+    it('redacts API keys, bearer tokens and sensitive query parameters', () => {
+      const sanitized = logger.sanitize({
+        apiKey: 'sk-live-1234567890',
+        api_key: 'sk-live-0987654321',
+        authorization: 'Bearer token-secret',
+        url: 'https://provider.test/v1/chat?api_key=sk-live-abcdef&token=token-secret&model=gpt',
+        headers: { 'X-Api-Key': 'sk-live-header', Accept: 'application/json' },
+      }) as Record<string, unknown>;
+
+      const serialized = JSON.stringify(sanitized);
+      expect(serialized).not.toMatch(/sk-live-1234567890|sk-live-0987654321|token-secret|sk-live-abcdef|sk-live-header/);
+      expect(sanitized).toHaveProperty('apiKey', '[REDACTED]');
+      expect(sanitized).toHaveProperty('api_key', '[REDACTED]');
+      expect(sanitized).toHaveProperty('authorization', '[REDACTED]');
+      expect(sanitized).toHaveProperty('url', expect.stringContaining('[REDACTED]'));
+      expect(sanitized).toHaveProperty('url', expect.stringContaining('model=gpt'));
+      expect(sanitized).toHaveProperty('headers', {
+        'X-Api-Key': '[REDACTED]',
+        Accept: 'application/json',
+      });
+    });
+
+    it('redacts nested provider request and response payloads', () => {
+      const sanitized = logger.sanitize({
+        provider: 'openai',
+        request: { body: { prompt: 'hello', apiKey: 'sk-live-nested' } },
+        response: { status: 200, body: { token: 'token-secret', text: 'ok' } },
+      }) as Record<string, any>;
+
+      expect(sanitized.provider).toBe('openai');
+      expect(sanitized.request.body.apiKey).toBe('[REDACTED]');
+      expect(sanitized.response.status).toBe(200);
+      expect(sanitized.response.body.token).toBe('[REDACTED]');
+      expect(sanitized.response.body.text).toBe('ok');
+    });
+
+    it('emits provider request logs with timestamp, provider, method, url and sanitized params', () => {
+      logger.info(
+        logger.sanitize({
+          provider: 'anthropic',
+          method: 'POST',
+          url: 'https://api.anthropic.test/v1/messages?api_key=sk-live-query',
+          params: { model: 'claude', apiKey: 'sk-live-params' },
+        }),
+        'provider_request',
+      );
+
+      const json = JSON.parse(logOutput.join('').trim());
+      expect(json).toMatchObject({
+        message: 'provider_request',
+        provider: 'anthropic',
+        method: 'POST',
+        params: { model: 'claude', apiKey: '[REDACTED]' },
+      });
+      expect(json.timestamp).toBeDefined();
+      expect(json.url).toContain('[REDACTED]');
+      expect(logOutput.join('')).not.toMatch(/sk-live-query|sk-live-params/);
+    });
+
+    it('emits provider response logs with status and sanitized body', () => {
+      logger.info(
+        logger.sanitize({
+          provider: 'openai',
+          status: 429,
+          body: { error: 'rate limited', authorization: 'Bearer token-secret' },
+        }),
+        'provider_response',
+      );
+
+      const json = JSON.parse(logOutput.join('').trim());
+      expect(json).toMatchObject({
+        message: 'provider_response',
+        provider: 'openai',
+        status: 429,
+        body: { error: 'rate limited', authorization: '[REDACTED]' },
+      });
+      expect(logOutput.join('')).not.toMatch(/token-secret/);
+    });
+
+    it('rotates provider logs once the configured size is exceeded', () => {
+      const rotated: string[] = [];
+      const rotation = logger.createRotation({
+        maxBytes: 64,
+        maxFiles: 2,
+        onRotate: (archive: string) => rotated.push(archive),
+      });
+
+      rotation.write('a'.repeat(40));
+      expect(rotated).toHaveLength(0);
+
+      rotation.write('b'.repeat(40));
+      expect(rotated).toHaveLength(1);
+      expect(rotation.currentSize()).toBeLessThanOrEqual(64);
+
+      rotation.write('c'.repeat(40));
+      rotation.write('d'.repeat(40));
+      expect(rotated.length).toBeLessThanOrEqual(2);
+      expect(rotation.archives()).toHaveLength(2);
+    });
+  });
+
   // #1722 — log level gating, which request-logging.ts relies on to keep
   // DEBUG-only output (including request bodies) out of production logs.
   describe('log level gating', () => {

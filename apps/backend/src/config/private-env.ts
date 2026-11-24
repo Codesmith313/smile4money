@@ -10,6 +10,7 @@ export interface PrivateEnv {
   deployerSecretKey: string | undefined;
   mainnetDeployerSecretKey: string | undefined;
   mongodbUrl: string | undefined;
+  credentialRotationAdminToken: string | undefined;
 }
 
 export const privateEnv: PrivateEnv = {
@@ -33,5 +34,8 @@ export const privateEnv: PrivateEnv = {
   },
   get mongodbUrl() {
     return process.env.MONGODB_URL;
+  },
+  get credentialRotationAdminToken() {
+    return process.env.CREDENTIAL_ROTATION_ADMIN_TOKEN;
   },
 };

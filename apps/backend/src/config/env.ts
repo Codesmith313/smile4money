@@ -48,6 +48,18 @@ const DEFAULT_SQLITE_POOL_SIZE = 5;
 const DEFAULT_SQLITE_POOL_IDLE_TIMEOUT_MS = 30 * 1000;
 
 /**
+ * Default grace period (seconds) during which old API credentials remain
+ * valid after a rotation (#2112). Defaults to 24 hours.
+ */
+const DEFAULT_CREDENTIAL_ROTATION_GRACE_SECONDS = 86_400;
+
+/**
+ * Default dispute window (seconds) after result submission during which a
+ * result may be disputed (#2115). Defaults to 1 hour.
+ */
+const DEFAULT_DISPUTE_WINDOW_SECONDS = 3_600;
+
+/**
  * Reads an optional string environment variable, falling back to a default.
  */
 function parseString(name: string, defaultValue: string): string {
@@ -362,6 +374,30 @@ export interface Env {
 
   /** Idle timeout in milliseconds for pooled SQLite connections (#2196). */
   sqlitePoolIdleTimeoutMs: number;
+
+  /**
+   * Grace period (in seconds) during which previously rotated API credentials
+   * are still accepted, so rotation causes no service interruption (#2112).
+   *
+   * Sourced from CREDENTIAL_ROTATION_GRACE_SECONDS. Defaults to 86400 when unset.
+   * Must be a positive integer.
+   */
+  credentialRotationGraceSeconds: number;
+
+  /**
+   * Shared secret required to invoke the credential rotation endpoint (#2112).
+   * Empty when unset; the rotation endpoint must refuse to run without it.
+   */
+  adminRotationToken: string;
+
+  /**
+   * Dispute window (in seconds) after result submission during which a player
+   * may challenge the result (#2115).
+   *
+   * Sourced from DISPUTE_WINDOW_SECONDS. Defaults to 3600 when unset.
+   * Must be a positive integer.
+   */
+  disputeWindowSeconds: number;
 }
 
 /**
@@ -428,6 +464,15 @@ function loadEnv(): Env {
     sqlitePoolIdleTimeoutMs: parsePositiveInt(
       'SQLITE_POOL_IDLE_TIMEOUT_MS',
       DEFAULT_SQLITE_POOL_IDLE_TIMEOUT_MS
+    ),
+    credentialRotationGraceSeconds: parsePositiveInt(
+      'CREDENTIAL_ROTATION_GRACE_SECONDS',
+      DEFAULT_CREDENTIAL_ROTATION_GRACE_SECONDS
+    ),
+    adminRotationToken: parseString('ADMIN_ROTATION_TOKEN', ''),
+    disputeWindowSeconds: parsePositiveInt(
+      'DISPUTE_WINDOW_SECONDS',
+      DEFAULT_DISPUTE_WINDOW_SECONDS
     ),
   };
 }
