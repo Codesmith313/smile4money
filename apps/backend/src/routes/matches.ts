@@ -5,6 +5,8 @@ import { authenticate } from '../middleware/auth.js';
 import {
   validateCreateMatchInput,
   createMatchForPlayer,
+  searchMatches,
+  getMatchStatistics,
 } from '../services/match-service.js';
 import {
   ErrorCode,
@@ -25,6 +27,36 @@ router.delete('/identities', async (req, res, next) => {
   } catch (err) {
     next(err);
   }
+});
+
+router.get('/statistics', async (req, res) => {
+  const player =
+    typeof req.query.player === 'string' ? req.query.player : undefined;
+
+  const result = await getMatchStatistics(store, { player });
+
+  if (!result.ok) {
+    return res
+      .status(result.status)
+      .json(errorEnvelope(statusToErrorCode(result.status), result.error));
+  }
+
+  return res.status(200).json(result.statistics);
+});
+
+router.get('/', async (req, res) => {
+  const result = await searchMatches(store, req.query);
+
+  if (!result.ok) {
+    return res
+      .status(result.status)
+      .json(errorEnvelope(statusToErrorCode(result.status), result.error));
+  }
+
+  return res.status(200).json({
+    matches: result.matches,
+    nextCursor: result.nextCursor,
+  });
 });
 
 router.post('/', async (req, res) => {

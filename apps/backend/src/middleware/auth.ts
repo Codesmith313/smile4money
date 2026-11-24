@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import jwt, { JsonWebTokenError, TokenExpiredError } from 'jsonwebtoken';
 import { ErrorCode, errorEnvelope } from '../errors/errorResponse.js';
 import { privateEnv } from '../config/private-env.js';
+import { logAuthFailure, logAuthSuccess } from '../audit/authAudit.js';
 
 /**
  * JWT_SECRET is used to sign and verify authentication tokens.
@@ -43,8 +44,16 @@ declare module 'express-serve-static-core' {
  * - 401 if token doesn't contain a valid address claim
  */
 export function authenticate(req: Request, res: Response, next: NextFunction) {
+  // Non-sensitive client identifier for audit context. The IP is used only for
+  // security auditing and is never included in client-facing responses.
+  const auditContext = {
+    path: req.originalUrl || req.path,
+    ip: req.ip,
+  };
+
   const auth = req.header('Authorization');
   if (!auth || !auth.startsWith('Bearer ')) {
+    logAuthFailure('missing_or_invalid_authorization_header', auditContext);
     return res.status(401).json(errorEnvelope(ErrorCode.UNAUTHORIZED, 'Missing or invalid Authorization header'));
   }
 
@@ -52,17 +61,22 @@ export function authenticate(req: Request, res: Response, next: NextFunction) {
   try {
     const payload = jwt.verify(token, SECRET) as { address?: string };
     if (!payload || typeof payload.address !== 'string') {
+      logAuthFailure('invalid_token_payload', auditContext);
       return res.status(401).json(errorEnvelope(ErrorCode.UNAUTHORIZED, 'Invalid token payload'));
     }
+    logAuthSuccess(payload.address, auditContext);
     req.address = payload.address;
     next();
   } catch (error) {
     if (error instanceof TokenExpiredError) {
+      logAuthFailure('token_expired', auditContext);
       return res.status(401).json(errorEnvelope(ErrorCode.UNAUTHORIZED, 'Token has expired'));
     }
     if (error instanceof JsonWebTokenError) {
+      logAuthFailure('invalid_token_signature', auditContext);
       return res.status(401).json(errorEnvelope(ErrorCode.UNAUTHORIZED, 'Invalid token'));
     }
+    logAuthFailure('unknown_authentication_error', auditContext);
     return res.status(401).json(errorEnvelope(ErrorCode.UNAUTHORIZED, 'Authentication failed'));
   }
 }
