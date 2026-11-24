@@ -8,7 +8,9 @@ import axios from 'axios';
 import { getChessDotComLimiterSingleton } from '../services/bottleneck-limiters.js';
 import logger from '../logger.js';
 import { RateLimitError } from '../errors/RateLimitError.js';
+import { ProviderFetchError } from './provider-validation.js';
 import type { MatchResult, GameResult } from './lichess.js';
+import { traceHeaders } from '../tracing/trace-context.js';
 
 export { GameNotFoundError } from './lichess.js';
 export { RateLimitError } from '../errors/RateLimitError.js';
@@ -84,6 +86,7 @@ async function fetchArchive(
     try {
       const response = await axios.get(url, {
         timeout: 10_000,
+        headers: traceHeaders(),
         validateStatus: (s) => s < 500,
       });
 
@@ -93,6 +96,13 @@ async function fetchArchive(
 
       if (response.status === 429) {
         throw new RateLimitError('Chess.com API rate limit exceeded (429)');
+      }
+
+      if (response.status === 408 || response.status >= 500) {
+        throw new ProviderFetchError(
+          'unavailable',
+          `Chess.com API unavailable: ${response.status}`,
+        );
       }
 
       if (response.status !== 200) {
@@ -110,6 +120,17 @@ async function fetchArchive(
       }
       return response.data.games;
     } catch (error) {
+      if (
+        axios.isAxiosError(error) &&
+        (error.response === undefined ||
+          error.response.status === 408 ||
+          error.response.status >= 500)
+      ) {
+        throw new ProviderFetchError(
+          'unavailable',
+          'Chess.com API unavailable; retry later',
+        );
+      }
       const message = error instanceof Error ? error.message : 'Unknown error';
       logger.error(
         { username, year, month, url, error: message },

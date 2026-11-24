@@ -14,15 +14,12 @@ export interface Decision {
   id?: number;
   matchId: number;
   gameId: string;
-  state:
-    | 'review_required'
-    | 'verified'
-    | 'in_progress'
-    | 'retry_requested'
-    | 'operator_decided';
+  state: 'review_required' | 'verified' | 'in_progress' | 'retry_requested' | 'provider_changed';
   reason: string;
+  provider?: Evidence['provider'];
+  previousProvider?: Evidence['provider'];
   evidence?: Evidence;
-  operatorDecision?: OperatorDecision;
+  previousEvidence?: Evidence;
   recordedAt: string;
   operator?: string;
 }
@@ -30,6 +27,21 @@ export interface EvidenceStore {
   history(gameId: string): Promise<Decision[]>;
   query(options?: { gameId?: string; startTime?: number; endTime?: number }): Promise<Decision[]>;
   append(decision: Decision): Promise<number>;
+}
+
+function validateDecision(decision: Decision): void {
+  if (!decision.reason.trim()) {
+    throw new Error('Decision reason is required');
+  }
+  if (
+    !Number.isFinite(Date.parse(decision.recordedAt)) ||
+    new Date(decision.recordedAt).toISOString() !== decision.recordedAt
+  ) {
+    throw new Error('A valid ISO 8601 timestamp is required for decisions');
+  }
+  if (decision.state === 'retry_requested' && !decision.operator?.trim()) {
+    throw new Error('Operator identity is required for operator decisions');
+  }
 }
 
 export class MemoryEvidenceStore implements EvidenceStore {
@@ -58,6 +70,7 @@ export class MemoryEvidenceStore implements EvidenceStore {
       .map((entry) => structuredClone(entry));
   }
   async append(decision: Decision): Promise<number> {
+    validateDecision(decision);
     const id = this.entries.length + 1;
     this.entries.push(structuredClone({ ...decision, id }));
     return id;
@@ -119,6 +132,7 @@ export class SqliteEvidenceStore implements EvidenceStore {
   }
   async append(decision: Decision): Promise<number> {
     if (!this.db) throw new Error('Evidence store not initialized');
+    validateDecision(decision);
     return new Promise((resolve, reject) =>
       this.db!.run(
         'INSERT INTO oracle_decisions(gameId, decision) VALUES (?, ?)',

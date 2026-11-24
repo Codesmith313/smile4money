@@ -42,6 +42,7 @@ import { createHash } from 'node:crypto';
 import { randomBytes } from 'node:crypto';
 import { Keypair } from '@stellar/stellar-sdk';
 import axios from 'axios';
+import { traceHeaders } from '../tracing/trace-context.js';
 import type { GameResult } from '../fetchers/lichess.js';
 import type { MatchRecord } from '../store/match-store.js';
 
@@ -79,7 +80,10 @@ async function verifyChessProfile(platform: string, username: string, profilePro
   const url = platform === 'lichess'
     ? `https://lichess.org/api/user/${encodeURIComponent(username)}`
     : `https://api.chess.com/pub/player/${encodeURIComponent(username)}`;
-  const response = await axios.get(url, { timeout: 10_000, headers: { Accept: 'application/json' } });
+  const response = await axios.get(url, {
+    timeout: 10_000,
+    headers: { Accept: 'application/json', ...traceHeaders() },
+  });
   const account = response.data as { username?: string; id?: string; profile?: { bio?: string }; location?: string };
   const returnedUsername = account.username ?? account.id;
   if (!returnedUsername || returnedUsername.toLowerCase() !== username.toLowerCase()) return false;

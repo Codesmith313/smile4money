@@ -63,12 +63,53 @@ describe("SQLite schema migrations", () => {
     );
   });
 
+  it("makes oracle decisions append-only and prevents rolling back that protection", async () => {
+    db = new sqlite3.Database(":memory:");
+    const migrations = SQLITE_SCHEMA_MIGRATIONS["oracle-evidence"];
+    await applySqliteMigrations(db, migrations);
+    await new Promise<void>((resolve, reject) =>
+      db!.run(
+        "INSERT INTO oracle_decisions(gameId, decision) VALUES ('game', '{}')",
+        (error) => (error ? reject(error) : resolve()),
+      ),
+    );
+
+    const run = (sql: string) =>
+      new Promise<void>((resolve, reject) =>
+        db!.run(sql, (error) => (error ? reject(error) : resolve())),
+      );
+    await expect(
+      run("UPDATE oracle_decisions SET decision = '{\"changed\":true}'"),
+    ).rejects.toThrow("oracle decisions are immutable");
+    await expect(run("DELETE FROM oracle_decisions")).rejects.toThrow(
+      "oracle decisions are immutable",
+    );
+    await expect(rollbackSqliteMigrations(db, migrations, 2)).rejects.toThrow(
+      "has no down statements to roll back",
+    );
+
+    const row = await new Promise<{ decision: string }>((resolve, reject) =>
+      db!.get(
+        "SELECT decision FROM oracle_decisions WHERE gameId = 'game'",
+        (error, result: { decision: string }) =>
+          error ? reject(error) : resolve(result),
+      ),
+    );
+    expect(row.decision).toBe("{}");
+  });
+
   it("applies and rolls back every registered SQLite migration set", async () => {
     for (const migrations of Object.values(SQLITE_SCHEMA_MIGRATIONS)) {
       const database = new sqlite3.Database(":memory:");
       try {
         const applied = await applySqliteMigrations(database, migrations);
         expect(applied.currentVersion).toBe(migrations.length);
+        if (migrations.some((migration) => !migration.down?.length)) {
+          await expect(
+            rollbackSqliteMigrations(database, migrations, 0),
+          ).rejects.toThrow("has no down statements to roll back");
+          continue;
+        }
         const rolledBack = await rollbackSqliteMigrations(
           database,
           migrations,
@@ -82,5 +123,29 @@ describe("SQLite schema migrations", () => {
         );
       }
     }
+  });
+
+  it("adds and backfills the provider column in settlement evidence", async () => {
+    db = new sqlite3.Database(":memory:");
+    const migrations = SQLITE_SCHEMA_MIGRATIONS["match-store"];
+    await applySqliteMigrations(db, migrations.slice(0, 3));
+    await new Promise<void>((resolve, reject) =>
+      db!.run(
+        `INSERT INTO settlement_evidence
+          (matchId, parserVersion, evaluatedAt, gameId, platform, whitePlayer, blackPlayer, result, status, decision)
+         VALUES (1, 'v1', '2026-01-01T00:00:00.000Z', 'game', 'lichess', 'alice', 'bob', 'Player1Wins', 'mate', 'verified')`,
+        (error) => (error ? reject(error) : resolve()),
+      ),
+    );
+    await applySqliteMigrations(db, migrations);
+
+    const result = await new Promise<{ provider: string }>((resolve, reject) =>
+        db!.all(
+          "SELECT provider FROM settlement_evidence WHERE gameId = 'game'",
+          (error, rows: Array<{ provider: string }>) =>
+            error ? reject(error) : resolve(rows[0]),
+        ),
+    );
+    expect(result.provider).toBe("lichess");
   });
 });

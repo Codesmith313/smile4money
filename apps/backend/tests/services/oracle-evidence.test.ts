@@ -67,7 +67,11 @@ describe('durable oracle evidence and operator review', () => {
         data: { ...payload, status: 'started', winner: undefined },
       })
       .mockResolvedValue({ status: 200, data: payload });
-    expect((await verifyGameResult(matches, input, ledger)).ok).toBe(true);
+    expect(await verifyGameResult(matches, input, ledger)).toMatchObject({
+      ok: false,
+      status: 425,
+      error: 'Result submission timing violation',
+    });
     const result = await verifyGameResult(matches, input, ledger);
     expect(result.ok).toBe(true);
     await ledger.close();
@@ -75,6 +79,7 @@ describe('durable oracle evidence and operator review', () => {
     await ledger.initialize();
     const history = await ledger.history('game');
     expect(history.map((d) => d.state)).toEqual(['in_progress', 'verified']);
+    expect(history[1].provider).toBe('lichess');
     expect(history[1].evidence).toMatchObject({
       provider: 'lichess',
       parserVersion: '2',
@@ -150,7 +155,13 @@ describe('durable oracle evidence and operator review', () => {
       'retry_requested',
       'verified',
     ]);
-    expect(history[1].operator).toBe('operator');
+    expect(history[1]).toMatchObject({
+      operator: 'operator',
+      reason: 'Provider corrected evidence',
+      recordedAt: expect.stringMatching(
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+      ),
+    });
   });
   it('re-fetches provider data on rollback and preserves prior decisions', async () => {
     const recordedAt = '2025-01-01T10:00:00.000Z';

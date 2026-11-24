@@ -67,6 +67,7 @@ export interface CanonicalSettlementEvidence {
   matchId: number;
   gameId: string;
   platform: string;
+  provider: 'lichess' | 'chessdotcom';
   whitePlayer: string;
   blackPlayer: string;
   result: string | null;

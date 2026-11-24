@@ -8,8 +8,8 @@
  * the business logic can be tested independently of HTTP concerns.
  */
 
-import { fetchLichessResult, GameNotFoundError } from '../fetchers/lichess.js';
-import { fetchChessDotComResult } from '../fetchers/chessdotcom.js';
+import { GameNotFoundError } from '../fetchers/lichess.js';
+import { getCachedProviderGameResult } from './game-validation-cache.js';
 import type { MatchRecord } from '../store/match-store.js';
 import type { MatchStorePort } from '../store/match-store.js';
 import { errorToHttpStatus, ValidationError, ConflictError } from '../errors/errorToHttpStatus.js';
@@ -98,7 +98,7 @@ export async function validateGameExists(
 ): Promise<GameValidationResult> {
   try {
     if (platform === 'lichess') {
-      await fetchLichessResult(gameId);
+      await getCachedProviderGameResult('lichess', gameId);
       return { valid: true };
     } else if (platform === 'chessdotcom') {
       if (!username || username.length === 0) {
@@ -107,7 +107,7 @@ export async function validateGameExists(
           error: 'username is required for chessdotcom game validation',
         };
       }
-      await fetchChessDotComResult(username, gameId);
+      await getCachedProviderGameResult('chessdotcom', gameId, username);
       return { valid: true };
     }
     return { valid: false, error: 'invalid platform' };
@@ -134,13 +134,13 @@ export async function getGameResultWithPlayerIdentities(
 ): Promise<PlayerIdentityResult> {
   try {
     if (platform === 'lichess') {
-      const result = await fetchLichessResult(gameId);
+      const result = await getCachedProviderGameResult('lichess', gameId);
       return { whitePlayer: result.whitePlayer, blackPlayer: result.blackPlayer };
     } else if (platform === 'chessdotcom') {
       if (!username || username.length === 0) {
         return { error: 'username is required for chessdotcom' };
       }
-      const result = await fetchChessDotComResult(username, gameId);
+      const result = await getCachedProviderGameResult('chessdotcom', gameId, username);
       return { whitePlayer: result.whitePlayer, blackPlayer: result.blackPlayer };
     }
     return { error: 'invalid platform' };

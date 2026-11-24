@@ -70,24 +70,12 @@ Alerting: `critical` and `error` entries raise alerts; `warning` and `info` are
 recorded for filtering only. Route alerts through the existing logger/queue
 alerting hooks so severity drives whether an operator is paged.
 
-### Match-state webhooks
+### HTTP metrics
 
-Authenticated match participants can manage subscriptions at `GET /api/webhooks`,
-`POST /api/webhooks` (`{ "matchId": 12, "url": "https://hooks.example/events" }`),
-and `DELETE /api/webhooks/:id`. Subscription URLs must be public HTTPS endpoints.
-The POST response includes a 256-bit signing secret once; subsequent list responses
-never expose it.
-
-The backend polls escrow state when `STELLAR_RPC_URL`,
-`STELLAR_NETWORK_PASSPHRASE`, `ORACLE_SECRET_KEY`, and `CONTRACT_ESCROW` are
-configured. `MATCH_STATE_SYNC_INTERVAL_MS` controls the interval (1000-300000 ms,
-default 15000). State changes are persisted with their delivery outbox in the
-match-store database. Failed deliveries retry with exponential backoff; after
-eight unsuccessful attempts they are retained as terminal failures.
-
-Events use `match.state_changed` and include the previous and current states.
-Requests carry `X-Smile4Money-Event`, `X-Smile4Money-Timestamp`, and
-`X-Smile4Money-Signature` headers. The signature is
-`sha256=<hex HMAC-SHA256(secret, timestamp + "." + exact_request_body)>`.
-Consumers should verify the signature against the unmodified request body and
-reject stale timestamps to prevent replay.
+Scrape `GET /metrics` for Prometheus-format HTTP request totals and response
+duration histograms, labeled by method, route template, and status code. The
+scrape endpoint itself is excluded. The process also exposes exact p50, p90,
+p95, and p99 duration gauges over its most recent 10,000 completed requests;
+these gauges and counters reset when the process restarts. Histogram-based
+percentiles can be calculated across instances with, for example,
+`histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))`.

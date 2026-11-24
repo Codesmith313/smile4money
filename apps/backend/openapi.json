@@ -14,7 +14,7 @@
     "/health": {
       "get": {
         "operationId": "getHealth",
-        "summary": "Liveness, with an optional deep Stellar RPC check",
+        "summary": "Readiness, including database and Stellar RPC connectivity",
         "responses": {
           "200": {
             "description": "Healthy",
@@ -1000,14 +1000,22 @@
         "type": "object",
         "required": [
           "status",
+          "ready",
           "uptime",
-          "version"
+          "version",
+          "dependencies"
         ],
         "properties": {
           "status": {
             "type": "string",
             "enum": [
               "ok"
+            ]
+          },
+          "ready": {
+            "type": "boolean",
+            "enum": [
+              true
             ]
           },
           "uptime": {
@@ -1018,12 +1026,68 @@
           },
           "dependencies": {
             "type": "object",
+            "required": [
+              "database",
+              "stellar_rpc"
+            ],
             "properties": {
+              "database": {
+                "type": "object",
+                "required": [
+                  "status",
+                  "schemaVersion"
+                ],
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "ok"
+                    ]
+                  },
+                  "schemaVersion": {
+                    "type": "number"
+                  }
+                }
+              },
               "stellar_rpc": {
                 "type": "string",
                 "enum": [
                   "ok"
                 ]
+              }
+            }
+          },
+          "database": {
+            "type": "object",
+            "properties": {
+              "schemaVersion": {
+                "type": "number"
+              },
+              "integrity": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "database",
+                    "timestamp",
+                    "ok",
+                    "details"
+                  ],
+                  "properties": {
+                    "database": {
+                      "type": "string"
+                    },
+                    "timestamp": {
+                      "type": "number"
+                    },
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "details": {
+                      "type": "string"
+                    }
+                  }
+                }
               }
             }
           },
@@ -1228,6 +1292,15 @@
           "gameId": {
             "type": "string"
           },
+          "stale": {
+            "type": "boolean",
+            "description": "True when returned from cache because the provider is unavailable."
+          },
+          "cacheAgeMs": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Age of the cached result in milliseconds when stale is true."
+          },
           "status": {
             "type": "string"
           },
@@ -1263,6 +1336,15 @@
           },
           "message": {
             "type": "string"
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "True when eligibility was evaluated from cached provider data."
+          },
+          "cacheAgeMs": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Age of the cached result in milliseconds when stale is true."
           },
           "error": {
             "type": "object",

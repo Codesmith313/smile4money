@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { listDlqEntries } from "../queue.js";
+import { httpMetrics, type HttpMetrics } from "../services/http-metrics.js";
 import type { DlqEntry } from "../store/persistent-queue-store.js";
 
 const RETRY_ATTEMPT_BUCKETS = [0, 1, 2, 3, 5, 10, 25, 50, 100];
@@ -58,7 +58,11 @@ export function renderDlqMetrics(
 }
 
 export function createMetricsRouter(
-  loadEntries: () => Promise<DlqEntry[]> = listDlqEntries,
+  loadEntries: () => Promise<DlqEntry[]> = async () => {
+    const { listDlqEntries } = await import("../queue.js");
+    return listDlqEntries();
+  },
+  metrics: HttpMetrics = httpMetrics,
 ) {
   const router = Router();
 
@@ -66,7 +70,9 @@ export function createMetricsRouter(
     try {
       const entries = await loadEntries();
       res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
-      return res.status(200).send(renderDlqMetrics(entries));
+      return res
+        .status(200)
+        .send(`${metrics.render()}${renderDlqMetrics(entries)}`);
     } catch (error) {
       return next(error);
     }

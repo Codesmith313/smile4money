@@ -1,5 +1,6 @@
 import axios from 'axios';
 import logger from '../logger.js';
+import { traceHeaders } from '../tracing/trace-context.js';
 
 export type ProviderFailureKind =
   | 'unavailable'
@@ -31,7 +32,10 @@ export async function providerGet(
   options: Parameters<typeof axios.get>[1],
 ) {
   try {
-    return await axios.get(url, options);
+    return await axios.get(url, {
+      ...options,
+      headers: { ...options?.headers, ...traceHeaders() },
+    });
   } catch {
     // Axios errors can contain authorization headers and raw response bodies.
     throw new ProviderFetchError(

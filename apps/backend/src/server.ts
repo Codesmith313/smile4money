@@ -3,16 +3,17 @@ dotenv.config();
 
 import { app } from './app.js';
 import { initializeQueue, closeQueue, startRetryWorker, startDlqEvictionTask, listDlqEntries, writeToDlq, type DlqEntry } from './queue.js';
-import { closeMatchStore, initializeMatchStore, matchStore } from './store/index.js';
-import { initializeCircuitBreaker, closeCircuitBreakerStore } from './services/circuit-breaker.js';
+import { initializeMatchStore, matchStore } from './store/index.js';
+import {
+  circuitBreakerConfigFromEnv,
+  initializeCircuitBreaker,
+  closeCircuitBreakerStore,
+} from './services/circuit-breaker.js';
 import { PollingJobStore, PollingWorker, parsePollingIntervalMs } from './services/polling.js';
 import ChessPlatformPoller from './services/game-poller.js';
 import { getCurrentLedger } from './services/stellar.js';
-import {
-  retryDlqSubmission,
-  SorobanSettlementClient,
-  type OracleSubmission,
-} from './services/oracle-submit.js';
+import { retryDlqSubmission, type OracleSubmission } from './services/oracle-submit.js';
+import { initializeValidateGameCache } from './services/validate-game-service.js';
 import { createShutdownHandler } from './shutdown.js';
 import { resolveNetworkConfig } from './config/network.js';
 import { startMatchStateSync } from './services/match-state-sync.js';
@@ -68,6 +69,8 @@ async function retryOracleSubmission(entry: DlqEntry): Promise<void> {
 
 async function main() {
   try {
+    initializeValidateGameCache();
+
     // #118 — fail fast on a network identity conflict (e.g. mainnet with the
     // testnet RPC, or another network's contract id) before touching any store.
     const network = resolveNetworkConfig(process.env);
@@ -108,7 +111,7 @@ async function main() {
     // Initialize the circuit breaker with SQLite-backed persistence (#1716),
     // restoring its prior state (or resetting to CLOSED if it went stale
     // while this process was down) before the retry worker starts using it.
-    await initializeCircuitBreaker();
+    await initializeCircuitBreaker(circuitBreakerConfigFromEnv());
     logger.info('Circuit breaker initialized');
 
     // Review-only monitor: compares settled outcomes with independent provider evidence.

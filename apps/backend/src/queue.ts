@@ -507,7 +507,10 @@ export function startRetryWorker(
       return;
     }
 
-    const batchSize = parseBatchSize(process.env.DLQ_BATCH_SIZE);
+    const batchSize =
+      breaker.getState() === CircuitState.HALF_OPEN
+        ? 1
+        : parseBatchSize(process.env.DLQ_BATCH_SIZE);
     const batch = entries.slice(0, batchSize);
 
     logger.info(

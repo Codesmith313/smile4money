@@ -17,7 +17,7 @@
  * resets to CLOSED on every restart, same as before this was added.
  */
 
-import { SqliteCircuitBreakerStore } from '../store/sqlite-circuit-breaker-store.js';
+import type { SqliteCircuitBreakerStore } from '../store/sqlite-circuit-breaker-store.js';
 import logger from '../logger.js';
 
 export enum CircuitState {
@@ -77,6 +77,23 @@ const DEFAULT_CONFIG: CircuitBreakerConfig = {
   successThreshold: 2,
 };
 
+export function circuitBreakerConfigFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): Partial<CircuitBreakerConfig> {
+  const raw = env.RPC_CIRCUIT_BREAKER_FAILURE_THRESHOLD;
+  if (raw === undefined || raw.trim() === "") {
+    return {};
+  }
+
+  const failureThreshold = Number(raw);
+  if (!Number.isSafeInteger(failureThreshold) || failureThreshold < 1) {
+    throw new Error(
+      "RPC_CIRCUIT_BREAKER_FAILURE_THRESHOLD must be a positive integer",
+    );
+  }
+  return { failureThreshold };
+}
+
 /**
  * Circuit breaker for protecting against cascading RPC failures.
  */
@@ -87,6 +104,7 @@ export class CircuitBreaker {
   private lastFailureTime: number | null = null;
   private openedAt: number | null = null;
   private attemptCount: number = 0;
+  private halfOpenProbeInFlight = false;
   private config: CircuitBreakerConfig;
 
   constructor(config?: Partial<CircuitBreakerConfig>) {
@@ -208,6 +226,7 @@ export class CircuitBreaker {
     this.lastFailureTime = persisted.lastFailureTime;
     this.openedAt = persisted.openedAt;
     this.attemptCount = persisted.attemptCount;
+    this.halfOpenProbeInFlight = false;
 
     if (this.state === CircuitState.OPEN || this.state === CircuitState.HALF_OPEN) {
       const referenceTime = this.openedAt ?? this.lastFailureTime;
@@ -232,6 +251,7 @@ export class CircuitBreaker {
    */
   recordSuccess(): void {
     if (this.state === CircuitState.HALF_OPEN) {
+      this.halfOpenProbeInFlight = false;
       this.successCount += 1;
 
       if (this.successCount >= this.config.successThreshold) {
@@ -256,6 +276,7 @@ export class CircuitBreaker {
 
     if (this.state === CircuitState.HALF_OPEN) {
       // Failure in half-open resets to open
+      this.halfOpenProbeInFlight = false;
       this.transitionState(CircuitState.OPEN);
       this.successCount = 0;
       this.attemptCount += 1;
@@ -289,6 +310,10 @@ export class CircuitBreaker {
     }
 
     if (this.state === CircuitState.HALF_OPEN) {
+      if (this.halfOpenProbeInFlight) {
+        return false;
+      }
+      this.halfOpenProbeInFlight = true;
       return true;
     }
 
@@ -301,6 +326,7 @@ export class CircuitBreaker {
         this.transitionState(CircuitState.HALF_OPEN);
         this.successCount = 0;
         this.failureCount = 0;
+        this.halfOpenProbeInFlight = true;
         this.persist();
         return true;
       }
@@ -319,6 +345,7 @@ export class CircuitBreaker {
     this.lastFailureTime = null;
     this.openedAt = null;
     this.attemptCount = 0;
+    this.halfOpenProbeInFlight = false;
     this.persist();
   }
 
@@ -383,16 +410,23 @@ export function resetCircuitBreaker(): void {
  */
 export async function initializeCircuitBreaker(
   config?: Partial<CircuitBreakerConfig>,
-  store: SqliteCircuitBreakerStore = new SqliteCircuitBreakerStore(),
+  store?: SqliteCircuitBreakerStore,
 ): Promise<CircuitBreaker> {
-  await store.initialize();
-  circuitBreakerStore = store;
+  let persistenceStore = store;
+  if (!persistenceStore) {
+    const { SqliteCircuitBreakerStore } = await import(
+      '../store/sqlite-circuit-breaker-store.js'
+    );
+    persistenceStore = new SqliteCircuitBreakerStore();
+  }
+  await persistenceStore.initialize();
+  circuitBreakerStore = persistenceStore;
 
   const breaker = new CircuitBreaker({
     ...config,
     onPersist: async (snapshot) => {
       try {
-        await store.save(snapshot);
+        await persistenceStore.save(snapshot);
       } catch (err) {
         logger.warn(
           { err: err instanceof Error ? err.message : String(err) },
@@ -403,7 +437,7 @@ export async function initializeCircuitBreaker(
     },
   });
 
-  const persisted = await store.load();
+  const persisted = await persistenceStore.load();
   if (persisted) {
     breaker.restoreState(persisted);
     logger.info(

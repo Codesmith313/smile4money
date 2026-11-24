@@ -71,39 +71,12 @@ export const SQLITE_SCHEMA_MIGRATIONS: Record<string, SqliteMigration[]> = {
     },
     {
       version: 4,
-      name: "create-match-webhook-outbox",
+      name: "add-settlement-evidence-provider",
       statements: [
-        `CREATE TABLE IF NOT EXISTS webhook_subscriptions (
-          id TEXT PRIMARY KEY NOT NULL,
-          matchId INTEGER NOT NULL,
-          owner TEXT NOT NULL,
-          url TEXT NOT NULL,
-          secret TEXT NOT NULL,
-          createdAt INTEGER NOT NULL,
-          UNIQUE(matchId, owner, url)
-        )`,
-        "CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_match ON webhook_subscriptions(matchId)",
-        `CREATE TABLE IF NOT EXISTS webhook_deliveries (
-          id TEXT PRIMARY KEY NOT NULL,
-          eventId TEXT NOT NULL,
-          subscriptionId TEXT NOT NULL,
-          url TEXT NOT NULL,
-          secret TEXT NOT NULL,
-          payload TEXT NOT NULL,
-          attempts INTEGER NOT NULL DEFAULT 0,
-          nextAttemptAt INTEGER NOT NULL,
-          deliveredAt INTEGER,
-          deadAt INTEGER,
-          lastError TEXT
-        )`,
-        "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_due ON webhook_deliveries(nextAttemptAt) WHERE deliveredAt IS NULL AND deadAt IS NULL",
+        "ALTER TABLE settlement_evidence ADD COLUMN provider TEXT",
+        "UPDATE settlement_evidence SET provider = platform WHERE provider IS NULL",
       ],
-      down: [
-        "DROP INDEX IF EXISTS idx_webhook_deliveries_due",
-        "DROP TABLE IF EXISTS webhook_deliveries",
-        "DROP INDEX IF EXISTS idx_webhook_subscriptions_match",
-        "DROP TABLE IF EXISTS webhook_subscriptions",
-      ],
+      down: ["ALTER TABLE settlement_evidence DROP COLUMN provider"],
     },
   ],
   "oracle-queue": [
@@ -206,6 +179,22 @@ export const SQLITE_SCHEMA_MIGRATIONS: Record<string, SqliteMigration[]> = {
         "CREATE INDEX IF NOT EXISTS oracle_decisions_game ON oracle_decisions(gameId, id)",
       ],
       down: ["DROP INDEX IF EXISTS oracle_decisions_game"],
+    },
+    {
+      version: 3,
+      name: "make-oracle-decisions-append-only",
+      statements: [
+        `CREATE TRIGGER IF NOT EXISTS oracle_decisions_no_update
+          BEFORE UPDATE ON oracle_decisions
+          BEGIN
+            SELECT RAISE(ABORT, 'oracle decisions are immutable');
+          END`,
+        `CREATE TRIGGER IF NOT EXISTS oracle_decisions_no_delete
+          BEFORE DELETE ON oracle_decisions
+          BEGIN
+            SELECT RAISE(ABORT, 'oracle decisions are immutable');
+          END`,
+      ],
     },
   ],
   settlement: [
