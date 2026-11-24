@@ -2,6 +2,7 @@ import { unlinkPlayerIdentities } from '../services/player-identity.js';
 import { Router } from 'express';
 import { matchStore } from '../store/index.js';
 import { authenticate } from '../middleware/auth.js';
+import { requirePermission, Permission } from '../middleware/permissions.js';
 import {
   validateCreateMatchInput,
   createMatchForPlayer,
@@ -18,7 +19,7 @@ const store = matchStore;
 
 router.use(authenticate);
 
-router.delete('/identities', async (req, res, next) => {
+router.delete('/identities', requirePermission(Permission.SUBMIT_RESULTS), async (req, res, next) => {
   try {
     await unlinkPlayerIdentities(store, req.address!);
     return res.status(204).end();
@@ -27,7 +28,7 @@ router.delete('/identities', async (req, res, next) => {
   }
 });
 
-router.post('/', async (req, res) => {
+router.post('/', requirePermission(Permission.SUBMIT_RESULTS), async (req, res) => {
   const payload = req.body;
   const player1 = req.address;
 
