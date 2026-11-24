@@ -47,6 +47,27 @@ const DEFAULT_SQLITE_POOL_SIZE = 5;
 /** Default idle timeout for pooled SQLite connections (30 seconds). */
 const DEFAULT_SQLITE_POOL_IDLE_TIMEOUT_MS = 30 * 1000;
 
+/** Default TTL (seconds) for cached provider results (#2109). */
+const DEFAULT_PROVIDER_RESULT_CACHE_TTL_SECONDS = 300;
+
+/** Default provider fallback chain, in query order (#2111). */
+const DEFAULT_PROVIDER_FALLBACK_CHAIN = 'lichess,chessdotcom';
+
+/** Default rolling window (ms) for provider health metrics (#2110). */
+const DEFAULT_PROVIDER_HEALTH_WINDOW_MS = 300_000;
+
+/** Default error-rate threshold that flags provider degradation (#2110). */
+const DEFAULT_PROVIDER_HEALTH_ERROR_RATE_THRESHOLD = 0.2;
+
+/** Default latency threshold (ms) that flags provider degradation (#2110). */
+const DEFAULT_PROVIDER_HEALTH_LATENCY_MS_THRESHOLD = 5000;
+
+/** Provider identifiers accepted in PROVIDER_FALLBACK_CHAIN (#2111). */
+const VALID_PROVIDERS = ['lichess', 'chessdotcom'] as const;
+
+/** A provider identifier accepted in the fallback chain. */
+export type ProviderName = (typeof VALID_PROVIDERS)[number];
+
 /**
  * Reads an optional string environment variable, falling back to a default.
  */
@@ -81,7 +102,23 @@ function parseString(name: string, defaultValue: string): string {
  * @throws {Error} when the value is non-numeric, zero, or negative.
  */
 function parsePositiveNumber(name: string, defaultValue: number): number {
-  return raw;
+  const raw = process.env[name];
+
+  if (raw === undefined || raw === '') {
+    return defaultValue;
+  }
+
+  const parsed = Number(raw);
+
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`${name} must be a positive number, got: "${raw}"`);
+  }
+
+  if (parsed <= 0) {
+    throw new Error(`${name} must be greater than zero, got: ${parsed}`);
+  }
+
+  return parsed;
 }
 
 /**
@@ -101,10 +138,6 @@ function parsePositiveInt(name: string, defaultValue: number): number {
     return defaultValue;
   }
 
-  const parsed = Number(raw);
-
-  if (!Number.isFinite(parsed)) {
-    throw new Error(`${name} must be a positive number, got: "${raw}"`);
   const parsed = parseInt(raw, 10);
 
   if (isNaN(parsed) || !Number.isInteger(parsed)) {
@@ -116,6 +149,53 @@ function parsePositiveInt(name: string, defaultValue: number): number {
   }
 
   return parsed;
+}
+
+/**
+ * Parses PROVIDER_FALLBACK_CHAIN into an ordered list of provider names.
+ *
+ * Rules:
+ *  - If the variable is absent or empty, the default chain is used.
+ *  - Entries are comma-separated, trimmed and lower-cased.
+ *  - Every entry must be a known provider; duplicates are rejected.
+ *
+ * @throws {Error} when the chain is empty or contains an unknown/duplicate entry.
+ */
+function parseProviderFallbackChain(): ProviderName[] {
+  const raw = process.env.PROVIDER_FALLBACK_CHAIN;
+
+  const entries = (raw === undefined || raw === ''
+    ? DEFAULT_PROVIDER_FALLBACK_CHAIN
+    : raw
+  )
+    .split(',')
+    .map((entry) => entry.trim().toLowerCase())
+    .filter((entry) => entry !== '');
+
+  if (entries.length === 0) {
+    throw new Error('PROVIDER_FALLBACK_CHAIN must contain at least one provider');
+  }
+
+  const seen = new Set<string>();
+
+  for (const entry of entries) {
+    if (!(VALID_PROVIDERS as readonly string[]).includes(entry)) {
+      throw new Error(
+        `PROVIDER_FALLBACK_CHAIN contains unknown provider "${entry}"; ` +
+          `expected one of: ${VALID_PROVIDERS.join(', ')}`
+      );
+    }
+
+    if (seen.has(entry)) {
+      throw new Error(
+        `PROVIDER_FALLBACK_CHAIN contains duplicate provider "${entry}"`
+      );
+    }
+
+    seen.add(entry);
+  }
+
+  return entries as ProviderName[];
 }
 
 /**
@@ -362,6 +442,50 @@ export interface Env {
 
   /** Idle timeout in milliseconds for pooled SQLite connections (#2196). */
   sqlitePoolIdleTimeoutMs: number;
+
+  /**
+   * TTL in seconds for cached, verified provider results (#2109).
+   *
+   * Sourced from PROVIDER_RESULT_CACHE_TTL_SECONDS. Defaults to 300 when unset.
+   * Must be a positive integer.
+   */
+  providerResultCacheTtlSeconds: number;
+
+  /**
+   * Ordered provider fallback chain used when the primary provider returns
+   * invalid data (#2111).
+   *
+   * Sourced from PROVIDER_FALLBACK_CHAIN. Defaults to
+   * "lichess,chessdotcom" when unset. Each entry must be a known provider.
+   */
+  providerFallbackChain: ProviderName[];
+
+  /**
+   * Rolling window in milliseconds over which provider health metrics are
+   * aggregated (#2110).
+   *
+   * Sourced from PROVIDER_HEALTH_WINDOW_MS. Defaults to 300000 when unset.
+   * Must be a positive integer.
+   */
+  providerHealthWindowMs: number;
+
+  /**
+   * Error-rate threshold (0..1) above which a provider is considered degraded
+   * and an alert is triggered (#2110).
+   *
+   * Sourced from PROVIDER_HEALTH_ERROR_RATE_THRESHOLD. Defaults to 0.2.
+   * Must be a positive number.
+   */
+  providerHealthErrorRateThreshold: number;
+
+  /**
+   * Latency threshold in milliseconds above which a provider is considered
+   * degraded and an alert is triggered (#2110).
+   *
+   * Sourced from PROVIDER_HEALTH_LATENCY_MS_THRESHOLD. Defaults to 5000.
+   * Must be a positive integer.
+   */
+  providerHealthLatencyMsThreshold: number;
 }
 
 /**
@@ -428,6 +552,23 @@ function loadEnv(): Env {
     sqlitePoolIdleTimeoutMs: parsePositiveInt(
       'SQLITE_POOL_IDLE_TIMEOUT_MS',
       DEFAULT_SQLITE_POOL_IDLE_TIMEOUT_MS
+    ),
+    providerResultCacheTtlSeconds: parsePositiveInt(
+      'PROVIDER_RESULT_CACHE_TTL_SECONDS',
+      DEFAULT_PROVIDER_RESULT_CACHE_TTL_SECONDS
+    ),
+    providerFallbackChain: parseProviderFallbackChain(),
+    providerHealthWindowMs: parsePositiveInt(
+      'PROVIDER_HEALTH_WINDOW_MS',
+      DEFAULT_PROVIDER_HEALTH_WINDOW_MS
+    ),
+    providerHealthErrorRateThreshold: parsePositiveNumber(
+      'PROVIDER_HEALTH_ERROR_RATE_THRESHOLD',
+      DEFAULT_PROVIDER_HEALTH_ERROR_RATE_THRESHOLD
+    ),
+    providerHealthLatencyMsThreshold: parsePositiveInt(
+      'PROVIDER_HEALTH_LATENCY_MS_THRESHOLD',
+      DEFAULT_PROVIDER_HEALTH_LATENCY_MS_THRESHOLD
     ),
   };
 }

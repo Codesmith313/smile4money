@@ -32,6 +32,7 @@ vi.mock('../src/logger.js', () => ({
 
 import { fetchLichessResult, GameNotFoundError } from '../src/fetchers/lichess.js';
 import { fetchChessDotComResult, RateLimitError } from '../src/fetchers/chessdotcom.js';
+import { ProviderHealthMonitor } from '../src/services/provider-health.js';
 
 const mockLichess = vi.mocked(fetchLichessResult);
 const mockChess = vi.mocked(fetchChessDotComResult);
@@ -113,6 +114,42 @@ describe('ChessPlatformPoller during an outage', () => {
       result: 'Player2Wins',
     });
     expect(await poller.poll(job())).toEqual({ status: 'completed', result: 'Player2Wins' });
+  });
+});
+
+describe('ChessPlatformPoller failover during an outage', () => {
+  it('falls back to Chess.com when Lichess is unavailable', async () => {
+    const health = new ProviderHealthMonitor();
+    const poller = new ChessPlatformPoller({ healthMonitor: health });
+    mockLichess.mockRejectedValue(new Error('Request failed with status code 503'));
+    mockChess.mockResolvedValue({
+      gameId: 'game-abc',
+      status: 'resign',
+      whitePlayer: 'alice',
+      blackPlayer: 'bob',
+      result: 'Player1Wins',
+    });
+
+    const status = await poller.poll(job({ platform: 'lichess' }));
+
+    expect(status).toEqual({ status: 'completed', result: 'Player1Wins' });
+    expect(mockChess).toHaveBeenCalledTimes(1);
+    expect(health.getMetrics('lichess')?.failureCount).toBeGreaterThanOrEqual(1);
+    expect(health.getMetrics('chessdotcom')?.successCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it('invents no result when both providers are unavailable', async () => {
+    const health = new ProviderHealthMonitor();
+    const poller = new ChessPlatformPoller({ healthMonitor: health });
+    mockLichess.mockRejectedValue(new Error('Request failed with status code 503'));
+    mockChess.mockRejectedValue(new Error('Request failed with status code 502'));
+
+    const status = await poller.poll(job({ platform: 'lichess' }));
+
+    expect(status.status).toBe('failed');
+    expect(status.result).toBeUndefined();
+    expect(health.getMetrics('lichess')?.failureCount).toBeGreaterThanOrEqual(1);
+    expect(health.getMetrics('chessdotcom')?.failureCount).toBeGreaterThanOrEqual(1);
   });
 });
 

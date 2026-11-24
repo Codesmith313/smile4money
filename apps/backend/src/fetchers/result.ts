@@ -1,5 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { GameResult, MatchResult } from './lichess.js';
+import {
+  recordProviderFailure,
+  recordProviderSuccess,
+} from '../services/health-service.js';
 
 export const PARSER_VERSION = '2';
 export interface Evidence {
@@ -43,6 +47,25 @@ export function evidenceFor(
     outcome: null,
     endedAt: null,
   };
+}
+
+/**
+ * Wrap a provider fetch so every call records success/failure and latency
+ * into the health-service for uptime and response-time monitoring.
+ */
+export async function instrumentProviderCall<T>(
+  provider: Evidence['provider'],
+  call: () => Promise<T>,
+): Promise<T> {
+  const startedAt = Date.now();
+  try {
+    const result = await call();
+    recordProviderSuccess(provider, Date.now() - startedAt);
+    return result;
+  } catch (error) {
+    recordProviderFailure(provider, Date.now() - startedAt);
+    throw error;
+  }
 }
 
 export function normalizeResult(

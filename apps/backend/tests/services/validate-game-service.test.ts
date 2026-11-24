@@ -11,6 +11,8 @@ import {
   validateGameInput,
   validateGame,
   resetValidateGameCache,
+  providerCacheConfigFromEnv,
+  providerFailoverConfigFromEnv,
 } from '../../src/services/validate-game-service.js';
 import { clearGameValidationCache } from '../../src/services/game-validation-cache.js';
 
@@ -76,6 +78,68 @@ describe('provider cache configuration', () => {
       }),
     ).toThrow('PROVIDER_CACHE_STALE_TOLERANCE_MS');
   });
+
+  it('uses the default TTL and validates overrides', () => {
+    expect(providerCacheConfigFromEnv({})).toMatchObject({
+      ttlMs: 60_000,
+    });
+    expect(
+      providerCacheConfigFromEnv({
+        PROVIDER_CACHE_TTL_MS: '15000',
+      }),
+    ).toMatchObject({ ttlMs: 15_000 });
+    expect(
+      providerCacheConfigFromEnv({
+        PROVIDER_CACHE_TTL_MS: '0',
+      }),
+    ).toMatchObject({ ttlMs: 0 });
+    expect(() =>
+      providerCacheConfigFromEnv({
+        PROVIDER_CACHE_TTL_MS: '-5',
+      }),
+    ).toThrow('PROVIDER_CACHE_TTL_MS');
+    expect(() =>
+      providerCacheConfigFromEnv({
+        PROVIDER_CACHE_TTL_MS: 'not-a-number',
+      }),
+    ).toThrow('PROVIDER_CACHE_TTL_MS');
+  });
+});
+
+describe('provider failover configuration', () => {
+  it('uses the default fallback chain', () => {
+    expect(providerFailoverConfigFromEnv({})).toEqual({
+      enabled: true,
+      fallbackChain: ['lichess', 'chessdotcom'],
+      flagConflicts: true,
+    });
+  });
+
+  it('parses a custom fallback chain', () => {
+    expect(
+      providerFailoverConfigFromEnv({
+        PROVIDER_FAILOVER_CHAIN: 'chessdotcom,lichess',
+      }),
+    ).toMatchObject({
+      fallbackChain: ['chessdotcom', 'lichess'],
+    });
+  });
+
+  it('can disable failover', () => {
+    expect(
+      providerFailoverConfigFromEnv({
+        PROVIDER_FAILOVER_ENABLED: 'false',
+      }),
+    ).toMatchObject({ enabled: false });
+  });
+
+  it('rejects unknown providers in the chain', () => {
+    expect(() =>
+      providerFailoverConfigFromEnv({
+        PROVIDER_FAILOVER_CHAIN: 'lichess,unknown',
+      }),
+    ).toThrow('PROVIDER_FAILOVER_CHAIN');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -128,6 +192,7 @@ describe('validateGame (lichess)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     clearGameValidationCache();
+    resetValidateGameCache();
   });
 
   it('returns ok:true with game details when lichess game exists', async () => {
@@ -193,6 +258,7 @@ describe('validateGame (chessdotcom)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     clearGameValidationCache();
+    resetValidateGameCache();
   });
 
   it('returns ok:true with game details when chess.com game exists', async () => {
@@ -245,6 +311,151 @@ describe('validateGame (chessdotcom)', () => {
     if (!result.ok) {
       expect(result.status).toBe(500);
       expect(result.message).toContain('Validation failed');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validateGame — provider response caching
+// ---------------------------------------------------------------------------
+describe('validateGame (provider cache)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearGameValidationCache();
+    resetValidateGameCache();
+  });
+
+  it('serves a cache hit without calling the provider again', async () => {
+    mockFetchLichess.mockResolvedValue(LICHESS_GAME);
+
+    const first = await validateGame({ gameId: 'abc123', platform: 'lichess' });
+    const second = await validateGame({ gameId: 'abc123', platform: 'lichess' });
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    expect(mockFetchLichess).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats different game ids as separate cache entries', async () => {
+    mockFetchLichess.mockResolvedValue(LICHESS_GAME);
+
+    await validateGame({ gameId: 'abc123', platform: 'lichess' });
+    await validateGame({ gameId: 'def456', platform: 'lichess' });
+
+    expect(mockFetchLichess).toHaveBeenCalledTimes(2);
+  });
+
+  it('revalidates stale entries before use', async () => {
+    vi.useFakeTimers();
+    try {
+      mockFetchLichess.mockResolvedValue(LICHESS_GAME);
+
+      await validateGame({ gameId: 'abc123', platform: 'lichess' });
+      expect(mockFetchLichess).toHaveBeenCalledTimes(1);
+
+      // Advance past the TTL so the cached entry is stale.
+      vi.advanceTimersByTime(120_000);
+
+      mockFetchLichess.mockResolvedValue({ ...LICHESS_GAME, result: 'Player2Wins' });
+      const refreshed = await validateGame({ gameId: 'abc123', platform: 'lichess' });
+
+      expect(mockFetchLichess).toHaveBeenCalledTimes(2);
+      expect(refreshed.ok).toBe(true);
+      if (refreshed.ok) {
+        expect(refreshed.result).toBe('Player2Wins');
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resetValidateGameCache clears cached provider results', async () => {
+    mockFetchLichess.mockResolvedValue(LICHESS_GAME);
+
+    await validateGame({ gameId: 'abc123', platform: 'lichess' });
+    expect(mockFetchLichess).toHaveBeenCalledTimes(1);
+
+    resetValidateGameCache();
+
+    await validateGame({ gameId: 'abc123', platform: 'lichess' });
+    expect(mockFetchLichess).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validateGame — provider failover
+// ---------------------------------------------------------------------------
+describe('validateGame (provider failover)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearGameValidationCache();
+    resetValidateGameCache();
+  });
+
+  it('queries the alternate provider when the primary returns invalid data', async () => {
+    mockFetchLichess.mockResolvedValue({ ...LICHESS_GAME, result: 'NotARealResult' as never });
+    mockFetchChess.mockResolvedValue(CHESS_GAME);
+
+    const result = await validateGame({ gameId: 'abc123', platform: 'lichess', username: 'alice' });
+
+    expect(mockFetchLichess).toHaveBeenCalledTimes(1);
+    expect(mockFetchChess).toHaveBeenCalledTimes(1);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.valid).toBe(true);
+      expect(result.platform).toBe('chessdotcom');
+    }
+  });
+
+  it('uses the result when both providers agree', async () => {
+    mockFetchLichess.mockResolvedValue(LICHESS_GAME);
+    mockFetchChess.mockResolvedValue(CHESS_GAME);
+
+    const result = await validateGame({ gameId: 'abc123', platform: 'lichess', username: 'alice' });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.valid).toBe(true);
+      expect(result.result).toBe('Player1Wins');
+      expect(result.conflict).toBeFalsy();
+    }
+  });
+
+  it('flags conflicting results for review', async () => {
+    mockFetchLichess.mockResolvedValue(LICHESS_GAME);
+    mockFetchChess.mockResolvedValue({ ...CHESS_GAME, result: 'Player2Wins' });
+
+    const result = await validateGame({ gameId: 'abc123', platform: 'lichess', username: 'alice' });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.conflict).toBe(true);
+      expect(result.needsReview).toBe(true);
+    }
+  });
+
+  it('falls back to the alternate provider when the primary is not found', async () => {
+    mockFetchLichess.mockRejectedValue(new GameNotFoundError('abc123'));
+    mockFetchChess.mockResolvedValue(CHESS_GAME);
+
+    const result = await validateGame({ gameId: 'abc123', platform: 'lichess', username: 'alice' });
+
+    expect(mockFetchChess).toHaveBeenCalledTimes(1);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.platform).toBe('chessdotcom');
+    }
+  });
+
+  it('returns a failure when both providers fail', async () => {
+    mockFetchLichess.mockRejectedValue(new GameNotFoundError('abc123'));
+    mockFetchChess.mockRejectedValue(new GameNotFoundError('abc123'));
+
+    const result = await validateGame({ gameId: 'abc123', platform: 'lichess', username: 'alice' });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.valid).toBe(false);
     }
   });
 });

@@ -3,6 +3,70 @@ import { httpMetrics, type HttpMetrics } from "../services/http-metrics.js";
 import type { DlqEntry } from "../store/persistent-queue-store.js";
 
 const RETRY_ATTEMPT_BUCKETS = [0, 1, 2, 3, 5, 10, 25, 50, 100];
+const RESPONSE_TIME_BUCKETS_MS = [50, 100, 250, 500, 1000, 2500, 5000, 10000];
+
+export interface ProviderHealthSnapshot {
+  provider: string;
+  uptimeRatio: number;
+  responseTimeCount: number;
+  responseTimeSumMs: number;
+  responseTimeBuckets: Record<string, number>;
+  errorsTotal: number;
+  cacheHitsTotal: number;
+  cacheMissesTotal: number;
+  cacheStaleTotal: number;
+}
+
+function escapeLabelValue(value: string): string {
+  return value
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n");
+}
+
+export function renderProviderMetrics(
+  snapshots: readonly ProviderHealthSnapshot[],
+): string {
+  const lines = [
+    "# HELP oracle_provider_uptime_ratio Fraction of successful health checks per provider.",
+    "# TYPE oracle_provider_uptime_ratio gauge",
+    "# HELP oracle_provider_response_time_ms Provider response time in milliseconds.",
+    "# TYPE oracle_provider_response_time_ms histogram",
+    "# HELP oracle_provider_errors_total Total provider errors observed.",
+    "# TYPE oracle_provider_errors_total counter",
+    "# HELP oracle_provider_cache_hits_total Total provider cache hits.",
+    "# TYPE oracle_provider_cache_hits_total counter",
+    "# HELP oracle_provider_cache_misses_total Total provider cache misses.",
+    "# TYPE oracle_provider_cache_misses_total counter",
+    "# HELP oracle_provider_cache_stale_total Total stale provider cache entries revalidated.",
+    "# TYPE oracle_provider_cache_stale_total counter",
+  ];
+
+  for (const snapshot of snapshots) {
+    const provider = escapeLabelValue(snapshot.provider);
+    lines.push(
+      `oracle_provider_uptime_ratio{provider="${provider}"} ${snapshot.uptimeRatio}`,
+    );
+
+    for (const bucket of RESPONSE_TIME_BUCKETS_MS) {
+      const count = snapshot.responseTimeBuckets[String(bucket)] ?? 0;
+      lines.push(
+        `oracle_provider_response_time_ms_bucket{provider="${provider}",le="${bucket}"} ${count}`,
+      );
+    }
+    lines.push(
+      `oracle_provider_response_time_ms_bucket{provider="${provider}",le="+Inf"} ${snapshot.responseTimeCount}`,
+      `oracle_provider_response_time_ms_sum{provider="${provider}"} ${snapshot.responseTimeSumMs}`,
+      `oracle_provider_response_time_ms_count{provider="${provider}"} ${snapshot.responseTimeCount}`,
+      `oracle_provider_errors_total{provider="${provider}"} ${snapshot.errorsTotal}`,
+      `oracle_provider_cache_hits_total{provider="${provider}"} ${snapshot.cacheHitsTotal}`,
+      `oracle_provider_cache_misses_total{provider="${provider}"} ${snapshot.cacheMissesTotal}`,
+      `oracle_provider_cache_stale_total{provider="${provider}"} ${snapshot.cacheStaleTotal}`,
+    );
+  }
+
+  return `${lines.join("\n")}\n`;
+}
 
 export function renderDlqMetrics(
   entries: readonly DlqEntry[],
@@ -63,16 +127,27 @@ export function createMetricsRouter(
     return listDlqEntries();
   },
   metrics: HttpMetrics = httpMetrics,
+  loadProviderHealth: () => Promise<ProviderHealthSnapshot[]> = async () => {
+    const { getProviderHealthSnapshots } = await import(
+      "../services/provider-health.js"
+    );
+    return getProviderHealthSnapshots();
+  },
 ) {
   const router = Router();
 
   router.get("/", async (_req, res, next) => {
     try {
-      const entries = await loadEntries();
+      const [entries, providerHealth] = await Promise.all([
+        loadEntries(),
+        loadProviderHealth(),
+      ]);
       res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
       return res
         .status(200)
-        .send(`${metrics.render()}${renderDlqMetrics(entries)}`);
+        .send(
+          `${metrics.render()}${renderDlqMetrics(entries)}${renderProviderMetrics(providerHealth)}`,
+        );
     } catch (error) {
       return next(error);
     }

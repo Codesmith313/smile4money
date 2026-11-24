@@ -8,7 +8,6 @@
 
 import { GameNotFoundError } from '../fetchers/lichess.js';
 import type { MatchResult, GameResult } from '../fetchers/lichess.js';
-import { getCachedProviderGameResult } from './game-validation-cache.js';
 import { errorToHttpStatus } from '../errors/errorToHttpStatus.js';
 import {
   checkGameEligibility,
@@ -21,6 +20,12 @@ import {
   ProviderResultCache,
   providerCacheConfigFromEnv,
 } from './provider-result-cache.js';
+import {
+  validateGameWithFailover,
+  type FailoverResult,
+  type ProviderChain,
+  providerChainFromEnv,
+} from './provider-failover.js';
 
 let validateGameCache: ProviderResultCache<NormalizedGameResult> | undefined;
 
@@ -94,10 +99,26 @@ export interface ValidateGameIneligible {
   rejections: EligibilityRejection[];
 }
 
+/**
+ * Providers returned conflicting results for the same game (#2111). The
+ * result is flagged for manual review rather than trusting either provider.
+ */
+export interface ValidateGameConflict {
+  ok: false;
+  status: 409;
+  valid: false;
+  platform: string;
+  gameId: string;
+  message: string;
+  conflict: true;
+  providers: string[];
+}
+
 export type ValidateGameResult =
   | ValidateGameSuccess
   | ValidateGameNotFound
   | ValidateGameIneligible
+  | ValidateGameConflict
   | ValidateGameError;
 
 /**
@@ -143,6 +164,26 @@ function stalenessMetadata(
 }
 
 /**
+ * Build the success response for a verified game result.
+ */
+function successResponse(
+  platform: string,
+  result: CachedProviderResult<NormalizedGameResult>,
+): ValidateGameSuccess {
+  return {
+    ok: true,
+    valid: true,
+    ...stalenessMetadata(result),
+    platform,
+    gameId: result.gameId,
+    status: result.status,
+    whitePlayer: result.whitePlayer,
+    blackPlayer: result.blackPlayer,
+    result: result.result,
+  };
+}
+
+/**
  * Validate the input fields for a game-validation request.
  *
  * Returns an error string if validation fails, or null if valid.
@@ -174,42 +215,44 @@ export function validateGameInput(input: Partial<ValidateGameInput>): string | n
 export async function validateGame(
   input: ValidateGameInput,
   cache: ProviderResultCache<NormalizedGameResult> = getValidateGameCache(),
+  chain: ProviderChain = providerChainFromEnv(),
 ): Promise<ValidateGameResult> {
   const { gameId, platform, username } = input;
 
   try {
-    if (platform === 'lichess') {
-      const result = await getCachedProviderGameResult('lichess', gameId);
-      const ineligible = ineligibleResponse('lichess', result.gameId, result);
-      if (ineligible) return ineligible;
+    // Query the configured provider chain, falling back to alternate
+    // providers when the primary returns invalid data (#2111). The
+    // orchestrator handles caching and stale revalidation via `cache`.
+    const outcome: FailoverResult = await validateGameWithFailover(
+      { gameId, platform, username },
+      { cache, chain },
+    );
+
+    if (outcome.kind === 'conflict') {
       return {
-        ok: true,
-        valid: true,
-        ...stalenessMetadata(cached),
-        platform: 'lichess',
-        gameId: result.gameId,
-        status: result.status,
-        whitePlayer: result.whitePlayer,
-        blackPlayer: result.blackPlayer,
-        result: result.result,
-      };
-    } else {
-      // chessdotcom — username already validated by validateGameInput
-      const result = await getCachedProviderGameResult('chessdotcom', gameId, username);
-      const ineligible = ineligibleResponse('chessdotcom', result.gameId, result);
-      if (ineligible) return ineligible;
-      return {
-        ok: true,
-        valid: true,
-        ...stalenessMetadata(cached),
-        platform: 'chessdotcom',
-        gameId: result.gameId,
-        status: result.status,
-        whitePlayer: result.whitePlayer,
-        blackPlayer: result.blackPlayer,
-        result: result.result,
+        ok: false,
+        status: 409,
+        valid: false,
+        platform,
+        gameId,
+        message:
+          `Providers returned conflicting results for game ${gameId} ` +
+          `(${outcome.providers.join(', ')}); flagged for manual review.`,
+        conflict: true,
+        providers: outcome.providers,
       };
     }
+
+    const result = outcome.result;
+    const resolvedPlatform = outcome.platform;
+    const ineligible = ineligibleResponse(
+      resolvedPlatform,
+      result.gameId,
+      result,
+      result,
+    );
+    if (ineligible) return ineligible;
+    return successResponse(resolvedPlatform, result);
   } catch (error) {
     if (error instanceof GameNotFoundError) {
       return {

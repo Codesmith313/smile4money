@@ -7,6 +7,8 @@ import {
 import { RateLimitError } from '../errors/RateLimitError.js';
 import {
   ProviderFetchError,
+  ProviderSchemaError,
+  checkHttpStatus,
   providerGet,
 } from './provider-validation.js';
 
@@ -120,15 +122,8 @@ export async function fetchLichessResult(gameId: string): Promise<NormalizedGame
       throw new GameNotFoundError(gameId);
     }
 
-    if (response.status !== 200) {
-      if (response.status >= 500) {
-        throw new ProviderFetchError(
-          'unavailable',
-          `Lichess API error: ${response.status}`,
-        );
-      }
-      throw new Error(`Lichess API error: ${response.status}`);
-    }
+    // Shared status handling so Lichess and Chess.com fail identically.
+    checkHttpStatus(response.status, 'Lichess');
 
     const data = response.data as {
       id: string;
@@ -142,8 +137,29 @@ export async function fetchLichessResult(gameId: string): Promise<NormalizedGame
     };
 
     const evidence = evidenceFor('lichess', url, data);
-    if (!data || data.id !== gameId)
+    if (!data || typeof data !== 'object')
+      throw new ProviderSchemaError('Lichess payload is not an object', evidence);
+    if (typeof data.id !== 'string' || data.id !== gameId)
       throw new AmbiguousEvidenceError('Mismatched game identity', evidence);
+    if (typeof data.status !== 'string')
+      throw new ProviderSchemaError('Lichess payload missing status', evidence);
+    if (
+      data.winner !== undefined &&
+      data.winner !== 'white' &&
+      data.winner !== 'black'
+    )
+      throw new ProviderSchemaError(
+        `Unrecognized Lichess winner code: ${String(data.winner)}`,
+        evidence,
+      );
+    if (
+      data.lastMoveAt !== undefined &&
+      typeof data.lastMoveAt !== 'number'
+    )
+      throw new ProviderSchemaError(
+        'Lichess payload has non-numeric lastMoveAt',
+        evidence,
+      );
     const isTerminal = TERMINAL_STATUSES.has(data.status);
     const active = data.status === 'started' || data.status === 'created';
     let result: MatchResult | null = null;
@@ -175,6 +191,16 @@ export async function fetchLichessResult(gameId: string): Promise<NormalizedGame
         evidence,
       );
     }
+    if (
+      !data.players ||
+      typeof data.players !== 'object' ||
+      !data.players.white ||
+      !data.players.black
+    )
+      throw new ProviderSchemaError(
+        'Lichess payload missing player information',
+        evidence,
+      );
     return normalizeResult(
       data.id,
       data.players?.white?.user?.name,
@@ -189,3 +215,6 @@ export async function fetchLichessResult(gameId: string): Promise<NormalizedGame
   // Unreachable: the loop above always returns or throws.
   throw new RateLimitError('Lichess API rate limit exceeded (429)');
 }
+
+/** Re-exported so callers can catch provider errors uniformly. */
+export { ProviderFetchError, ProviderSchemaError };

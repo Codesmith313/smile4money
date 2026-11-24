@@ -58,6 +58,12 @@ router.post('/', async (req, res) => {
       // Machine-readable eligibility rejections (#110), when the game exists
       // but cannot be wagered on.
       ...('rejections' in result ? { rejections: result.rejections } : {}),
+      // Provider failover (#2111): when primary and alternate providers
+      // disagree, the result is flagged for manual review rather than
+      // silently trusting either source.
+      ...('conflict' in result && result.conflict
+        ? { conflict: true, requiresReview: true }
+        : {}),
       error: errorEnvelope(statusToErrorCode(result.status), message).error,
     });
   }

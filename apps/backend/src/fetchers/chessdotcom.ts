@@ -4,13 +4,15 @@ import {
   evidenceFor,
   normalizeResult,
 } from './result.js';
-import axios from 'axios';
 import { getChessDotComLimiterSingleton } from '../services/bottleneck-limiters.js';
 import logger from '../logger.js';
 import { RateLimitError } from '../errors/RateLimitError.js';
-import { ProviderFetchError } from './provider-validation.js';
+import {
+  ProviderFetchError,
+  providerGet,
+  parseRetryAfterMs,
+} from './provider-validation.js';
 import type { MatchResult, GameResult } from './lichess.js';
-import { traceHeaders } from '../tracing/trace-context.js';
 
 export { GameNotFoundError } from './lichess.js';
 export { RateLimitError } from '../errors/RateLimitError.js';
@@ -73,6 +75,30 @@ export function parseArchiveMonths(
   return months;
 }
 
+const MAX_RETRIES = 3;
+const BASE_BACKOFF_MS = 250;
+
+function isChessDotComGame(value: unknown): value is ChessDotComGame {
+  if (!value || typeof value !== 'object') return false;
+  const g = value as Record<string, any>;
+  return (
+    typeof g.url === 'string' &&
+    typeof g.end_time === 'number' &&
+    g.white &&
+    typeof g.white === 'object' &&
+    typeof g.white.username === 'string' &&
+    typeof g.white.result === 'string' &&
+    g.black &&
+    typeof g.black === 'object' &&
+    typeof g.black.username === 'string' &&
+    typeof g.black.result === 'string'
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function fetchArchive(
   username: string,
   year: number,
@@ -82,54 +108,63 @@ async function fetchArchive(
   const url = `https://api.chess.com/pub/player/${encodeURIComponent(username)}/games/${year}/${mm}`;
   const limiter = getChessDotComLimiterSingleton();
 
-  return limiter.schedule(async () => {
+  for (let attempt = 0; ; attempt++) {
     try {
-      const response = await axios.get(url, {
-        timeout: 10_000,
-        headers: traceHeaders(),
-        validateStatus: (s) => s < 500,
+      return await limiter.schedule(async () => {
+        const response = await providerGet(url, { timeoutMs: 10_000 });
+
+        if (response.status === 404) {
+          return [];
+        }
+
+        if (response.status === 429) {
+          const retryAfterMs = parseRetryAfterMs(
+            response.headers?.['retry-after'],
+          );
+          throw new RateLimitError(
+            'Chess.com API rate limit exceeded (429)',
+            retryAfterMs,
+          );
+        }
+
+        if (response.status === 408 || response.status >= 500) {
+          throw new ProviderFetchError(
+            'unavailable',
+            `Chess.com API unavailable: ${response.status}`,
+          );
+        }
+
+        if (response.status !== 200) {
+          throw new ProviderFetchError(
+            'access_denied',
+            `Chess.com API error: ${response.status}`,
+          );
+        }
+
+        if (
+          !Array.isArray(response.data?.games) ||
+          !response.data.games.every(isChessDotComGame)
+        ) {
+          throw new AmbiguousEvidenceError(
+            'Invalid archive payload',
+            evidenceFor('chessdotcom', url, response.data),
+          );
+        }
+        return response.data.games;
       });
-
-      if (response.status === 404) {
-        return [];
-      }
-
-      if (response.status === 429) {
-        throw new RateLimitError('Chess.com API rate limit exceeded (429)');
-      }
-
-      if (response.status === 408 || response.status >= 500) {
-        throw new ProviderFetchError(
-          'unavailable',
-          `Chess.com API unavailable: ${response.status}`,
-        );
-      }
-
-      if (response.status !== 200) {
-        throw new Error(`Chess.com API error: ${response.status}`);
-      }
-
-      if (
-        !Array.isArray(response.data?.games) ||
-        !response.data.games.every((g: any) => g && typeof g.url === 'string')
-      ) {
-        throw new AmbiguousEvidenceError(
-          'Invalid archive payload',
-          evidenceFor('chessdotcom', url, response.data),
-        );
-      }
-      return response.data.games;
     } catch (error) {
-      if (
-        axios.isAxiosError(error) &&
-        (error.response === undefined ||
-          error.response.status === 408 ||
-          error.response.status >= 500)
-      ) {
-        throw new ProviderFetchError(
-          'unavailable',
-          'Chess.com API unavailable; retry later',
+      if (error instanceof RateLimitError && attempt < MAX_RETRIES) {
+        const backoff =
+          error.retryAfterMs ?? BASE_BACKOFF_MS * Math.pow(2, attempt);
+        await sleep(backoff);
+        continue;
+      }
+      if (error instanceof ProviderFetchError) {
+        logger.error(
+          { username, year, month, url, error: error.message },
+          'Chess.com API archive fetch failed',
         );
+        throw error;
       }
       const message = error instanceof Error ? error.message : 'Unknown error';
       logger.error(
@@ -138,7 +173,7 @@ async function fetchArchive(
       );
       throw error;
     }
-  });
+  }
 }
 
 /**
@@ -164,7 +199,15 @@ export async function fetchChessDotComResult(
     const year = d.getUTCFullYear();
     const month = d.getUTCMonth() + 1;
 
-    const games = await fetchArchive(username, year, month);
+    let games: ChessDotComGame[];
+    try {
+      games = await fetchArchive(username, year, month);
+    } catch (error) {
+      if (error instanceof ProviderFetchError && error.kind === 'not_found') {
+        throw new GameNotFoundError(gameId);
+      }
+      throw error;
+    }
     const matches = games.filter((g) => extractGameId(g.url) === gameId);
     if (matches.length > 1)
       throw new AmbiguousEvidenceError(
