@@ -63,6 +63,7 @@ function readMatch(row: any): MatchRecord {
     platform: row.platform,
     state: row.state,
     identityHash: row.identityHash ?? undefined,
+    cancellationReason: row.cancellationReason ?? undefined,
   };
 }
 
@@ -168,8 +169,8 @@ export class SqliteMatchStore implements MatchStorePort {
       (db) =>
         new Promise((resolve, reject) => {
           const stmt = db.prepare(
-            `INSERT INTO matches (matchId, player1, player2, player1Username, player2Username, stakeAmount, token, gameId, platform, state, identityHash)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?)`,
+            `INSERT INTO matches (matchId, player1, player2, player1Username, player2Username, stakeAmount, token, gameId, platform, state, identityHash, cancellationReason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?, ?)`,
           );
 
           const matchId = this.nextId++;
@@ -184,6 +185,7 @@ export class SqliteMatchStore implements MatchStorePort {
             payload.gameId,
             payload.platform,
             identityHash,
+            payload.cancellationReason ?? null,
             function (this: sqlite3.RunResult, err: Error | null) {
               if (err) {
                 reject(err);
@@ -201,6 +203,7 @@ export class SqliteMatchStore implements MatchStorePort {
                 platform: payload.platform,
                 state: 'Pending',
                 identityHash: identityHash ?? undefined,
+                cancellationReason: payload.cancellationReason ?? undefined,
               });
             },
           );
@@ -271,7 +274,27 @@ export class SqliteMatchStore implements MatchStorePort {
     );
   }
 
-  async updateMatchState(matchId: number, state: MatchState): Promise<MatchStateChange | null> {
+  /**
+   * #2137 — List matches filtered by cancellation reason.
+   * Only matches that were cancelled with the given reason are returned.
+   */
+  async listMatchesByCancellationReason(reason: string): Promise<MatchRecord[]> {
+    return this.withConnection(
+      (db) =>
+        new Promise((resolve, reject) => {
+          db.all(
+            `SELECT * FROM matches WHERE state = 'Cancelled' AND cancellationReason = ? ORDER BY matchId`,
+            [reason],
+            (err: Error | null, rows: any[]) => {
+              if (err) reject(err);
+              else resolve(rows.map(readMatch));
+            },
+          );
+        }),
+    );
+  }
+
+  async updateMatchState(matchId: number, state: MatchState, cancellationReason?: string): Promise<MatchStateChange | null> {
     return this.withConnection(async (db) => {
       await runAsync(db, 'BEGIN IMMEDIATE');
       try {
@@ -288,7 +311,9 @@ export class SqliteMatchStore implements MatchStorePort {
           return null;
         }
         const previousState = match.state;
-        await runWithParams(db, 'UPDATE matches SET state = ? WHERE matchId = ?', [state, matchId]);
+        // #2137 — Record the cancellation reason when the match is cancelled.
+        const reason = state === 'Cancelled' ? cancellationReason ?? match.cancellationReason : match.cancellationReason;
+        await runWithParams(db, 'UPDATE matches SET state = ?, cancellationReason = ? WHERE matchId = ?', [state, reason ?? null, matchId]);
         const subscriptions = await new Promise<Array<{ id: string; url: string; secret: string }>>((resolve, reject) =>
           db.all(
             'SELECT id, url, secret FROM webhook_subscriptions WHERE matchId = ?',
@@ -302,7 +327,13 @@ export class SqliteMatchStore implements MatchStorePort {
             id: eventId,
             type: 'match.state_changed',
             occurredAt: new Date().toISOString(),
-            data: { matchId, gameId: match.gameId, previousState, state },
+            data: {
+              matchId,
+              gameId: match.gameId,
+              previousState,
+              state,
+              ...(state === 'Cancelled' && reason ? { cancellationReason: reason } : {}),
+            },
           });
           for (const subscription of subscriptions) {
             await runWithParams(
@@ -315,7 +346,7 @@ export class SqliteMatchStore implements MatchStorePort {
           }
         }
         await runAsync(db, 'COMMIT');
-        return { match: { ...match, state }, previousState, state };
+        return { match: { ...match, state, cancellationReason: reason ?? undefined }, previousState, state };
       } catch (error) {
         await runAsync(db, 'ROLLBACK').catch(() => undefined);
         throw error;

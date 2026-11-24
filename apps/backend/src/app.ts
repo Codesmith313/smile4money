@@ -50,7 +50,11 @@ app.use(
         callback(
           Object.assign(
             new Error(`CORS: origin '${origin}' is not allowed`),
-            { status: 403 },
+            {
+              status: 403,
+              code: ErrorCode.FORBIDDEN,
+              details: { origin },
+            },
           ),
         );
       }
@@ -87,10 +91,16 @@ app.use('/api/oracle', oracleRouter);
 app.use('/api/player-identity', playerIdentityRouter);
 app.use('/status', statusRouter);
 
-app.use((_req, res) => {
+app.use((req, res) => {
   res
     .status(404)
-    .json(errorEnvelope(ErrorCode.NOT_FOUND, userFacingErrorMessage(404)));
+    .json(
+      errorEnvelope(
+        ErrorCode.NOT_FOUND,
+        userFacingErrorMessage(404),
+        { method: req.method, path: req.originalUrl ?? req.url },
+      ),
+    );
 });
 
 app.use(apiErrorHandler);

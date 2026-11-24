@@ -3,6 +3,13 @@ import { errorToHttpStatus } from "../errors/errorToHttpStatus.js";
 import { errorEnvelope, statusToErrorCode } from "../errors/errorResponse.js";
 import logger from "../logger.js";
 
+function extractDetails(error: unknown): unknown {
+  if (error && typeof error === "object" && "details" in error) {
+    return (error as { details?: unknown }).details;
+  }
+  return undefined;
+}
+
 export const apiErrorHandler: ErrorRequestHandler = (
   error,
   req,
@@ -17,12 +24,22 @@ export const apiErrorHandler: ErrorRequestHandler = (
     logger.warn({ status, method: req.method, error }, "http_request_failed");
   }
 
-  const message =
-    status >= 500
-      ? "An unexpected server error occurred."
-      : error instanceof Error
-        ? error.message
-        : "The request could not be completed.";
+  const code = statusToErrorCode(status);
 
-  res.status(status).json(errorEnvelope(statusToErrorCode(status), message));
+  if (status >= 500) {
+    // Hide internal details for server errors.
+    res
+      .status(status)
+      .json(errorEnvelope(code, "An unexpected server error occurred."));
+    return;
+  }
+
+  const message =
+    error instanceof Error
+      ? error.message
+      : "The request could not be completed.";
+
+  const details = extractDetails(error);
+
+  res.status(status).json(errorEnvelope(code, message, details));
 };

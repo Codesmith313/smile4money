@@ -46,8 +46,68 @@ export interface QueueMetricsSnapshot {
   failed: number;
   /** processed / (processed + failed); 1 when nothing has been attempted. */
   successRate: number;
+  /** Histogram of retry attempts across pending DLQ entries. */
+  retryCountHistogram: RetryCountHistogram;
   /** Timestamp of the last metrics refresh. */
   updatedAt: number;
+}
+
+/**
+ * Histogram of retry attempts across pending DLQ entries.
+ *
+ * `buckets` is cumulative (Prometheus-style): each entry's `le` bound counts
+ * every entry whose attempt count is less than or equal to that bound. The
+ * final bucket is always `+Inf`. `sum` is the total attempts across all
+ * entries and `count` is the number of entries observed.
+ */
+export interface RetryCountHistogram {
+  buckets: Array<{ le: number; count: number }>;
+  sum: number;
+  count: number;
+}
+
+/** Upper bounds (inclusive) for the retry-count histogram buckets. */
+export const RETRY_COUNT_BUCKETS: readonly number[] = [0, 1, 2, 3, 5, 8, 13];
+
+/** Build an empty retry-count histogram (all buckets zero). */
+export function emptyRetryCountHistogram(): RetryCountHistogram {
+  return {
+    buckets: [
+      ...RETRY_COUNT_BUCKETS.map((le) => ({ le, count: 0 })),
+      { le: Infinity, count: 0 },
+    ],
+    sum: 0,
+    count: 0,
+  };
+}
+
+/**
+ * Compute a cumulative retry-count histogram from a set of DLQ entries.
+ * Entries with a non-finite or negative attempt count are treated as 0.
+ */
+export function computeRetryCountHistogram(
+  entries: readonly DlqEntry[],
+): RetryCountHistogram {
+  const histogram = emptyRetryCountHistogram();
+  const finiteBuckets = histogram.buckets.filter((b) => b.le !== Infinity);
+
+  for (const entry of entries) {
+    const attempts =
+      Number.isFinite(entry.attempts) && entry.attempts > 0
+        ? Math.floor(entry.attempts)
+        : 0;
+    histogram.sum += attempts;
+    histogram.count += 1;
+    for (const bucket of finiteBuckets) {
+      if (attempts <= bucket.le) bucket.count += 1;
+    }
+  }
+
+  // The +Inf bucket always holds every observation.
+  const infBucket = histogram.buckets[histogram.buckets.length - 1];
+  infBucket.count = histogram.count;
+
+  return histogram;
 }
 
 const queueMetrics = {
@@ -55,6 +115,7 @@ const queueMetrics = {
   oldestEntryAgeMs: 0,
   processed: 0,
   failed: 0,
+  retryCountHistogram: emptyRetryCountHistogram(),
   updatedAt: Date.now(),
 };
 
@@ -94,6 +155,7 @@ export async function refreshQueueMetrics(): Promise<void> {
       entries.length === 0
         ? 0
         : now - Math.min(...entries.map((entry) => entry.createdAt));
+    queueMetrics.retryCountHistogram = computeRetryCountHistogram(entries);
     queueMetrics.updatedAt = now;
   } catch (err) {
     logger.error({ err: String(err) }, "oracle_queue: metrics refresh failed");
@@ -108,8 +170,31 @@ export function getQueueMetrics(): QueueMetricsSnapshot {
     processed: queueMetrics.processed,
     failed: queueMetrics.failed,
     successRate: computeSuccessRate(),
+    retryCountHistogram: {
+      buckets: queueMetrics.retryCountHistogram.buckets.map((b) => ({ ...b })),
+      sum: queueMetrics.retryCountHistogram.sum,
+      count: queueMetrics.retryCountHistogram.count,
+    },
     updatedAt: queueMetrics.updatedAt,
   };
+}
+
+/**
+ * Compute the retry-count histogram directly from the active queue store.
+ * Returns an empty histogram when the store is not initialised.
+ */
+export async function getRetryCountHistogram(): Promise<RetryCountHistogram> {
+  if (!queueStore) return emptyRetryCountHistogram();
+  try {
+    const entries = await queueStore.getAll();
+    return computeRetryCountHistogram(entries);
+  } catch (err) {
+    logger.error(
+      { err: String(err) },
+      "oracle_queue: retry histogram computation failed",
+    );
+    return emptyRetryCountHistogram();
+  }
 }
 
 /** Reset all queue metrics (used by tests). */
@@ -118,6 +203,7 @@ export function resetQueueMetrics(): void {
   queueMetrics.oldestEntryAgeMs = 0;
   queueMetrics.processed = 0;
   queueMetrics.failed = 0;
+  queueMetrics.retryCountHistogram = emptyRetryCountHistogram();
   queueMetrics.updatedAt = Date.now();
 }
 

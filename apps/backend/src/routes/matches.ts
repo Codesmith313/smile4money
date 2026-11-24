@@ -5,6 +5,7 @@ import { authenticate } from '../middleware/auth.js';
 import {
   validateCreateMatchInput,
   createMatchForPlayer,
+  cancelMatch,
 } from '../services/match-service.js';
 import {
   ErrorCode,
@@ -78,6 +79,65 @@ router.post('/', async (req, res) => {
   }
 
   return res.status(201).json(result.match);
+});
+
+router.post('/:matchId/cancel', async (req, res) => {
+  const matchId = req.params.matchId;
+  const payload = req.body;
+
+  if (!req.address) {
+    return res.status(401).json(errorEnvelope(ErrorCode.UNAUTHORIZED, 'Authentication required'));
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    return res
+      .status(400)
+      .json(
+        errorEnvelope(ErrorCode.VALIDATION_ERROR, 'Request body must be JSON'),
+      );
+  }
+
+  const result = await cancelMatch(store, matchId, req.address, {
+    reason: payload.reason,
+  });
+
+  if (!result.ok) {
+    const message =
+      result.status >= 500
+        ? userFacingErrorMessage(result.status)
+        : result.details
+          ? `${result.error}: ${result.details}`
+          : result.error;
+    return res
+      .status(result.status)
+      .json(errorEnvelope(statusToErrorCode(result.status), message));
+  }
+
+  return res.status(200).json(result.match);
+});
+
+router.get('/', async (req, res) => {
+  const cancellationReason = req.query.cancellationReason;
+
+  if (
+    cancellationReason !== undefined &&
+    typeof cancellationReason !== 'string'
+  ) {
+    return res
+      .status(400)
+      .json(
+        errorEnvelope(
+          ErrorCode.VALIDATION_ERROR,
+          'cancellationReason must be a single string value',
+        ),
+      );
+  }
+
+  const matches = await store.listMatches(
+    cancellationReason ? { cancellationReason } : undefined,
+  );
+
+  return res.status(200).json(matches);
 });
 
 export default router;

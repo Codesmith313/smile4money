@@ -21,6 +21,8 @@ export interface MatchRecord {
    */
   identityHash?: string;
   evidence?: CanonicalSettlementEvidence;
+  /** #2137 — why the match was cancelled, when state is 'Cancelled'. */
+  cancellationReason?: CancellationReason;
 }
 
 export type MatchState = 'Pending' | 'Active' | 'PendingResult' | 'Completed' | 'Cancelled';
@@ -34,6 +36,24 @@ const MATCH_STATE_VALUES = new Set<string>([
 
 export function isMatchState(value: unknown): value is MatchState {
   return typeof value === 'string' && MATCH_STATE_VALUES.has(value);
+}
+
+/**
+ * #2137 — categorized reasons a match may be cancelled. Stored on the match
+ * record and included in the `match.state_changed` event payload so the
+ * reason is both persisted and queryable.
+ */
+export type CancellationReason = 'player_request' | 'timeout' | 'dispute' | 'admin' | 'other';
+const CANCELLATION_REASON_VALUES = new Set<string>([
+  'player_request',
+  'timeout',
+  'dispute',
+  'admin',
+  'other',
+]);
+
+export function isCancellationReason(value: unknown): value is CancellationReason {
+  return typeof value === 'string' && CANCELLATION_REASON_VALUES.has(value);
 }
 
 export interface WebhookSubscription {
@@ -92,7 +112,12 @@ export interface MatchStorePort {
   findByMatchId(matchId: number): Promise<MatchRecord | null>;
   listMatchesByPlayer(address: string): Promise<MatchRecord[]>;
   listMatchesForStateSync(): Promise<MatchRecord[]>;
-  updateMatchState(matchId: number, state: MatchState): Promise<MatchStateChange | null>;
+  listMatchesByCancellationReason(reason: CancellationReason): Promise<MatchRecord[]>;
+  updateMatchState(
+    matchId: number,
+    state: MatchState,
+    cancellationReason?: CancellationReason,
+  ): Promise<MatchStateChange | null>;
   createWebhookSubscription(
     input: Omit<WebhookSubscription, 'createdAt'>,
   ): Promise<WebhookSubscription>;
@@ -206,17 +231,39 @@ export class MatchStore implements MatchStorePort {
       .map((match) => ({ ...match }));
   }
 
-  async updateMatchState(matchId: number, state: MatchState): Promise<MatchStateChange | null> {
+  async listMatchesByCancellationReason(reason: CancellationReason): Promise<MatchRecord[]> {
+    return [...this.matches.values()]
+      .filter((match) => match.state === 'Cancelled' && match.cancellationReason === reason)
+      .map((match) => ({ ...match }));
+  }
+
+  async updateMatchState(
+    matchId: number,
+    state: MatchState,
+    cancellationReason?: CancellationReason,
+  ): Promise<MatchStateChange | null> {
     const match = this.matches.get(matchId);
     if (!match || match.state === state) return null;
     const previousState = match.state;
     match.state = state;
+    // #2137 — persist the cancellation reason on the record when cancelling.
+    if (state === 'Cancelled') {
+      match.cancellationReason = cancellationReason;
+    } else {
+      delete match.cancellationReason;
+    }
     const eventId = randomUUID();
     const payload = JSON.stringify({
       id: eventId,
       type: 'match.state_changed',
       occurredAt: new Date().toISOString(),
-      data: { matchId, gameId: match.gameId, previousState, state },
+      data: {
+        matchId,
+        gameId: match.gameId,
+        previousState,
+        state,
+        ...(state === 'Cancelled' ? { cancellationReason } : {}),
+      },
     });
     for (const subscription of this.webhookSubscriptions.values()) {
       if (subscription.matchId === matchId) {

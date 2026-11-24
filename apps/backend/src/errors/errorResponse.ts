@@ -36,8 +36,12 @@ export interface ErrorEnvelope {
   error: {
     code: string;
     message: string;
+    details?: unknown;
     suggestion: string;
-    documentation: string;
+    docsUrl: string;
+    requestId?: string;
+    correlationId?: string;
+    timestamp?: string;
     [extra: string]: unknown;
   };
 }
@@ -115,15 +119,20 @@ export function getRecoverySuggestion(key: string): RecoverySuggestion {
 }
 
 /**
- * Builds the standard `{ error: { code, message, suggestion, documentation } }` body.
+ * Builds the canonical
+ * `{ error: { code, message, details, suggestion, docsUrl, requestId, correlationId, timestamp } }`
+ * body.
  *
- * `extra` merges additional diagnostic fields (e.g. a machine-readable
- * `hint`) into the `error` object. The returned envelope has one top-level
- * key, `error`.
+ * `details` carries structured diagnostic information (e.g. per-field
+ * validation failures or a machine-readable `hint`). `extra` merges any
+ * additional diagnostic fields into the `error` object; canonical fields
+ * always win over conflicting keys supplied via `extra`. The returned
+ * envelope has one top-level key, `error`.
  */
 export function errorEnvelope(
   code: ErrorCode | string,
   message: string,
+  details?: unknown,
   extra?: Record<string, unknown>,
 ): ErrorEnvelope {
   const recovery = getRecoverySuggestion(code);
@@ -133,10 +142,9 @@ export function errorEnvelope(
       ...extra,
       code,
       message,
+      details,
       suggestion: recovery.suggestion,
       docsUrl: recovery.docsUrl,
-      ...extra,
-      ...extra,
       ...(context
         ? {
             requestId: context.spanId,
@@ -162,6 +170,7 @@ export function statusToErrorCode(status: number): ErrorCode {
     case 400:
     case 413:
     case 415:
+    case 422:
       return ErrorCode.VALIDATION_ERROR;
     case 401:
       return ErrorCode.UNAUTHORIZED;
@@ -172,8 +181,6 @@ export function statusToErrorCode(status: number): ErrorCode {
     case 409:
     case 425:
       return ErrorCode.CONFLICT;
-    case 422:
-      return ErrorCode.VALIDATION_ERROR;
     case 429:
       return ErrorCode.RATE_LIMITED;
     case 503:

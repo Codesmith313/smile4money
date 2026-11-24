@@ -38,6 +38,7 @@ export const LOG_EVENTS = new Set([
   "http_request",
   "http_request_failed",
   "http_server_listening",
+  "match_cancelled",
   "oracle_dlq: QUEUE_STORE=memory is not safe in production (DLQ entries are lost on restart); auto-falling back to sqlite. See docs/oracle.md#queue-store-persistence.",
   "oracle_dlq: QUEUE_STORE=mongodb requested but the mongoose dependency is not installed; falling back to sqlite",
   "oracle_dlq: TTL eviction run complete",

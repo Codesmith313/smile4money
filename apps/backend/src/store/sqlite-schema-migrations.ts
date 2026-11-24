@@ -78,6 +78,14 @@ export const SQLITE_SCHEMA_MIGRATIONS: Record<string, SqliteMigration[]> = {
       ],
       down: ["ALTER TABLE settlement_evidence DROP COLUMN provider"],
     },
+    {
+      version: 5,
+      name: "add-match-cancellation-reason",
+      statements: [
+        "ALTER TABLE matches ADD COLUMN cancellationReason TEXT",
+      ],
+      down: ["ALTER TABLE matches DROP COLUMN cancellationReason"],
+    },
   ],
   "oracle-queue": [
     {

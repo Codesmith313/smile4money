@@ -12,7 +12,8 @@ import { GameNotFoundError } from '../fetchers/lichess.js';
 import { getCachedProviderGameResult } from './game-validation-cache.js';
 import type { MatchRecord } from '../store/match-store.js';
 import type { MatchStorePort } from '../store/match-store.js';
-import { errorToHttpStatus, ValidationError, ConflictError } from '../errors/errorToHttpStatus.js';
+import { errorToHttpStatus, ValidationError, ConflictError, NotFoundError } from '../errors/errorToHttpStatus.js';
+import { logEvent } from './log-events.js';
 
 // Mirrors contracts/escrow/src/constants.rs and contracts/smile4money-common.
 export const MIN_STAKE = 1;
@@ -42,6 +43,48 @@ export interface CreateMatchInput {
 export type CreateMatchSuccess = { ok: true; match: MatchRecord };
 export type CreateMatchFailure = { ok: false; status: number; error: string; details?: string };
 export type CreateMatchResult = CreateMatchSuccess | CreateMatchFailure;
+
+/**
+ * Categorised reasons a match can be cancelled.
+ *
+ * Each category groups concrete reasons so that cancellations can be
+ * aggregated and queried by category via the API.
+ */
+export const CANCELLATION_REASON_CATEGORIES = {
+  player_request: ['player_request', 'player_withdrew', 'mutual_agreement'],
+  timeout: ['timeout', 'no_show', 'expired'],
+  dispute: ['dispute', 'cheating_suspected', 'result_disputed'],
+  system: ['system_error', 'game_not_found', 'invalid_game', 'other'],
+} as const;
+
+export type CancellationCategory = keyof typeof CANCELLATION_REASON_CATEGORIES;
+export type CancellationReason =
+  (typeof CANCELLATION_REASON_CATEGORIES)[CancellationCategory][number];
+
+const CANCELLATION_REASON_TO_CATEGORY: Record<string, CancellationCategory> = Object.entries(
+  CANCELLATION_REASON_CATEGORIES,
+).reduce(
+  (acc, [category, reasons]) => {
+    for (const reason of reasons) {
+      acc[reason] = category as CancellationCategory;
+    }
+    return acc;
+  },
+  {} as Record<string, CancellationCategory>,
+);
+
+/**
+ * Resolve the category for a given cancellation reason.
+ *
+ * Returns null if the reason is not a recognised cancellation reason.
+ */
+export function getCancellationCategory(reason: string): CancellationCategory | null {
+  return CANCELLATION_REASON_TO_CATEGORY[reason] ?? null;
+}
+
+export type CancelMatchSuccess = { ok: true; match: MatchRecord };
+export type CancelMatchFailure = { ok: false; status: number; error: string; details?: string };
+export type CancelMatchResult = CancelMatchSuccess | CancelMatchFailure;
 
 /**
  * Validate input fields for creating a match.
@@ -197,6 +240,61 @@ export async function createMatchForPlayer(
     const message = error instanceof Error ? error.message : 'Unknown error';
     if (message.includes('duplicate')) {
       return { ok: false, status: errorToHttpStatus(new ConflictError(message)), error: 'duplicate gameId' };
+    }
+    return { ok: false, status: errorToHttpStatus(error), error: message };
+  }
+}
+
+/**
+ * Cancel a match, recording the reason and its category.
+ *
+ * Validates the supplied reason against the known cancellation categories,
+ * persists the cancellation via the store, and emits a structured
+ * `match.cancelled` event containing the matchId, gameId, reason and category.
+ *
+ * Returns a discriminated union so the route handler only needs to map the
+ * result to an HTTP response.
+ */
+export async function cancelMatch(
+  store: MatchStorePort,
+  matchId: string,
+  reason: string,
+): Promise<CancelMatchResult> {
+  if (!reason || typeof reason !== 'string') {
+    const message = 'reason is required';
+    return { ok: false, status: errorToHttpStatus(new ValidationError(message)), error: message };
+  }
+
+  const category = getCancellationCategory(reason);
+  if (!category) {
+    const message = `reason must be one of: ${Object.values(CANCELLATION_REASON_CATEGORIES)
+      .flat()
+      .join(', ')}`;
+    return { ok: false, status: errorToHttpStatus(new ValidationError(message)), error: message };
+  }
+
+  try {
+    const match = await store.cancelMatch(matchId, reason, category);
+    if (!match) {
+      const message = 'match not found';
+      return { ok: false, status: errorToHttpStatus(new NotFoundError(message)), error: message };
+    }
+
+    logEvent('match.cancelled', {
+      matchId: match.id,
+      gameId: match.gameId,
+      reason,
+      category,
+    });
+
+    return { ok: true, match };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    if (message.includes('not found')) {
+      return { ok: false, status: errorToHttpStatus(new NotFoundError(message)), error: message };
+    }
+    if (message.includes('already') || message.includes('cannot cancel')) {
+      return { ok: false, status: errorToHttpStatus(new ConflictError(message)), error: message };
     }
     return { ok: false, status: errorToHttpStatus(error), error: message };
   }
