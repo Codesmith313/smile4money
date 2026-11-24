@@ -217,6 +217,26 @@ export const SQLITE_SCHEMA_MIGRATIONS: Record<string, SqliteMigration[]> = {
       down: ["DROP TABLE IF EXISTS sponsorships"],
     },
   ],
+  sessions: [
+    {
+      version: 1,
+      name: "create-sessions",
+      statements: [
+        `CREATE TABLE IF NOT EXISTS sessions (
+          session_id TEXT PRIMARY KEY NOT NULL,
+          principal TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          revoked_at INTEGER
+        )`,
+        "CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)",
+      ],
+      down: [
+        "DROP INDEX IF EXISTS idx_sessions_expires_at",
+        "DROP TABLE IF EXISTS sessions",
+      ],
+    },
+  ],
 };
 
 export function getSqliteMigrationsForDatabase(
