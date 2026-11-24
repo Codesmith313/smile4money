@@ -49,6 +49,12 @@ router.post('/', async (req, res) => {
       platform: result.platform ?? payload.platform,
       gameId: result.gameId ?? payload.gameId,
       ...(result.message || result.status >= 500 ? { message } : {}),
+      ...('stale' in result
+        ? {
+            stale: result.stale,
+            ...(result.stale ? { cacheAgeMs: result.cacheAgeMs } : {}),
+          }
+        : {}),
       // Machine-readable eligibility rejections (#110), when the game exists
       // but cannot be wagered on.
       ...('rejections' in result ? { rejections: result.rejections } : {}),
@@ -60,6 +66,8 @@ router.post('/', async (req, res) => {
     valid: result.valid,
     platform: result.platform,
     gameId: result.gameId,
+    stale: result.stale,
+    ...(result.stale ? { cacheAgeMs: result.cacheAgeMs } : {}),
     status: result.status,
     whitePlayer: result.whitePlayer,
     blackPlayer: result.blackPlayer,

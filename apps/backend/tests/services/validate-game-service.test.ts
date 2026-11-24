@@ -10,6 +10,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   validateGameInput,
   validateGame,
+  resetValidateGameCache,
 } from '../../src/services/validate-game-service.js';
 import { clearGameValidationCache } from '../../src/services/game-validation-cache.js';
 
@@ -53,6 +54,29 @@ const CHESS_GAME = {
   blackPlayer: 'bob',
   result: 'Player1Wins' as const,
 };
+
+describe('provider cache configuration', () => {
+  it('uses the default stale tolerance and validates overrides', () => {
+    expect(providerCacheConfigFromEnv({})).toEqual({
+      staleToleranceMs: 300_000,
+    });
+    expect(
+      providerCacheConfigFromEnv({
+        PROVIDER_CACHE_STALE_TOLERANCE_MS: '120000',
+      }),
+    ).toEqual({ staleToleranceMs: 120_000 });
+    expect(
+      providerCacheConfigFromEnv({
+        PROVIDER_CACHE_STALE_TOLERANCE_MS: '0',
+      }),
+    ).toEqual({ staleToleranceMs: 0 });
+    expect(() =>
+      providerCacheConfigFromEnv({
+        PROVIDER_CACHE_STALE_TOLERANCE_MS: '-1',
+      }),
+    ).toThrow('PROVIDER_CACHE_STALE_TOLERANCE_MS');
+  });
+});
 
 // ---------------------------------------------------------------------------
 // validateGameInput

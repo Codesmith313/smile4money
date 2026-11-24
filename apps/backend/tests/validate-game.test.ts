@@ -1,11 +1,15 @@
 import request from 'supertest';
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import express from 'express';
 import axios from 'axios';
 import { clearGameValidationCache } from '../src/services/game-validation-cache.js';
 import validateGameRouter from '../src/routes/validate-game.js';
+import { resetValidateGameCache } from '../src/services/validate-game-service.js';
 
 vi.mock('axios');
+vi.mock('../src/store/sqlite-rate-limit-store.js', () => ({
+  SqliteRateLimitStore: class {},
+}));
 const mockedAxios = vi.mocked(axios);
 
 const createApp = () => {
@@ -125,6 +129,33 @@ describe('POST /api/validate-game', () => {
       expect(response.body.whitePlayer).toBe('alice');
       expect(response.body.blackPlayer).toBe('bob');
       expect(response.body.result).toBe('Player1Wins');
+      expect(response.body.stale).toBe(false);
+    });
+
+    it('serves and labels cached game data during a provider outage', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+      mockedAxios.get = vi
+        .fn()
+        .mockResolvedValueOnce({ status: 200, data: BASE_LICHESS_GAME })
+        .mockResolvedValue({ status: 503, data: {} });
+
+      await request(app)
+        .post('/api/validate-game')
+        .send({ gameId: 'abc123', platform: 'lichess' });
+
+      vi.setSystemTime(new Date('2026-01-01T00:01:00Z'));
+      const response = await request(app)
+        .post('/api/validate-game')
+        .send({ gameId: 'abc123', platform: 'lichess' });
+
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({
+        valid: true,
+        stale: true,
+        cacheAgeMs: 60_000,
+        gameId: 'abc123',
+      });
     });
 
     it('returns 200 with valid=true for in-progress lichess game (result null)', async () => {
