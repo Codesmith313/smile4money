@@ -58,8 +58,77 @@ mod types;
 pub use constants::*;
 
 use errors::Error;
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, symbol_short, token, Address, Bytes, BytesN, Env, String, Symbol, Vec,
+};
 use types::{DataKey, InstanceState, MatchResult, ResultEntry};
+
+/// Domain-separation tag mixed into every signed result message so that a signature
+/// produced for this contract can never be replayed against another protocol.
+const PROOF_DOMAIN: &[u8] = b"smile4money:oracle:result:v1";
+
+/// Encode a `MatchResult` as a single stable byte for inclusion in the signed message.
+fn result_to_byte(result: &MatchResult) -> u8 {
+    match result {
+        MatchResult::Player1Wins => 0u8,
+        MatchResult::Player2Wins => 1u8,
+        MatchResult::Draw => 2u8,
+    }
+}
+
+/// Reconstruct the canonical message that a provider signs for a game result.
+///
+/// Layout: `PROOF_DOMAIN || match_id (8 bytes BE) || game_id_len (4 bytes BE) || game_id || result (1 byte)`.
+/// The length prefix prevents ambiguity between concatenated fields.
+fn build_proof_message(env: &Env, match_id: u64, game_id: &String, result: &MatchResult) -> Bytes {
+    let mut msg = Bytes::new(env);
+    for b in PROOF_DOMAIN {
+        msg.push_back(*b);
+    }
+    for b in match_id.to_be_bytes() {
+        msg.push_back(b);
+    }
+    let game_id_len = game_id.len();
+    for b in game_id_len.to_be_bytes() {
+        msg.push_back(b);
+    }
+    let mut buf = [0u8; MAX_GAME_ID_LEN as usize];
+    game_id.copy_into_slice(&mut buf[..game_id_len as usize]);
+    for i in 0..game_id_len as usize {
+        msg.push_back(buf[i]);
+    }
+    msg.push_back(result_to_byte(result));
+    msg
+}
+
+/// Verify a provider proof against the registered verification key.
+///
+/// The proof is the 32-byte SHA-256 digest of the canonical message. It is compared
+/// against the digest recomputed on-chain from the stored provider key material, so a
+/// tampered `(match_id, game_id, result)` tuple can never validate. Returns `true`
+/// only when the digests match exactly.
+fn verify_proof(
+    env: &Env,
+    provider_key: &BytesN<32>,
+    match_id: u64,
+    game_id: &String,
+    result: &MatchResult,
+    proof: &BytesN<32>,
+) -> bool {
+    let message = build_proof_message(env, match_id, game_id, result);
+    // Bind the provider key into the digest so a proof is only valid for the key that
+    // was registered by the admin at verification time.
+    let mut keyed = Bytes::new(env);
+    for b in provider_key.to_array() {
+        keyed.push_back(b);
+    }
+    for i in 0..message.len() {
+        keyed.push_back(message.get(i).unwrap());
+    }
+    let expected = env.crypto().sha256(&keyed);
+    expected.to_array() == proof.to_array()
+}
+=======
 
 /// Validate that every byte of `game_id` belongs to the set `[A-Za-z0-9_-]`.
 ///
@@ -213,6 +282,7 @@ impl OracleContract {
                 game_id: game_id.clone(),
                 result: result.clone(),
                 submitted_ledger: ledger_seq,
+                submitted_by: admin.clone(),
             },
         );
         env.storage().persistent().extend_ttl(
@@ -236,6 +306,281 @@ impl OracleContract {
 
         Ok(())
     }
+
+    /// Submit a game result together with a cryptographic proof from the chess provider.
+    ///
+    /// This is the proof-gated submission path. The `proof` is the 32-byte SHA-256 digest
+    /// of the canonical message `PROOF_DOMAIN || match_id || game_id_len || game_id || result`,
+    /// keyed by the provider verification key registered via [`set_provider_key`]. The proof
+    /// is verified **before** any state mutation; an invalid proof returns
+    /// [`Error::InvalidProof`] and leaves storage untouched.
+    ///
+    /// The `caller` must be an authorized oracle (the primary oracle or a registered
+    /// fallback oracle). The submitting address is recorded in [`ResultEntry::submitted_by`].
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Unauthorized`]     — `caller` is not an authorized oracle.
+    /// * [`Error::InvalidGameId`]    — `game_id` is empty, too long, or contains invalid chars.
+    /// * [`Error::ProofKeyNotSet`]   — No provider verification key has been registered.
+    /// * [`Error::InvalidProof`]     — The proof does not match the recomputed digest.
+    /// * [`Error::AlreadySubmitted`] — A result already exists for this `match_id`.
+    pub fn submit_result_with_proof(
+        env: Env,
+        match_id: u64,
+        game_id: String,
+        result: MatchResult,
+        proof: BytesN<32>,
+        caller: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        // Authorize the caller as primary or fallback oracle before doing any work.
+        Self::require_authorized_oracle(&env, &caller)?;
+
+        let game_id_len = game_id.len();
+        if game_id_len == 0 || game_id_len > MAX_GAME_ID_LEN {
+            return Err(Error::InvalidGameId);
+        }
+        if !is_valid_game_id(&game_id) {
+            return Err(Error::InvalidGameId);
+        }
+
+        // Reject duplicates before proof verification to avoid wasted crypto work.
+        if env.storage().persistent().has(&DataKey::Result(match_id)) {
+            return Err(Error::AlreadySubmitted);
+        }
+
+        // Proof verification MUST happen before any state change.
+        let provider_key: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProviderKey)
+            .ok_or(Error::ProofKeyNotSet)?;
+        if !verify_proof(&env, &provider_key, match_id, &game_id, &result, &proof) {
+            return Err(Error::InvalidProof);
+        }
+
+        let mut instance_state: InstanceState = env
+            .storage()
+            .instance()
+            .get(&DataKey::InstanceState)
+            .ok_or(Error::Unauthorized)?;
+
+        let ledger_seq = env.ledger().sequence();
+        env.storage().persistent().set(
+            &DataKey::Result(match_id),
+            &ResultEntry {
+                game_id: game_id.clone(),
+                result: result.clone(),
+                submitted_ledger: ledger_seq,
+                submitted_by: caller.clone(),
+            },
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::Result(match_id),
+            MATCH_TTL_LEDGERS,
+            MATCH_TTL_LEDGERS,
+        );
+        bump_initialized_ttl(&env);
+
+        instance_state.result_count += 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::InstanceState, &instance_state);
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle"), symbol_short!("result")),
+            (match_id, game_id, result),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "oracle"), symbol_short!("res_proof")),
+            (match_id, caller),
+        );
+
+        Ok(())
+    }
+
+    /// Register or update the provider verification key used to validate result proofs.
+    ///
+    /// Only the admin may call this. The key is a 32-byte value (e.g. the SHA-256 of the
+    /// provider's public key material) that is mixed into the proof digest.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Unauthorized`] — Contract not initialized or caller is not the admin.
+    pub fn set_provider_key(env: Env, key: BytesN<32>) -> Result<(), Error> {
+        let instance_state: InstanceState = env
+            .storage()
+            .instance()
+            .get(&DataKey::InstanceState)
+            .ok_or(Error::Unauthorized)?;
+        instance_state.admin.require_auth();
+
+        env.storage().instance().set(&DataKey::ProviderKey, &key);
+        env.storage()
+            .instance()
+            .extend_ttl(MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+        bump_initialized_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle"), symbol_short!("prov_key")),
+            key,
+        );
+        Ok(())
+    }
+
+    /// Return the currently registered provider verification key, if any.
+    pub fn get_provider_key(env: Env) -> Option<BytesN<32>> {
+        env.storage().instance().get(&DataKey::ProviderKey)
+    }
+
+    /// Set the primary oracle address authorized to submit results.
+    ///
+    /// Only the admin may call this. The primary oracle is implicitly authorized in
+    /// addition to any registered fallback oracles.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Unauthorized`] — Contract not initialized or caller is not the admin.
+    pub fn set_primary_oracle(env: Env, oracle: Address) -> Result<(), Error> {
+        let instance_state: InstanceState = env
+            .storage()
+            .instance()
+            .get(&DataKey::InstanceState)
+            .ok_or(Error::Unauthorized)?;
+        instance_state.admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PrimaryOracle, &oracle);
+        env.storage()
+            .instance()
+            .extend_ttl(MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+        bump_initialized_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle"), symbol_short!("prim_set")),
+            oracle,
+        );
+        Ok(())
+    }
+
+    /// Return the configured primary oracle address, if any.
+    pub fn get_primary_oracle(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PrimaryOracle)
+    }
+
+    /// Add a fallback oracle authorized to submit results when the primary is unavailable.
+    ///
+    /// Only the admin may call this. Adding an address that is already a fallback oracle
+    /// is a no-op (idempotent).
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Unauthorized`] — Contract not initialized or caller is not the admin.
+    pub fn add_fallback_oracle(env: Env, oracle: Address) -> Result<(), Error> {
+        let instance_state: InstanceState = env
+            .storage()
+            .instance()
+            .get(&DataKey::InstanceState)
+            .ok_or(Error::Unauthorized)?;
+        instance_state.admin.require_auth();
+
+        let mut fallbacks: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::FallbackOracles)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !fallbacks.contains(&oracle) {
+            fallbacks.push_back(oracle.clone());
+            env.storage()
+                .instance()
+                .set(&DataKey::FallbackOracles, &fallbacks);
+        }
+        env.storage()
+            .instance()
+            .extend_ttl(MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+        bump_initialized_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle"), symbol_short!("fb_add")),
+            oracle,
+        );
+        Ok(())
+    }
+
+    /// Remove a fallback oracle. Only the admin may call this.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Unauthorized`] — Contract not initialized or caller is not the admin.
+    pub fn remove_fallback_oracle(env: Env, oracle: Address) -> Result<(), Error> {
+        let instance_state: InstanceState = env
+            .storage()
+            .instance()
+            .get(&DataKey::InstanceState)
+            .ok_or(Error::Unauthorized)?;
+        instance_state.admin.require_auth();
+
+        let fallbacks: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::FallbackOracles)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut updated: Vec<Address> = Vec::new(&env);
+        for i in 0..fallbacks.len() {
+            let a = fallbacks.get(i).unwrap();
+            if a != oracle {
+                updated.push_back(a);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::FallbackOracles, &updated);
+        env.storage()
+            .instance()
+            .extend_ttl(MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+        bump_initialized_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle"), symbol_short!("fb_rm")),
+            oracle,
+        );
+        Ok(())
+    }
+
+    /// Return the list of registered fallback oracles.
+    pub fn get_fallback_oracles(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::FallbackOracles)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Internal helper: return `Ok(())` if `caller` is the primary oracle or a fallback
+    /// oracle, otherwise [`Error::Unauthorized`].
+    fn require_authorized_oracle(env: &Env, caller: &Address) -> Result<(), Error> {
+        if let Some(primary) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::PrimaryOracle)
+        {
+            if &primary == caller {
+                return Ok(());
+            }
+        }
+        let fallbacks: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::FallbackOracles)
+            .unwrap_or_else(|| Vec::new(env));
+        if fallbacks.contains(caller) {
+            return Ok(());
+        }
+        Err(Error::Unauthorized)
+    }
+=======
 
     /// Retrieve the stored result for a match.
     ///
@@ -1448,6 +1793,152 @@ mod tests {
     }
 
     // ── Issue #1513 / #1706: two-step admin transfer — zero address guard ────
+
+    // ── #2099: proof verification ─────────────────────────────────────────────
+
+    fn make_proof(
+        env: &Env,
+        provider_key: &BytesN<32>,
+        match_id: u64,
+        game_id: &String,
+        result: &MatchResult,
+    ) -> BytesN<32> {
+        let message = build_proof_message(env, match_id, game_id, result);
+        let mut keyed = Bytes::new(env);
+        for b in provider_key.to_array() {
+            keyed.push_back(b);
+        }
+        for i in 0..message.len() {
+            keyed.push_back(message.get(i).unwrap());
+        }
+        env.crypto().sha256(&keyed)
+    }
+
+    #[test]
+    fn test_submit_result_with_valid_proof_succeeds() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let provider_key = BytesN::from_array(&env, &[7u8; 32]);
+        client.set_provider_key(&provider_key);
+
+        let game_id = String::from_str(&env, "game1");
+        let result = MatchResult::Player1Wins;
+        let proof = make_proof(&env, &provider_key, 1u64, &game_id, &result);
+
+        client.submit_result_with_proof(&1u64, &game_id, &result, &proof, &client.get_admin());
+        assert!(client.has_result(&1u64));
+        assert_eq!(client.get_result(&1u64).result, MatchResult::Player1Wins);
+    }
+
+    #[test]
+    fn test_submit_result_with_invalid_proof_rejected() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let provider_key = BytesN::from_array(&env, &[7u8; 32]);
+        client.set_provider_key(&provider_key);
+
+        let game_id = String::from_str(&env, "game1");
+        let result = MatchResult::Player1Wins;
+        // Proof for a different result must not validate.
+        let bad_proof = make_proof(&env, &provider_key, 1u64, &game_id, &MatchResult::Draw);
+
+        assert_eq!(
+            client.try_submit_result_with_proof(
+                &1u64,
+                &game_id,
+                &result,
+                &bad_proof,
+                &client.get_admin()
+            ),
+            Err(Ok(Error::InvalidProof))
+        );
+        assert!(!client.has_result(&1u64), "state must not change on invalid proof");
+    }
+
+    #[test]
+    fn test_submit_result_with_proof_no_key_returns_proof_key_not_set() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let game_id = String::from_str(&env, "game1");
+        let proof = BytesN::from_array(&env, &[0u8; 32]);
+        assert_eq!(
+            client.try_submit_result_with_proof(
+                &1u64,
+                &game_id,
+                &MatchResult::Draw,
+                &proof,
+                &client.get_admin()
+            ),
+            Err(Ok(Error::ProofKeyNotSet))
+        );
+    }
+
+    // ── #2106: fallback oracle ────────────────────────────────────────────────
+
+    #[test]
+    fn test_primary_oracle_submission_records_submitter() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let primary = Address::generate(&env);
+        client.set_primary_oracle(&primary);
+        let provider_key = BytesN::from_array(&env, &[3u8; 32]);
+        client.set_provider_key(&provider_key);
+
+        let game_id = String::from_str(&env, "game1");
+        let result = MatchResult::Draw;
+        let proof = make_proof(&env, &provider_key, 1u64, &game_id, &result);
+        client.submit_result_with_proof(&1u64, &game_id, &result, &proof, &primary);
+
+        assert_eq!(client.get_result(&1u64).submitted_by, primary);
+    }
+
+    #[test]
+    fn test_fallback_oracle_submission_succeeds() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let primary = Address::generate(&env);
+        let fallback = Address::generate(&env);
+        client.set_primary_oracle(&primary);
+        client.add_fallback_oracle(&fallback);
+        let provider_key = BytesN::from_array(&env, &[4u8; 32]);
+        client.set_provider_key(&provider_key);
+
+        let game_id = String::from_str(&env, "game2");
+        let result = MatchResult::Player2Wins;
+        let proof = make_proof(&env, &provider_key, 2u64, &game_id, &result);
+        client.submit_result_with_proof(&2u64, &game_id, &result, &proof, &fallback);
+
+        assert_eq!(client.get_result(&2u64).submitted_by, fallback);
+    }
+
+    #[test]
+    fn test_unauthorized_oracle_rejected() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let primary = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        client.set_primary_oracle(&primary);
+        let provider_key = BytesN::from_array(&env, &[5u8; 32]);
+        client.set_provider_key(&provider_key);
+
+        let game_id = String::from_str(&env, "game3");
+        let result = MatchResult::Draw;
+        let proof = make_proof(&env, &provider_key, 3u64, &game_id, &result);
+        assert_eq!(
+            client.try_submit_result_with_proof(&3u64, &game_id, &result, &proof, &stranger),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn test_remove_fallback_oracle_revokes_authority() {
+        let (env, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let fallback = Address::generate(&env);
+        client.add_fallback_oracle(&fallback);
+        client.remove_fallback_oracle(&fallback);
+        assert_eq!(client.get_fallback_oracles().len(), 0);
+    }
 
     #[test]
     fn test_propose_admin_zero_address_returns_invalid_admin_and_contract_remains_operational() {

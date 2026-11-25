@@ -26,6 +26,9 @@ pub use smile4money_common::SharedError;
 /// | 15   | TransferFailed     | ✓       | Token transfer in withdraw failed                        |
 /// | 23   | InvalidAdmin       | ✓       | new_admin is the zero/burn address                       |
 /// | 24   | NoPendingAdmin     |         | accept_admin/cancel called with no pending proposal      |
+/// | 25   | InvalidProof       |         | Result proof (signature/hash) failed verification        |
+/// | 26   | NotAuthorizedOracle|         | Caller is neither the primary nor a fallback oracle      |
+/// | 27   | PrimaryOracleUnavailable |   | Primary oracle is unavailable; fallback required         |
 ///
 /// > **Note**: Error codes for shared variants were unified with the escrow contract.
 /// > Previously `Unauthorized` was 1, `AlreadyInitialized` was 4, `InvalidGameId` was 5,
@@ -69,6 +72,18 @@ pub enum Error {
     /// [E024] `accept_admin` or `cancel_admin_transfer` was called but there is no
     /// pending admin proposal outstanding.
     NoPendingAdmin = 24,
+
+    /// [E025] The cryptographic proof accompanying a result submission (signature
+    /// or hash) could not be verified against the provider's data.
+    InvalidProof = 25,
+
+    /// [E026] Caller is neither the configured primary oracle nor an authorized
+    /// fallback oracle, so it may not submit results.
+    NotAuthorizedOracle = 26,
+
+    /// [E027] The primary oracle is unavailable and a fallback oracle must be used
+    /// to submit the result.
+    PrimaryOracleUnavailable = 27,
 }
 
 /// Convert a [`SharedError`] into an oracle [`Error`].

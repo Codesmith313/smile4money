@@ -13,6 +13,14 @@ import {
 import type { OracleSubmission } from "./oracle-submit.js";
 import { oracleMetrics, type OracleOperation } from "./oracle-metrics.js";
 
+/** Cryptographic proof accompanying a result submission. */
+export interface OracleResultProof {
+  /** Hex-encoded signature over the canonical result payload. */
+  signature: string;
+  /** Hex-encoded hash of the canonical result payload. */
+  hash: string;
+}
+
 /** A transport accepts the already authorized signer for this attempt only. */
 export class OracleContractTransport {
   constructor(

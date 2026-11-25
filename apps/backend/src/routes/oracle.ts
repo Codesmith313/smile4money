@@ -192,14 +192,22 @@ router.get('/dashboard', (_req, res) => {
  *   "matchId": 1,
  *   "gameId": "abc123",
  *   "platform": "lichess",
- *   "username": "alice"  // Optional, required for Chess.com
+ *   "username": "alice",  // Optional, required for Chess.com
+ *   "proof": {            // Optional cryptographic proof of the result
+ *     "algorithm": "sha256",
+ *     "hash": "0x...",
+ *     "signature": "0x...",   // Optional provider signature
+ *     "publicKey": "0x..."    // Optional signer public key
+ *   },
+ *   "oracleAddress": "G..."  // Optional: select primary or fallback oracle
  * }
  * ```
  *
  * This endpoint:
  * 1. Fetches the game result from the chess platform API
  * 2. Verifies that the players in the API response match the registered players
- * 3. Returns the verified result for the oracle to submit on-chain
+ * 3. Verifies the cryptographic proof (if provided) against provider data
+ * 4. Returns the verified result for the oracle to submit on-chain
  *
  * The oracle (a privileged service) must then sign the result and call the
  * escrow contract's `submit_result` method on Stellar Soroban.
@@ -220,12 +228,25 @@ router.post(
     return res.status(400).json(errorEnvelope(ErrorCode.VALIDATION_ERROR, inputError));
   }
 
+  const proofError = validateResultProof(payload.proof);
+  if (proofError) {
+    return res.status(400).json(errorEnvelope(ErrorCode.VALIDATION_ERROR, proofError));
+  }
+
+  if (payload.oracleAddress !== undefined && typeof payload.oracleAddress !== 'string') {
+    return res
+      .status(400)
+      .json(errorEnvelope(ErrorCode.VALIDATION_ERROR, 'oracleAddress must be a string'));
+  }
+
   try {
     const result = await verifyGameResult(store, {
       matchId: payload.matchId,
       gameId: payload.gameId,
       platform: payload.platform,
       username: typeof payload.username === 'string' ? payload.username : undefined,
+      proof: payload.proof,
+      oracleAddress: typeof payload.oracleAddress === 'string' ? payload.oracleAddress : undefined,
     }, evidenceStore);
 
     if (!result.ok) {
