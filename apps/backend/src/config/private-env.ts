@@ -10,6 +10,8 @@ export interface PrivateEnv {
   deployerSecretKey: string | undefined;
   mainnetDeployerSecretKey: string | undefined;
   mongodbUrl: string | undefined;
+  requestSigningSecret: string | undefined;
+  sessionSecret: string | undefined;
 }
 
 export const privateEnv: PrivateEnv = {
@@ -33,5 +35,11 @@ export const privateEnv: PrivateEnv = {
   },
   get mongodbUrl() {
     return process.env.MONGODB_URL;
+  },
+  get requestSigningSecret() {
+    return process.env.REQUEST_SIGNING_SECRET;
+  },
+  get sessionSecret() {
+    return process.env.SESSION_SECRET;
   },
 };
