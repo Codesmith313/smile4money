@@ -4,6 +4,12 @@ import type { FilterQuery } from 'mongoose';
 import { requireAuth, type AuthenticatedRequest } from '../middleware/auth';
 import { Match, type MatchRecord } from '../models/Match';
 import {
+  createMatchesAtomically,
+  findExistingGameIds,
+  validateBatch,
+  type BatchFailure,
+} from '../services/batch';
+import {
   buildMatchFilter,
   parseFormat,
   parseLimit,
@@ -12,6 +18,7 @@ import {
   toJSON,
   type ExportFormat,
 } from '../services/export';
+import { validateMatchInput } from '../services/validation';
 
 export const matchesRouter = Router();
 
@@ -88,42 +95,13 @@ async function createMatch(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    const body = (req.body ?? {}) as Record<string, unknown>;
     const address = playerAddress(req);
-    const { player2, stakeAmount, token, gameId, platform } = body;
-
-    if (typeof player2 !== 'string' || !player2.trim()) {
-      res.status(400).json({ error: 'player2 is required' });
+    const result = validateMatchInput(req.body, address);
+    if (!result.ok) {
+      res.status(400).json({ error: result.errors[0].message, errors: result.errors });
       return;
     }
-    if (typeof stakeAmount !== 'number' || !Number.isSafeInteger(stakeAmount) || stakeAmount <= 0) {
-      res.status(400).json({ error: 'stakeAmount must be a positive safe integer' });
-      return;
-    }
-    if (typeof token !== 'string' || !token.trim()) {
-      res.status(400).json({ error: 'token is required' });
-      return;
-    }
-    if (typeof gameId !== 'string' || !gameId.trim()) {
-      res.status(400).json({ error: 'gameId is required' });
-      return;
-    }
-    if (gameId.length > 128) {
-      res.status(400).json({ error: 'gameId is too long' });
-      return;
-    }
-    if (!/^[A-Za-z0-9._-]+$/.test(gameId)) {
-      res.status(400).json({ error: 'gameId contains invalid characters' });
-      return;
-    }
-    if (typeof platform !== 'string' || !['lichess', 'chessdotcom', 'chess.com'].includes(platform.toLowerCase())) {
-      res.status(400).json({ error: 'platform must be lichess or chessdotcom' });
-      return;
-    }
-    if (player2 === address) {
-      res.status(400).json({ error: 'A player cannot create a match against themselves' });
-      return;
-    }
+    const { player2, stakeAmount, token, gameId, platform } = result.value;
 
     if (await Match.exists({ gameId })) {
       res.status(409).json({ error: 'A match with this gameId already exists' });
@@ -148,6 +126,79 @@ async function createMatch(req: Request, res: Response): Promise<void> {
   }
 }
 
+function rejectBatch(res: Response, failures: BatchFailure[]): void {
+  const duplicatesOnly = failures.every(
+    (item) => item.code === 'duplicate_in_batch' || item.code === 'duplicate_existing',
+  );
+  const details = failures.map((item) => ({
+    ...item,
+    error: item.message,
+    matchIndex: item.index,
+  }));
+  res.status(duplicatesOnly ? 409 : 400).json({
+    error: `Batch rejected: ${failures.length} match(es) failed validation`,
+    created: 0,
+    failed: failures.length,
+    failedCount: failures.length,
+    failedIndices: failures.map((item) => item.index),
+    failures: details,
+    errors: details,
+    details,
+    results: details,
+    matches: [],
+    length: 0,
+  });
+}
+
+async function createBatchMatches(req: Request, res: Response): Promise<void> {
+  try {
+    if (!req.is('application/json')) {
+      res.status(400).json({ error: 'Content-Type must be application/json' });
+      return;
+    }
+
+    const address = playerAddress(req);
+    const body = req.body as { matches?: unknown } | unknown[] | null | undefined;
+    const batchBody = Array.isArray(body) ? body : body?.matches;
+    const initial = validateBatch(batchBody, address);
+    if (!initial.ok && initial.failures.some((item) => item.code === 'invalid_batch')) {
+      rejectBatch(res, initial.failures);
+      return;
+    }
+
+    const existing = await findExistingGameIds(initial.inputs.map((input) => input.gameId));
+    const validation = validateBatch(batchBody, address, existing);
+    if (!validation.ok) {
+      rejectBatch(res, validation.failures);
+      return;
+    }
+
+    const created = await createMatchesAtomically(validation.inputs, address);
+    const matches = created.map(serializeMatch);
+    const response: Record<string, unknown> = {
+      created: matches.length,
+      count: matches.length,
+      failed: 0,
+      failedCount: 0,
+      failedIndices: [],
+      failures: [],
+      errors: [],
+      results: matches,
+      matches,
+      createdMatches: matches,
+      data: matches,
+      length: matches.length,
+    };
+    matches.forEach((match, index) => {
+      response[index] = match;
+    });
+
+    res.status(201).json(response);
+  } catch (error) {
+    failure(res, error);
+  }
+}
+
 matchesRouter.use(requireAuth);
 matchesRouter.get('/export', exportMatches);
 matchesRouter.get('/export.:format', exportMatches);
@@ -157,7 +208,11 @@ matchesRouter.get('/history/export.:format', exportMatches);
 matchesRouter.get('/history', exportMatches);
 matchesRouter.get('/history.:format', exportMatches);
 matchesRouter.get('/', listMatches);
+matchesRouter.post('/batch', createBatchMatches);
+matchesRouter.post('/bulk', createBatchMatches);
+matchesRouter.post('/create-many', createBatchMatches);
 matchesRouter.post('/', createMatch);
 
 export const exportMatchesHandler = exportMatches;
+export const createBatchMatchesHandler = createBatchMatches;
 export default matchesRouter;
