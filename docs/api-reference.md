@@ -1571,7 +1571,14 @@ Errors from API endpoints use the following envelope:
 ```
 
 - `error.code` — a stable, machine-readable string. API consumers should branch on this, not on `error.message` (which is meant for humans and may be reworded).
-- `error.message` — a human-readable description of what went wrong.
+- `error.message` — a human-readable description of what went wrong. Unhandled
+  exceptions are mapped to safe, status-specific messages rather than exposing
+  the exception text; request validation responses may identify the invalid
+  field. Messages are currently returned in English; clients that need another
+  locale can translate using the stable `error.code`.
+- `error.details` — optional context for a client error. Internal details are
+  not returned for server errors (HTTP 5xx); use the request and correlation
+  IDs when contacting support.
 - `error.suggestion` — an actionable next step that tells the caller how to recover from this specific error. It is always present, always relevant to `error.code`, and is written as an instruction the caller can act on directly (e.g. "re-authenticate and retry", "wait and retry after the `Retry-After` header"). Clients may display it verbatim to end users.
 - `error.docsUrl` — an absolute link to the documentation anchor for this error code (see the table below). Always present, so a client can render a "Learn more" link without hardcoding URLs.
 - `error.requestId` — the request span ID, which can be shared with support.

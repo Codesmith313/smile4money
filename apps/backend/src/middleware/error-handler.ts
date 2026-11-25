@@ -1,6 +1,10 @@
 import type { ErrorRequestHandler } from "express";
 import { errorToHttpStatus } from "../errors/errorToHttpStatus.js";
-import { errorEnvelope, statusToErrorCode } from "../errors/errorResponse.js";
+import {
+  errorEnvelope,
+  statusToErrorCode,
+  userFacingErrorMessage,
+} from "../errors/errorResponse.js";
 import logger from "../logger.js";
 
 function extractDetails(error: unknown): unknown {
@@ -25,21 +29,9 @@ export const apiErrorHandler: ErrorRequestHandler = (
   }
 
   const code = statusToErrorCode(status);
+  const details = status < 500 ? extractDetails(error) : undefined;
 
-  if (status >= 500) {
-    // Hide internal details for server errors.
-    res
-      .status(status)
-      .json(errorEnvelope(code, "An unexpected server error occurred."));
-    return;
-  }
-
-  const message =
-    error instanceof Error
-      ? error.message
-      : "The request could not be completed.";
-
-  const details = extractDetails(error);
-
-  res.status(status).json(errorEnvelope(code, message, details));
+  res
+    .status(status)
+    .json(errorEnvelope(code, userFacingErrorMessage(status), details));
 };
