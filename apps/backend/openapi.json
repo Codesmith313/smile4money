@@ -888,6 +888,149 @@
         }
       }
     },
+    "/api/oracle/validate-result": {
+      "post": {
+        "operationId": "validateResultSubmission",
+        "summary": "Pre-validate a result for submission without a Stellar transaction",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResultValidationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Result passed validation; no gas was consumed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultValidationSuccess"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed or inconsistent result submission data",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultValidationFailure"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller lacks the submit_results permission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No stored match exists for the game ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultValidationFailure"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The result requires operator review",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultValidationFailure"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Provider result or player identity did not pass validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultValidationFailure"
+                }
+              }
+            }
+          },
+          "425": {
+            "description": "The provider has not confirmed that the game has finished",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultValidationFailure"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The provider rate limit was exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultValidationFailure"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "A provider request timed out",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultValidationFailure"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected validation failure; no transaction was submitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultValidationFailure"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Provider unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultValidationFailure"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/status": {
       "get": {
         "operationId": "getStatus",
@@ -1391,7 +1534,8 @@
         "properties": {
           "matchId": {
             "type": "integer",
-            "minimum": 1
+            "minimum": 0,
+            "maximum": 9007199254740991
           },
           "OracleHistoryResponse": {
             "type": "object",
@@ -1748,6 +1892,125 @@
             "type": "string"
           },
           "message": {
+            "type": "string"
+          }
+        }
+      },
+      "ResultValidationRequest": {
+        "type": "object",
+        "required": [
+          "matchId",
+          "gameId",
+          "platform"
+        ],
+        "properties": {
+          "matchId": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "gameId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 511
+          },
+          "platform": {
+            "type": "string",
+            "enum": [
+              "lichess",
+              "chessdotcom"
+            ]
+          },
+          "username": {
+            "type": "string",
+            "description": "Required for Chess.com"
+          }
+        }
+      },
+      "ResultValidationSuccess": {
+        "type": "object",
+        "required": [
+          "valid",
+          "gasConsumed",
+          "matchId",
+          "gameId",
+          "result",
+          "provider"
+        ],
+        "properties": {
+          "valid": {
+            "type": "boolean",
+            "const": true
+          },
+          "gasConsumed": {
+            "type": "boolean",
+            "const": false
+          },
+          "matchId": {
+            "type": "integer"
+          },
+          "gameId": {
+            "type": "string"
+          },
+          "result": {
+            "$ref": "#/components/schemas/MatchResult"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/Platform"
+          },
+          "whitePlayer": {
+            "type": "string"
+          },
+          "blackPlayer": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "ResultValidationFailure": {
+        "type": "object",
+        "required": [
+          "valid",
+          "gasConsumed",
+          "errors",
+          "error"
+        ],
+        "properties": {
+          "valid": {
+            "type": "boolean",
+            "const": false
+          },
+          "gasConsumed": {
+            "type": "boolean",
+            "const": false
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ResultValidationIssue"
+            }
+          },
+          "error": {
+            "$ref": "#/components/schemas/ErrorEnvelope/properties/error"
+          }
+        }
+      },
+      "ResultValidationIssue": {
+        "type": "object",
+        "required": [
+          "field",
+          "message"
+        ],
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "details": {
             "type": "string"
           }
         }
