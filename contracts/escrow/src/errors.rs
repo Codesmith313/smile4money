@@ -182,8 +182,14 @@ pub enum Error {
     /// [E034] `override_result` was called after the dispute window expired.
     DisputeWindowExpired = 34,
 
-    /// [E035] The active match timeout has not elapsed yet.
-    TimeoutNotReached = 35,
+    /// [E035] Operation rejected because the match is contested under dispute.
+    DisputeActive = 35,
+
+    /// [E036] Caller is not the designated arbiter.
+    NotArbiter = 36,
+
+    /// [E037] Match is not in a contested state.
+    NotContested = 37,
 }
 
 /// Convert a [`SharedError`] into an escrow [`Error`].

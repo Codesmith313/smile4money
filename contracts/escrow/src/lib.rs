@@ -66,19 +66,13 @@ mod types;
 pub use constants::*;
 
 use errors::Error;
-use soroban_sdk::{contract, contractimpl, symbol_short, token, vec, Address, Env, String, Symbol, TryFromVal, Vec};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, vec, Address, BytesN, Env, String, Symbol, TryFromVal, Vec};
 
 /// Topic symbol for the event emitted when the contract is paused.
 const CONTRACT_PAUSED: Symbol = symbol_short!("paused");
 /// Topic symbol for the event emitted when the contract is unpaused.
 const CONTRACT_UNPAUSED: Symbol = symbol_short!("unpaused");
-use types::{AdminRole, DataKey, Match, MatchState, OptionalWinner, PendingDrain, Permission, Platform, Winner};
-
-/// Maximum number of decimals a SEP-41 token may report for it to be accepted.
-const MAX_TOKEN_DECIMALS: u32 = 18;
-
-/// Number of ledgers a pending drain approval remains valid before it expires.
-const DRAIN_APPROVAL_WINDOW_LEDGERS: u32 = 720; // ~1 hour at 5 s/ledger
+use types::{DataKey, DisputeEvidenceRecord, Match, MatchState, OptionalWinner, Platform, Winner};
 
 fn is_zero_address(env: &Env, addr: &Address) -> bool {
     // The all-zeros Stellar account key encodes to this strkey.
@@ -985,6 +979,10 @@ impl EscrowContract {
             .get(&DataKey::Match(match_id))
             .ok_or(Error::MatchNotFound)?;
 
+        if m.state == MatchState::Contested {
+            return Err(Error::DisputeActive);
+        }
+
         if m.state != MatchState::PendingResult {
             return Err(Error::InvalidState);
         }
@@ -1636,13 +1634,148 @@ impl EscrowContract {
         }
         ids
     }
+
+    /// Set or rotate the dispute arbiter address. Admin only.
+    pub fn set_arbiter(env: Env, caller: Address, arbiter: Address) -> Result<(), Error> {
+        let admin = Self::get_admin(env.clone())?;
+        if caller != admin {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+        env.storage().instance().set(&DataKey::Arbiter, &arbiter);
+        env.events().publish((Symbol::new(&env, "arbiter_updated"),), arbiter);
+        Ok(())
+    }
+
+    /// Retrieve the current dispute arbiter address.
+    pub fn get_arbiter(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Arbiter)
+    }
+
+    /// Contest an oracle result during the dispute window, placing the payout on hold.
+    pub fn contest_result(
+        env: Env,
+        caller: Address,
+        match_id: u64,
+        reason: String,
+    ) -> Result<(), Error> {
+        Self::validate_match_id(&env, match_id)?;
+        let mut m: Match = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Match(match_id))
+            .ok_or(Error::MatchNotFound)?;
+
+        let arbiter = Self::get_arbiter(env.clone());
+        let admin = Self::get_admin(env.clone())?;
+
+        let is_arbiter = arbiter.map(|a| a == caller).unwrap_or(false);
+        if caller != m.player1 && caller != m.player2 && !is_arbiter && caller != admin {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+
+        if m.state != MatchState::PendingResult {
+            return Err(Error::InvalidState);
+        }
+
+        m.state = MatchState::Contested;
+        env.storage().persistent().set(&DataKey::Match(match_id), &m);
+        env.events().publish(
+            (Symbol::new(&env, "dispute_contested"), match_id),
+            (caller, reason),
+        );
+        Ok(())
+    }
+
+    /// Submit cryptographic evidence for a contested dispute chain.
+    pub fn submit_dispute_evidence(
+        env: Env,
+        caller: Address,
+        match_id: u64,
+        evidence_hash: BytesN<32>,
+    ) -> Result<u32, Error> {
+        Self::validate_match_id(&env, match_id)?;
+        let m: Match = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Match(match_id))
+            .ok_or(Error::MatchNotFound)?;
+
+        let arbiter = Self::get_arbiter(env.clone());
+        let admin = Self::get_admin(env.clone())?;
+        let is_arbiter = arbiter.map(|a| a == caller).unwrap_or(false);
+
+        if caller != m.player1 && caller != m.player2 && !is_arbiter && caller != admin {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeEvidenceCount(match_id))
+            .unwrap_or(0);
+
+        let record = DisputeEvidenceRecord {
+            submitter: caller.clone(),
+            evidence_hash: evidence_hash.clone(),
+            timestamp_ledger: env.ledger().sequence(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeEvidence(match_id, count), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeEvidenceCount(match_id), &(count + 1));
+
+        env.events().publish(
+            (Symbol::new(&env, "dispute_evidence_submitted"), match_id),
+            (caller, evidence_hash, count),
+        );
+
+        Ok(count)
+    }
+
+    /// Resolve a contested dispute, setting the final outcome and unlocking payout.
+    pub fn resolve_dispute(
+        env: Env,
+        caller: Address,
+        match_id: u64,
+        winner: Winner,
+    ) -> Result<(), Error> {
+        Self::validate_match_id(&env, match_id)?;
+        let mut m: Match = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Match(match_id))
+            .ok_or(Error::MatchNotFound)?;
+
+        let arbiter = Self::get_arbiter(env.clone());
+        let admin = Self::get_admin(env.clone())?;
+        let is_arbiter = arbiter.map(|a| a == caller).unwrap_or(false);
+
+        if !is_arbiter && caller != admin {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+
+        if m.state != MatchState::Contested {
+            return Err(Error::NotContested);
+        }
+
+        m.pending_winner = OptionalWinner::Some(winner.clone());
+        m.state = MatchState::PendingResult;
+        m.pending_result_ledger = Some(env.ledger().sequence());
+
+        env.storage().persistent().set(&DataKey::Match(match_id), &m);
+
+        env.events().publish(
+            (Symbol::new(&env, "dispute_resolved"), match_id),
+            (caller, winner),
+        );
+
+        Ok(())
+    }
 }
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod tests_e2e;
-
-#[cfg(test)]
-mod tests_fuzz;

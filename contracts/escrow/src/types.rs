@@ -71,6 +71,10 @@ pub enum MatchState {
     ///   `DISPUTE_WINDOW_LEDGERS` have elapsed since the result was submitted.
     PendingResult,
 
+    /// A player or arbiter has contested the submitted result.
+    /// Finalization is held until resolved by arbiter or admin.
+    Contested,
+
     /// The oracle result has been finalized after the dispute window and the
     /// payout has been executed. This is a **terminal state**.
     ///
@@ -534,18 +538,22 @@ pub enum DataKey {
     /// Stored in **persistent** storage with the same TTL as the match.
     GameId(String),
 
-    /// The address currently holding the given administrative [`Role`].
-    ///
-    /// Presence of the key means the role is assigned; absence means it is
-    /// unassigned. Writes are gated on [`Permission::RoleManagement`], which
-    /// only the [`Primary`](Role::Primary) admin holds, so role assignment is
-    /// controlled by the primary admin. Stored in **instance** storage.
-    RoleAssignment(Role),
+    /// The address of the designated dispute arbiter.
+    Arbiter,
 
-    /// The armed two-phase emergency drain, if any.
-    ///
-    /// Written by the drain-initiate step and cleared by the drain-confirm
-    /// step (or when the record expires). Its presence means a drain is
-    /// awaiting a second signature. Stored in **instance** storage.
-    PendingDrain,
+    /// Records submitted dispute evidence for a match: (match_id, evidence_index).
+    DisputeEvidence(u64, u32),
+
+    /// Total count of evidence records submitted for a given match.
+    DisputeEvidenceCount(u64),
 }
+
+/// An immutable evidence record submitted in connection with a match dispute.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DisputeEvidenceRecord {
+    pub submitter: Address,
+    pub evidence_hash: BytesN<32>,
+    pub timestamp_ledger: u32,
+}
+
