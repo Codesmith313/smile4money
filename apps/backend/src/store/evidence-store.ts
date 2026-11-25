@@ -1,6 +1,7 @@
 import sqlite3 from 'sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import type { Evidence } from '../fetchers/result.js';
 import type { MatchResult } from '../fetchers/lichess.js';
 import { applySqliteMigrations } from './sqlite-migrations.js';
@@ -22,11 +23,30 @@ export interface Decision {
   previousEvidence?: Evidence;
   recordedAt: string;
   operator?: string;
+  /** SHA-256 hash of the serialized decision body, used for tamper detection. */
+  hash?: string;
 }
 export interface EvidenceStore {
   history(gameId: string): Promise<Decision[]>;
   query(options?: { gameId?: string; startTime?: number; endTime?: number }): Promise<Decision[]>;
   append(decision: Decision): Promise<number>;
+}
+
+/** Compute the canonical SHA-256 hash of a decision body (excluding id and hash). */
+export function computeDecisionHash(decision: Decision): string {
+  const { id: _id, hash: _hash, ...body } = decision;
+  return createHash('sha256').update(JSON.stringify(body)).digest('hex');
+}
+
+function verifyDecisionHash(decision: Decision, storedHash?: string): void {
+  const expected = storedHash ?? decision.hash;
+  if (!expected) return;
+  const actual = computeDecisionHash(decision);
+  if (actual !== expected) {
+    console.error(
+      `[evidence-store] Evidence hash mismatch for decision ${decision.id ?? 'unknown'} (game ${decision.gameId}): expected ${expected}, computed ${actual}`,
+    );
+  }
 }
 
 function validateDecision(decision: Decision): void {
@@ -49,7 +69,10 @@ export class MemoryEvidenceStore implements EvidenceStore {
   async history(gameId: string): Promise<Decision[]> {
     return this.entries
       .filter((e) => e.gameId === gameId)
-      .map((e) => structuredClone(e));
+      .map((e) => {
+        verifyDecisionHash(e);
+        return structuredClone(e);
+      });
   }
   async query(
     options: {
@@ -67,12 +90,17 @@ export class MemoryEvidenceStore implements EvidenceStore {
           (options.endTime === undefined || recordedAt <= options.endTime)
         );
       })
-      .map((entry) => structuredClone(entry));
+      .map((entry) => {
+        verifyDecisionHash(entry);
+        return structuredClone(entry);
+      });
   }
   async append(decision: Decision): Promise<number> {
     validateDecision(decision);
     const id = this.entries.length + 1;
-    this.entries.push(structuredClone({ ...decision, id }));
+    const stored = { ...decision, id };
+    stored.hash = computeDecisionHash(stored);
+    this.entries.push(structuredClone(stored));
     return id;
   }
 }
@@ -94,13 +122,17 @@ export class SqliteEvidenceStore implements EvidenceStore {
     if (!this.db) throw new Error('Evidence store not initialized');
     return new Promise((resolve, reject) =>
       this.db!.all(
-        'SELECT id, decision FROM oracle_decisions WHERE gameId = ? ORDER BY id',
+        'SELECT id, decision, hash FROM oracle_decisions WHERE gameId = ? ORDER BY id',
         [gameId],
-        (err, rows: { id: number; decision: string }[]) =>
+        (err, rows: { id: number; decision: string; hash: string | null }[]) =>
           err
             ? reject(err)
             : resolve(
-                rows.map((r) => ({ ...JSON.parse(r.decision), id: r.id })),
+                rows.map((r) => {
+                  const entry = { ...JSON.parse(r.decision), id: r.id } as Decision;
+                  verifyDecisionHash(entry, r.hash ?? undefined);
+                  return entry;
+                }),
               ),
       ),
     );
@@ -114,14 +146,19 @@ export class SqliteEvidenceStore implements EvidenceStore {
   ): Promise<Decision[]> {
     if (!this.db) throw new Error('Evidence store not initialized');
     const sql = options.gameId
-      ? 'SELECT id, decision FROM oracle_decisions WHERE gameId = ? ORDER BY id'
-      : 'SELECT id, decision FROM oracle_decisions ORDER BY id';
+      ? 'SELECT id, decision, hash FROM oracle_decisions WHERE gameId = ? ORDER BY id'
+      : 'SELECT id, decision, hash FROM oracle_decisions ORDER BY id';
     const params = options.gameId ? [options.gameId] : [];
-    const rows = await new Promise<{ id: number; decision: string }[]>((resolve, reject) =>
-      this.db!.all(sql, params, (err, result) => (err ? reject(err) : resolve(result))),
+    const rows = await new Promise<{ id: number; decision: string; hash: string | null }[]>(
+      (resolve, reject) =>
+        this.db!.all(sql, params, (err, result) => (err ? reject(err) : resolve(result))),
     );
     return rows
-      .map((row) => ({ ...JSON.parse(row.decision), id: row.id }) as Decision)
+      .map((row) => {
+        const entry = { ...JSON.parse(row.decision), id: row.id } as Decision;
+        verifyDecisionHash(entry, row.hash ?? undefined);
+        return entry;
+      })
       .filter((entry) => {
         const recordedAt = Date.parse(entry.recordedAt);
         return (
@@ -133,10 +170,11 @@ export class SqliteEvidenceStore implements EvidenceStore {
   async append(decision: Decision): Promise<number> {
     if (!this.db) throw new Error('Evidence store not initialized');
     validateDecision(decision);
+    const hash = computeDecisionHash(decision);
     return new Promise((resolve, reject) =>
       this.db!.run(
-        'INSERT INTO oracle_decisions(gameId, decision) VALUES (?, ?)',
-        [decision.gameId, JSON.stringify(decision)],
+        'INSERT INTO oracle_decisions(gameId, decision, hash) VALUES (?, ?, ?)',
+        [decision.gameId, JSON.stringify(decision), hash],
         function (err) {
           if (err) reject(err);
           else resolve(this.lastID);

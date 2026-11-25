@@ -24,8 +24,12 @@ import { createHash } from "node:crypto";
 import type { MatchRecord } from "../store/match-store.js";
 import type { DlqEntry } from "../store/persistent-queue-store.js";
 import type { GameResult } from "../fetchers/lichess.js";
+import { logger } from "../logger.js";
 
 export const EVIDENCE_BUNDLE_VERSION = 1;
+
+/** Hash algorithm used for evidence integrity (issue #2120). */
+export const EVIDENCE_HASH_ALGORITHM = "sha256" as const;
 
 export interface EvidenceDeps {
   findMatch(gameId: string): Promise<MatchRecord | null>;
@@ -43,8 +47,16 @@ export interface EvidenceDeps {
 export interface EvidenceBundle {
   bundleVersion: number;
   generatedAt: string;
-  /** SHA-256 of the bundle body, so a copy pasted into a ticket can be checked. */
+  /**
+   * SHA-256 (hex) of the canonical bundle body, so a copy pasted into a ticket
+   * can be checked. Kept for backwards compatibility; `hash` is the explicit
+   * integrity field (issue #2120).
+   */
   digest: string;
+  /** SHA-256 (hex) of the canonical bundle body. Tamper-detection hash. */
+  hash: string;
+  /** Algorithm used to compute `hash`/`digest`. Always "sha256". */
+  hashAlgorithm: typeof EVIDENCE_HASH_ALGORITHM;
   match: {
     matchId: number;
     gameId: string;
@@ -174,8 +186,49 @@ function iso(ms: number | null | undefined): string | null {
     : null;
 }
 
-function digestOf(body: Omit<EvidenceBundle, "digest">): string {
-  return createHash("sha256").update(JSON.stringify(body)).digest("hex");
+/**
+ * Compute the SHA-256 (hex) hash of an evidence bundle body.
+ *
+ * The body is serialized with `JSON.stringify`, which is deterministic for the
+ * plain objects produced by `buildEvidenceBundle` (insertion order is stable),
+ * so the same body always yields the same hash.
+ */
+export function hashEvidenceBody(body: string): string {
+  return createHash(EVIDENCE_HASH_ALGORITHM).update(body).digest("hex");
+}
+
+/** Canonical serialization of the bundle body (everything except the hash fields). */
+function canonicalBody(
+  body: Omit<EvidenceBundle, "digest" | "hash" | "hashAlgorithm">,
+): string {
+  return JSON.stringify(body);
+}
+
+function digestOf(
+  body: Omit<EvidenceBundle, "digest" | "hash" | "hashAlgorithm">,
+): string {
+  return hashEvidenceBody(canonicalBody(body));
+}
+
+/**
+ * Verify that a bundle's stored hash matches a recomputation over its body.
+ * Throws an `EvidenceError` (and logs a structured `evidence_hash_mismatch`
+ * event) when the bundle has been modified since it was produced.
+ */
+export function verifyEvidenceBundle(bundle: EvidenceBundle): void {
+  const { digest: _digest, hash: _hash, hashAlgorithm: _alg, ...body } = bundle;
+  const expected = hashEvidenceBody(canonicalBody(body));
+  if (expected !== bundle.hash || expected !== bundle.digest) {
+    logger.warn("evidence_hash_mismatch", {
+      matchId: bundle.match?.matchId,
+      gameId: bundle.match?.gameId,
+      expectedHash: expected,
+      actualHash: bundle.hash,
+    });
+    throw new EvidenceError(
+      `evidence bundle hash mismatch for match ${bundle.match?.matchId ?? "unknown"}`,
+    );
+  }
 }
 
 /**
@@ -248,7 +301,7 @@ export async function buildEvidenceBundle(
     }
   }
 
-  const body: Omit<EvidenceBundle, "digest"> = {
+  const body: Omit<EvidenceBundle, "digest" | "hash" | "hashAlgorithm"> = {
     bundleVersion: EVIDENCE_BUNDLE_VERSION,
     generatedAt: (deps.now?.() ?? new Date()).toISOString(),
     match: {
@@ -276,7 +329,13 @@ export async function buildEvidenceBundle(
     },
   };
 
-  const bundle: EvidenceBundle = { ...body, digest: digestOf(body) };
+  const hash = digestOf(body);
+  const bundle: EvidenceBundle = {
+    ...body,
+    digest: hash,
+    hash,
+    hashAlgorithm: EVIDENCE_HASH_ALGORITHM,
+  };
   assertNoSecrets(bundle);
   return bundle;
 }

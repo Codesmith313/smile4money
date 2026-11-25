@@ -17,6 +17,182 @@
 import logger from '../logger.js';
 import { DlqEntry, writeToDlq } from '../queue.js';
 
+/**
+ * Operation types tracked by the oracle performance monitor. Each type keeps
+ * its own latency samples and success/failure counters so degradation in one
+ * operation (e.g. status polling) does not mask health of another.
+ */
+export type OracleOperation =
+  | 'existence_check'
+  | 'submit'
+  | 'status_poll'
+  | 'prepare'
+  | 'send';
+
+/** Latency percentiles (ms) computed from recorded samples. */
+export interface OperationPercentiles {
+  p50: number;
+  p95: number;
+  p99: number;
+}
+
+/** Aggregated performance snapshot for a single operation type. */
+export interface OperationMetrics {
+  operation: OracleOperation;
+  /** Total recorded attempts (successes + failures). */
+  total: number;
+  successes: number;
+  failures: number;
+  /** Success rate in [0, 1]; 0 when no attempts recorded. */
+  successRate: number;
+  /** Mean latency (ms) across all recorded attempts. */
+  avgLatencyMs: number;
+  /** Latency percentiles (ms) across all recorded attempts. */
+  percentiles: OperationPercentiles;
+  /** Timestamp (ms) of the most recent recorded attempt. */
+  lastUpdated: number;
+}
+
+/** Thresholds that trigger a degradation alert for an operation type. */
+export interface DegradationThresholds {
+  /** Minimum attempts before success-rate alerts are evaluated. */
+  minSamples: number;
+  /** Success rate below this value (0..1) triggers an alert. */
+  minSuccessRate: number;
+  /** p95 latency above this value (ms) triggers an alert. */
+  maxP95LatencyMs: number;
+}
+
+const DEFAULT_THRESHOLDS: DegradationThresholds = {
+  minSamples: 20,
+  minSuccessRate: 0.9,
+  maxP95LatencyMs: 5000,
+};
+
+/** Maximum number of latency samples retained per operation (ring buffer). */
+const MAX_SAMPLES = 1000;
+
+interface OperationState {
+  latencies: number[];
+  successes: number;
+  failures: number;
+  lastUpdated: number;
+}
+
+/**
+ * Shared, in-process aggregator of oracle operation performance. Records
+ * latency and outcome per operation type and exposes snapshots for the
+ * dashboard/API. Recording is synchronous and allocation-light so it can wrap
+ * every submission attempt without affecting retry behavior.
+ */
+export class OraclePerformanceMonitor {
+  private readonly state = new Map<OracleOperation, OperationState>();
+  private readonly thresholds: DegradationThresholds;
+
+  constructor(thresholds: Partial<DegradationThresholds> = {}) {
+    this.thresholds = { ...DEFAULT_THRESHOLDS, ...thresholds };
+  }
+
+  private getState(operation: OracleOperation): OperationState {
+    let s = this.state.get(operation);
+    if (!s) {
+      s = { latencies: [], successes: 0, failures: 0, lastUpdated: 0 };
+      this.state.set(operation, s);
+    }
+    return s;
+  }
+
+  /** Record a completed attempt for an operation type. */
+  record(operation: OracleOperation, latencyMs: number, success: boolean): void {
+    const s = this.getState(operation);
+    if (success) s.successes += 1;
+    else s.failures += 1;
+    s.latencies.push(latencyMs);
+    if (s.latencies.length > MAX_SAMPLES) s.latencies.shift();
+    s.lastUpdated = Date.now();
+  }
+
+  /**
+   * Time an async operation, recording its latency and outcome. Errors are
+   * re-thrown unchanged so callers keep their existing control flow.
+   */
+  async measure<T>(
+    operation: OracleOperation,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const start = Date.now();
+    try {
+      const result = await fn();
+      this.record(operation, Date.now() - start, true);
+      return result;
+    } catch (err) {
+      this.record(operation, Date.now() - start, false);
+      throw err;
+    }
+  }
+
+  private static percentiles(sorted: number[]): OperationPercentiles {
+    if (sorted.length === 0) return { p50: 0, p95: 0, p99: 0 };
+    const at = (q: number): number => {
+      const idx = Math.min(
+        sorted.length - 1,
+        Math.max(0, Math.ceil(q * sorted.length) - 1),
+      );
+      return sorted[idx];
+    };
+    return { p50: at(0.5), p95: at(0.95), p99: at(0.99) };
+  }
+
+  /** Snapshot metrics for a single operation type. */
+  snapshot(operation: OracleOperation): OperationMetrics {
+    const s = this.getState(operation);
+    const total = s.successes + s.failures;
+    const sorted = [...s.latencies].sort((a, b) => a - b);
+    const sum = sorted.reduce((acc, v) => acc + v, 0);
+    return {
+      operation,
+      total,
+      successes: s.successes,
+      failures: s.failures,
+      successRate: total === 0 ? 0 : s.successes / total,
+      avgLatencyMs: total === 0 ? 0 : sum / sorted.length,
+      percentiles: OraclePerformanceMonitor.percentiles(sorted),
+      lastUpdated: s.lastUpdated,
+    };
+  }
+
+  /** Snapshot metrics for every operation type seen so far. */
+  snapshotAll(): OperationMetrics[] {
+    return Array.from(this.state.keys()).map((op) => this.snapshot(op));
+  }
+
+  /**
+   * Evaluate degradation for an operation type. Returns a human-readable
+   * reason when thresholds are breached, otherwise null.
+   */
+  checkDegradation(operation: OracleOperation): string | null {
+    const m = this.snapshot(operation);
+    if (m.total < this.thresholds.minSamples) return null;
+    if (m.successRate < this.thresholds.minSuccessRate) {
+      return `success rate ${(m.successRate * 100).toFixed(1)}% below ${(
+        this.thresholds.minSuccessRate * 100
+      ).toFixed(1)}%`;
+    }
+    if (m.percentiles.p95 > this.thresholds.maxP95LatencyMs) {
+      return `p95 latency ${m.percentiles.p95}ms above ${this.thresholds.maxP95LatencyMs}ms`;
+    }
+    return null;
+  }
+
+  /** Reset all recorded metrics (primarily for tests). */
+  reset(): void {
+    this.state.clear();
+  }
+}
+
+/** Process-wide monitor shared by submission and settlement code paths. */
+export const oraclePerformanceMonitor = new OraclePerformanceMonitor();
+
 /** Configuration for retry behavior. */
 export interface RetryConfig {
   /** Maximum number of retry attempts before writing to DLQ. */
@@ -103,7 +279,9 @@ export async function submitWithRetry(
 
   for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
     try {
-      await handler(submission);
+      await oraclePerformanceMonitor.measure('submit', () =>
+        handler(submission)
+      );
       if (attempt > 0) {
         logger.info(
           { matchId: submission.matchId, attempt },
@@ -160,7 +338,7 @@ export async function retryDlqEntry(
 ): Promise<boolean> {
   try {
     const submission = entry.payload as OracleSubmission;
-    await handler(submission);
+    await oraclePerformanceMonitor.measure('submit', () => handler(submission));
     logger.info(
       { dlqId: entry.id, totalAttempts: entry.attempts },
       'oracle_submit: DLQ entry resolved'
@@ -202,7 +380,10 @@ export async function submitWithIdempotence(
   config: RetryConfig
 ): Promise<DlqEntry | undefined> {
   try {
-    const alreadyExists = await existenceChecker(submission.matchId);
+    const alreadyExists = await oraclePerformanceMonitor.measure(
+      'existence_check',
+      () => existenceChecker(submission.matchId)
+    );
     if (alreadyExists) {
       logger.info(
         { matchId: submission.matchId, gameId: submission.gameId },
@@ -316,54 +497,63 @@ export class SorobanSettlementClient implements SettlementClient {
   }
 
   async getMatch(matchId: number): Promise<ChainMatch> {
-    const tx = await this.build(
-      this.contract.call(
-        "get_match",
-        nativeToScVal(BigInt(matchId), { type: "u64" }),
-      ),
-    );
-    const simulation = await this.server.simulateTransaction(tx);
-    if (!rpc.Api.isSimulationSuccess(simulation) || !simulation.result) {
-      throw new Error("Unable to read escrow match");
-    }
-    return scValToNative(simulation.result.retval) as ChainMatch;
+    return oraclePerformanceMonitor.measure('status_poll', async () => {
+      const tx = await this.build(
+        this.contract.call(
+          "get_match",
+          nativeToScVal(BigInt(matchId), { type: "u64" }),
+        ),
+      );
+      const simulation = await this.server.simulateTransaction(tx);
+      if (!rpc.Api.isSimulationSuccess(simulation) || !simulation.result) {
+        throw new Error("Unable to read escrow match");
+      }
+      return scValToNative(simulation.result.retval) as ChainMatch;
+    });
   }
 
   async prepare(submission: OracleSubmission) {
-    const winner = {
-      Player1Wins: "Player1",
-      Player2Wins: "Player2",
-      Draw: "Draw",
-    }[submission.result];
-    const tx = await this.server.prepareTransaction(
-      await this.build(
-        this.contract.call(
-          "submit_result",
-          nativeToScVal(BigInt(submission.matchId), { type: "u64" }),
-          nativeToScVal(submission.gameId, { type: "string" }),
-          xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(winner)]),
-          new Address(this.signer.publicKey()).toScVal(),
+    return oraclePerformanceMonitor.measure('prepare', async () => {
+      const winner = {
+        Player1Wins: "Player1",
+        Player2Wins: "Player2",
+        Draw: "Draw",
+      }[submission.result];
+      const tx = await this.server.prepareTransaction(
+        await this.build(
+          this.contract.call(
+            "submit_result",
+            nativeToScVal(BigInt(submission.matchId), { type: "u64" }),
+            nativeToScVal(submission.gameId, { type: "string" }),
+            xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(winner)]),
+            new Address(this.signer.publicKey()).toScVal(),
+          ),
         ),
-      ),
-    );
-    tx.sign(this.signer);
-    return {
-      hash: tx.hash().toString("hex"),
-      envelope: tx.toXDR(),
-      expiresAt: Number(tx.timeBounds!.maxTime) * 1000,
-    };
+      );
+      tx.sign(this.signer);
+      return {
+        hash: tx.hash().toString("hex"),
+        envelope: tx.toXDR(),
+        expiresAt: Number(tx.timeBounds!.maxTime) * 1000,
+      };
+    });
   }
 
   async send(envelope: string): Promise<void> {
-    const response = await this.server.sendTransaction(
-      TransactionBuilder.fromXDR(envelope, this.config.networkPassphrase),
-    );
-    if (response.status === "ERROR")
-      throw new Error("Soroban rejected transaction; reconciliation required");
+    await oraclePerformanceMonitor.measure('send', async () => {
+      const response = await this.server.sendTransaction(
+        TransactionBuilder.fromXDR(envelope, this.config.networkPassphrase),
+      );
+      if (response.status === "ERROR")
+        throw new Error("Soroban rejected transaction; reconciliation required");
+    });
   }
 
   async status(hash: string) {
-    return (await this.server.getTransaction(hash)).status;
+    return oraclePerformanceMonitor.measure(
+      'status_poll',
+      async () => (await this.server.getTransaction(hash)).status,
+    );
   }
 }
 
