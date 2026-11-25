@@ -1,68 +1,47 @@
-import { matchStore } from '../store/index.js';
-import type { MatchState } from '../store/match-store.js';
+import mongoose, { Schema, type Model } from 'mongoose';
 
-export interface MatchDocument {
-  matchId: number;
-  player1: string;
-  player2: string;
-  stakeAmount: number;
-  token: string;
-  gameId: string;
-  platform: string;
-  state: MatchState;
+export interface MatchRecord {
+  matchId?: number;
+  player1?: string;
+  player2?: string;
+  userId?: string;
+  players?: string[];
+  stakeAmount?: number;
+  stake?: number;
+  token?: string;
+  gameId?: string;
+  platform?: string;
+  state?: string;
+  status?: string;
+  winner?: string;
+  depositedByPlayer1?: boolean;
+  depositedByPlayer2?: boolean;
+  createdAt?: Date;
+  updatedAt?: Date;
 }
 
-export interface MatchQueryOptions {
-  player?: string;
-  status?: MatchState | MatchState[];
-  fromDate?: number | Date;
-  toDate?: number | Date;
-  minStake?: number;
-  maxStake?: number;
-  limit?: number;
-  cursor?: string;
-}
+const matchSchema = new Schema<MatchRecord>(
+  {
+    matchId: { type: Number },
+    player1: { type: String },
+    player2: { type: String },
+    userId: { type: String },
+    players: { type: [String], default: undefined },
+    stakeAmount: { type: Number },
+    stake: { type: Number },
+    token: { type: String },
+    gameId: { type: String },
+    platform: { type: String },
+    state: { type: String },
+    status: { type: String },
+    winner: { type: String },
+    depositedByPlayer1: { type: Boolean },
+    depositedByPlayer2: { type: Boolean },
+  },
+  { timestamps: true, strict: false, collection: 'matches' },
+);
 
-export interface MatchQueryResult {
-  matches: MatchDocument[];
-  nextCursor: string | null;
-  hasMore: boolean;
-}
+export const Match: Model<MatchRecord> =
+  (mongoose.models.Match as Model<MatchRecord>) ?? mongoose.model<MatchRecord>('Match', matchSchema);
 
-export interface PlayerStatistics {
-  player: string;
-  totalMatches: number;
-  wins: number;
-  losses: number;
-  draws: number;
-  winrate: number;
-  earnings: Record<string, number>;
-}
-
-export interface MatchStatistics {
-  totalMatches: number;
-  players: PlayerStatistics[];
-  earningsByCurrency: Record<string, number>;
-}
-
-export class Match {
-  static async deleteMany(_filter: Record<string, unknown> = {}): Promise<void> {
-    matchStore.clear();
-  }
-
-  static async findOne(query: { gameId: string }): Promise<MatchDocument | null> {
-    return matchStore.findByGameId(query.gameId);
-  }
-
-  static async countDocuments(): Promise<number> {
-    return matchStore.count();
-  }
-
-  static async queryMatches(options: MatchQueryOptions = {}): Promise<MatchQueryResult> {
-    return matchStore.queryMatches(options);
-  }
-
-  static async getStatistics(): Promise<MatchStatistics> {
-    return matchStore.getStatistics();
-  }
-}
+export default Match;

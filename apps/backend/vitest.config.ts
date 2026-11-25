@@ -4,8 +4,15 @@ export default defineConfig({
   test: {
     environment: 'node',
     globals: true,
-    setupFiles: ['./tests/setup.ts'],
-    testTimeout: 10000,
-    hookTimeout: 10000,
+    env: {
+      MONGOMS_STARTUP_TIMEOUT: '60000',
+    },
+    testTimeout: 60000,
+    hookTimeout: 60000,
+    include: ['tests/**/*.test.ts'],
+    pool: 'forks',
+    poolOptions: {
+      forks: { singleFork: true },
+    },
   },
 });
