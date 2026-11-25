@@ -108,3 +108,42 @@ pub const DEFAULT_TIMEOUT_LEDGERS: u32 = TIMEOUT_LEDGERS;
 /// key component length allowed by Soroban `String` (32 bytes) plus headroom.
 /// See `docs/api-reference.md` for the accepted character set.
 pub const MAX_GAME_ID_LEN: u32 = 64;
+
+/// Number of decimal places used by the canonical internal base unit.
+///
+/// Every token amount handled by the contracts is normalized to this many
+/// decimals before any arithmetic is performed, so that tokens with different
+/// on-chain decimal configurations (6, 7, 8, …) can be compared, summed and
+/// escrowed without loss of precision. `7` matches the Stellar convention used
+/// by the native asset and by the majority of issued assets.
+///
+/// **Source:** policy decided by this repository for the multi-token work; the
+/// escrow, oracle and frontend must all agree on this value.
+pub const BASE_DECIMALS: u32 = 7;
+
+/// Maximum number of decimal places accepted from a token contract.
+///
+/// Token contracts report their decimals via `decimals()`; values above this
+/// bound are rejected rather than silently truncated, because scaling such an
+/// amount into [`BASE_DECIMALS`] would overflow or lose precision.
+///
+/// **Source:** policy decided by this repository for the multi-token work.
+pub const MAX_TOKEN_DECIMALS: u32 = 18;
+
+/// Rounding policy for token decimal normalization.
+///
+/// When a token's decimals differ from [`BASE_DECIMALS`]:
+///
+/// - **Scaling up** (token decimals `<` [`BASE_DECIMALS`]): the amount is
+///   multiplied by `10^(BASE_DECIMALS - token_decimals)`. This is exact and
+///   never rounds.
+/// - **Scaling down** (token decimals `>` [`BASE_DECIMALS`]): the amount is
+///   divided by `10^(token_decimals - BASE_DECIMALS)` using **truncation toward
+///   zero** (floor for non-negative amounts). Any remainder is discarded, so
+///   the normalized amount never exceeds the original value and the contract
+///   never credits more than was deposited. Callers that require exactness must
+///   reject amounts that are not a whole multiple of the scaling factor.
+///
+/// Token decimals above [`MAX_TOKEN_DECIMALS`] are rejected outright.
+pub const ROUNDING_POLICY: &str =
+    "truncate toward zero when scaling down; exact when scaling up";

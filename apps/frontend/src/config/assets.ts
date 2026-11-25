@@ -65,3 +65,16 @@ export function getNetworkAssets(networkPassphrase: string): AssetMetadata[] {
   }
   return assets;
 }
+
+/**
+ * Returns the decimal configuration for the asset identified by `contractId`
+ * across all supported networks, or `undefined` when the contract is unknown.
+ */
+export function getAssetDecimals(contractId: string): number | undefined {
+  if (!isValidContractId(contractId)) return undefined;
+  for (const network of Object.values(NETWORKS)) {
+    if (network.nativeContract === contractId) return 7;
+    if (network.usdc === contractId) return 6;
+  }
+  return undefined;
+}

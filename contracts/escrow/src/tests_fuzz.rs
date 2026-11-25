@@ -436,6 +436,123 @@ fn fuzz_address_validation() {
 }
 
 // ============================================================================
+// Property Tests for Token Decimals Normalization
+// ============================================================================
+
+/// Strategy that generates token decimal configurations in [0, MAX_TOKEN_DECIMALS].
+fn token_decimals_strategy() -> impl Strategy<Value = u32> {
+    0u32..=crate::MAX_TOKEN_DECIMALS
+}
+
+/// Strategy that generates non-negative raw token amounts.
+fn raw_amount_strategy() -> impl Strategy<Value = i128> {
+    0i128..=i128::MAX
+}
+
+proptest! {
+    /// Round-down invariant: denormalizing a normalized amount never exceeds the
+    /// original raw amount. Any fractional remainder is truncated (round-down
+    /// policy), so `denormalize_from_base(normalize_to_base(x, d), d) <= x`.
+    #[test]
+    fn prop_normalize_denormalize_round_down(
+        amount in raw_amount_strategy(),
+        decimals in token_decimals_strategy(),
+    ) {
+        let base = crate::normalize_to_base(amount, decimals)
+            .expect("non-negative amount within range should normalize");
+        let round_trip = crate::denormalize_from_base(base, decimals)
+            .expect("normalized base amount should denormalize");
+        prop_assert!(
+            round_trip <= amount,
+            "round-trip {} -> {} -> {} must not exceed original amount (decimals={})",
+            amount, base, round_trip, decimals
+        );
+    }
+
+    /// Normalization is monotonic: for `a <= b`, `normalize_to_base(a, d) <= normalize_to_base(b, d)`.
+    #[test]
+    fn prop_normalize_is_monotonic(
+        a in raw_amount_strategy(),
+        delta in 0i128..=i128::MAX,
+        decimals in token_decimals_strategy(),
+    ) {
+        let b = match a.checked_add(delta) {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+        let norm_a = crate::normalize_to_base(a, decimals).unwrap();
+        let norm_b = crate::normalize_to_base(b, decimals).unwrap();
+        prop_assert!(
+            norm_a <= norm_b,
+            "normalize_to_base must be monotonic: {} <= {} (decimals={})",
+            norm_a, norm_b, decimals
+        );
+    }
+
+    /// Amounts whose normalization would overflow the common base unit are rejected.
+    #[test]
+    fn prop_normalize_rejects_overflow(
+        amount in raw_amount_strategy(),
+        decimals in token_decimals_strategy(),
+    ) {
+        let result = crate::normalize_to_base(amount, decimals);
+        if let Some(scale) = 10i128.checked_pow(decimals) {
+            if amount.checked_mul(scale).is_none() {
+                prop_assert!(
+                    result.is_err(),
+                    "normalization of {} at {} decimals should be rejected on overflow",
+                    amount, decimals
+                );
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Property Tests for Token Whitelist Gating
+// ============================================================================
+
+proptest! {
+    /// Whitelist membership is the sole gate for token acceptance: a token is
+    /// accepted by `create_match` if and only if it is whitelisted.
+    #[test]
+    fn prop_whitelist_is_sole_gate(whitelisted in any::<bool>()) {
+        let fixture = FuzzTestFixture::setup();
+        let client = fixture.get_client();
+
+        let token = if whitelisted {
+            fixture.token.clone()
+        } else {
+            let other = fixture.env.register_stellar_asset_contract_v2(fixture.admin.clone());
+            other.address()
+        };
+
+        if !whitelisted {
+            client.remove_token(&fixture.admin, &token);
+        }
+
+        let game_id = String::from_str(&fixture.env, "whitelist_gate");
+        let result = client.try_create_match(
+            &fixture.player1,
+            &fixture.player2,
+            &100,
+            &token,
+            &game_id,
+            &Platform::Lichess,
+        );
+
+        if whitelisted {
+            prop_assert!(result.is_ok(), "whitelisted token should be accepted");
+        } else {
+            prop_assert!(
+                matches!(result, Err(Ok(Error::TokenNotWhitelisted))),
+                "non-whitelisted token must be rejected"
+            );
+        }
+    }
+}
+
+// ============================================================================
 // Property Tests for Escrow Balance Non-Negativity
 // ============================================================================
 
