@@ -11,6 +11,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import type { CanonicalSettlementEvidence, CreateMatchPayload, isMatchState, MatchRecord, MatchStorePort } from './match-store.js';
 import type { MatchState, MatchStateChange, WebhookDelivery, WebhookSubscription } from './match-store.js';
+import type { MatchQueryFilters, MatchQueryPage, MatchStatistics } from './match-store.js';
 import { computeIdentityHash } from '../services/player-identity.js';
 import { randomUUID } from 'node:crypto';
 import { SqliteConnectionPool } from './sqlite-connection-pool.js';
@@ -83,7 +84,42 @@ function readMatch(row: any): MatchRecord {
     identityHash: row.identityHash ?? undefined,
     resultSubmittedAt: row.resultSubmittedAt ?? undefined,
     disputeDeadline: row.disputeDeadline ?? undefined,
+    cancellationReason: row.cancellationReason ?? undefined,
   };
+}
+
+// #2133/#2134 — Build a parameterized WHERE clause from match query filters.
+// Returns the SQL fragment (without the leading WHERE) and its bound params.
+function buildMatchFilterClause(filters: MatchQueryFilters): { clause: string; params: unknown[] } {
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+
+  if (filters.player) {
+    conditions.push('(lower(player1) = lower(?) OR lower(player2) = lower(?))');
+    params.push(filters.player, filters.player);
+  }
+  if (filters.state) {
+    conditions.push('state = ?');
+    params.push(filters.state);
+  }
+  if (filters.createdAfter !== undefined) {
+    conditions.push('createdAt >= ?');
+    params.push(filters.createdAfter);
+  }
+  if (filters.createdBefore !== undefined) {
+    conditions.push('createdAt <= ?');
+    params.push(filters.createdBefore);
+  }
+  if (filters.minStake !== undefined) {
+    conditions.push('stakeAmount >= ?');
+    params.push(filters.minStake);
+  }
+  if (filters.maxStake !== undefined) {
+    conditions.push('stakeAmount <= ?');
+    params.push(filters.maxStake);
+  }
+
+  return { clause: conditions.length > 0 ? conditions.join(' AND ') : '', params };
 }
 
 function logSlowQuery(query: string, durationMs: number): void {
@@ -146,6 +182,11 @@ export class SqliteMatchStore implements MatchStorePort {
         }
 
         await applySqliteMigrations(db, SQLITE_SCHEMA_MIGRATIONS['match-store']);
+        // #2133/#2134 — Supporting indexes for match search/filter and pagination.
+        await runAsync(db, 'CREATE INDEX IF NOT EXISTS idx_matches_state ON matches(state)');
+        await runAsync(db, 'CREATE INDEX IF NOT EXISTS idx_matches_stake ON matches(stakeAmount)');
+        await runAsync(db, 'CREATE INDEX IF NOT EXISTS idx_matches_player1 ON matches(player1)');
+        await runAsync(db, 'CREATE INDEX IF NOT EXISTS idx_matches_player2 ON matches(player2)');
         await runAsync(db, "DELETE FROM settlement_evidence WHERE evaluatedAt < datetime('now', '-30 days')");
         const row = await new Promise<{ nextId: number }>((resolve, reject) =>
           db.get('SELECT COALESCE(MAX(matchId), -1) + 1 AS nextId FROM matches', (error, result: { nextId: number } | undefined) =>
@@ -188,8 +229,8 @@ export class SqliteMatchStore implements MatchStorePort {
       (db) =>
         new Promise((resolve, reject) => {
           const stmt = db.prepare(
-            `INSERT INTO matches (matchId, player1, player2, player1Username, player2Username, stakeAmount, token, gameId, platform, state, identityHash)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?)`,
+            `INSERT INTO matches (matchId, player1, player2, player1Username, player2Username, stakeAmount, token, gameId, platform, state, identityHash, cancellationReason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?, ?)`,
           );
 
           const matchId = this.nextId++;
@@ -204,6 +245,7 @@ export class SqliteMatchStore implements MatchStorePort {
             payload.gameId,
             payload.platform,
             identityHash,
+            payload.cancellationReason ?? null,
             function (this: sqlite3.RunResult, err: Error | null) {
               if (err) {
                 reject(err);
@@ -221,6 +263,7 @@ export class SqliteMatchStore implements MatchStorePort {
                 platform: payload.platform,
                 state: 'Pending',
                 identityHash: identityHash ?? undefined,
+                cancellationReason: payload.cancellationReason ?? undefined,
               });
             },
           );
@@ -279,6 +322,95 @@ export class SqliteMatchStore implements MatchStorePort {
     );
   }
 
+  /**
+   * #2133/#2134 — Query matches with combinable filters and cursor-based
+   * pagination. Results are ordered by matchId DESC; the cursor is the last
+   * matchId of the previous page (exclusive), so pages are stable even as new
+   * matches are inserted.
+   */
+  async queryMatches(filters: MatchQueryFilters): Promise<MatchQueryPage> {
+    const { clause, params } = buildMatchFilterClause(filters);
+    const conditions: string[] = [];
+    const bound: unknown[] = [...params];
+
+    if (clause) conditions.push(clause);
+    if (filters.cursor !== undefined) {
+      conditions.push('matchId < ?');
+      bound.push(filters.cursor);
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const limit = Math.max(1, Math.floor(filters.limit ?? 50));
+    // Fetch one extra row to detect whether another page exists.
+    const query = `SELECT * FROM matches ${where} ORDER BY matchId DESC LIMIT ?`;
+    bound.push(limit + 1);
+
+    const startedAt = performance.now();
+    const rows = await this.withConnection(
+      (db) =>
+        new Promise<any[]>((resolve, reject) => {
+          db.all(query, bound, (err: Error | null, result: any[]) => {
+            logSlowQuery(query, performance.now() - startedAt);
+            if (err) reject(err);
+            else resolve(result);
+          });
+        }),
+    );
+
+    const hasMore = rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    const items = pageRows.map(readMatch);
+    const nextCursor = hasMore && items.length > 0 ? items[items.length - 1].matchId : null;
+
+    return { items, nextCursor, hasMore };
+  }
+
+  /**
+   * #2135 — Aggregate match statistics computed live on each call.
+   * - totalMatches: total number of matches
+   * - perPlayer: win/loss/draw counts for the requested player (if any)
+   * - earningsByCurrency: summed stakeAmount of completed matches grouped by token
+   */
+  async getMatchStatistics(player?: string): Promise<MatchStatistics> {
+    return this.withConnection(async (db) => {
+      const totalMatches = await new Promise<number>((resolve, reject) =>
+        db.get('SELECT COUNT(*) AS count FROM matches', (err: Error | null, row: any) => (err ? reject(err) : resolve(row?.count ?? 0))),
+      );
+
+      const earningsByCurrency = await new Promise<Array<{ currency: string; total: number; count: number }>>((resolve, reject) =>
+        db.all(
+          `SELECT token AS currency, COALESCE(SUM(stakeAmount), 0) AS total, COUNT(*) AS count
+           FROM matches WHERE state = 'Completed' GROUP BY token ORDER BY token`,
+          (err: Error | null, rows: Array<{ currency: string; total: number; count: number }>) => (err ? reject(err) : resolve(rows)),
+        ),
+      );
+
+      let perPlayer: MatchStatistics['perPlayer'] = null;
+      if (player) {
+        const row = await new Promise<{ wins: number; losses: number; draws: number; total: number }>((resolve, reject) =>
+          db.get(
+            `SELECT
+               COALESCE(SUM(CASE WHEN state = 'Completed' AND lower(player1) = lower(?) THEN 1 ELSE 0 END), 0) AS wins,
+               COALESCE(SUM(CASE WHEN state = 'Completed' AND lower(player2) = lower(?) THEN 1 ELSE 0 END), 0) AS losses,
+               COALESCE(SUM(CASE WHEN state = 'Cancelled' AND (lower(player1) = lower(?) OR lower(player2) = lower(?)) THEN 1 ELSE 0 END), 0) AS draws,
+               COUNT(*) AS total
+             FROM matches WHERE lower(player1) = lower(?) OR lower(player2) = lower(?)`,
+            [player, player, player, player, player, player],
+            (err: Error | null, result: any) => (err ? reject(err) : resolve(result)),
+          ),
+        );
+        const wins = row?.wins ?? 0;
+        const losses = row?.losses ?? 0;
+        const draws = row?.draws ?? 0;
+        const total = row?.total ?? 0;
+        const winrate = total > 0 ? wins / total : 0;
+        perPlayer = { player, wins, losses, draws, total, winrate };
+      }
+
+      return { totalMatches, perPlayer, earningsByCurrency };
+    });
+  }
+
   async listMatchesForStateSync(): Promise<MatchRecord[]> {
     return this.withConnection(
       (db) =>
@@ -291,7 +423,27 @@ export class SqliteMatchStore implements MatchStorePort {
     );
   }
 
-  async updateMatchState(matchId: number, state: MatchState): Promise<MatchStateChange | null> {
+  /**
+   * #2137 — List matches filtered by cancellation reason.
+   * Only matches that were cancelled with the given reason are returned.
+   */
+  async listMatchesByCancellationReason(reason: string): Promise<MatchRecord[]> {
+    return this.withConnection(
+      (db) =>
+        new Promise((resolve, reject) => {
+          db.all(
+            `SELECT * FROM matches WHERE state = 'Cancelled' AND cancellationReason = ? ORDER BY matchId`,
+            [reason],
+            (err: Error | null, rows: any[]) => {
+              if (err) reject(err);
+              else resolve(rows.map(readMatch));
+            },
+          );
+        }),
+    );
+  }
+
+  async updateMatchState(matchId: number, state: MatchState, cancellationReason?: string): Promise<MatchStateChange | null> {
     return this.withConnection(async (db) => {
       await runAsync(db, 'BEGIN IMMEDIATE');
       try {
@@ -322,10 +474,12 @@ export class SqliteMatchStore implements MatchStorePort {
             windowMs: disputeDeadline - resultSubmittedAt,
           });
         }
+        // #2137 — Record the cancellation reason when the match is cancelled.
+        const reason = state === 'Cancelled' ? cancellationReason ?? match.cancellationReason : match.cancellationReason;
         await runWithParams(
           db,
-          'UPDATE matches SET state = ?, resultSubmittedAt = ?, disputeDeadline = ? WHERE matchId = ?',
-          [state, resultSubmittedAt ?? null, disputeDeadline ?? null, matchId],
+          'UPDATE matches SET state = ?, resultSubmittedAt = ?, disputeDeadline = ?, cancellationReason = ? WHERE matchId = ?',
+          [state, resultSubmittedAt ?? null, disputeDeadline ?? null, reason ?? null, matchId],
         );
         const subscriptions = await new Promise<Array<{ id: string; url: string; secret: string }>>((resolve, reject) =>
           db.all(
@@ -340,7 +494,13 @@ export class SqliteMatchStore implements MatchStorePort {
             id: eventId,
             type: 'match.state_changed',
             occurredAt: new Date().toISOString(),
-            data: { matchId, gameId: match.gameId, previousState, state },
+            data: {
+              matchId,
+              gameId: match.gameId,
+              previousState,
+              state,
+              ...(state === 'Cancelled' && reason ? { cancellationReason: reason } : {}),
+            },
           });
           for (const subscription of subscriptions) {
             await runWithParams(
@@ -353,7 +513,11 @@ export class SqliteMatchStore implements MatchStorePort {
           }
         }
         await runAsync(db, 'COMMIT');
-        return { match: { ...match, state, resultSubmittedAt, disputeDeadline }, previousState, state };
+        return {
+          match: { ...match, state, resultSubmittedAt, disputeDeadline, cancellationReason: reason ?? undefined },
+          previousState,
+          state,
+        };
       } catch (error) {
         await runAsync(db, 'ROLLBACK').catch(() => undefined);
         throw error;

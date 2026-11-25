@@ -47,6 +47,9 @@ const DEFAULT_SQLITE_POOL_SIZE = 5;
 /** Default idle timeout for pooled SQLite connections (30 seconds). */
 const DEFAULT_SQLITE_POOL_IDLE_TIMEOUT_MS = 30 * 1000;
 
+/** Default session lifetime (1 hour) before a session expires (#2129). */
+const DEFAULT_SESSION_TTL_MS = 60 * 60 * 1000;
+
 /**
  * Default grace period (seconds) during which old API credentials remain
  * valid after a rotation (#2112). Defaults to 24 hours.
@@ -398,6 +401,35 @@ export interface Env {
    * Must be a positive integer.
    */
   disputeWindowSeconds: number;
+
+  /**
+   * Whitelisted frontend origins allowed to make browser (CORS) requests
+   * (#2130).
+   *
+   * Sourced from CORS_ALLOWED_ORIGINS (or ALLOWED_ORIGINS as a fallback),
+   * a comma-separated list of origins such as
+   * "https://app.example.com,https://admin.example.com".
+   * Empty when unset, in which case no cross-origin browser requests are
+   * permitted.
+   */
+  corsAllowedOrigins: string[];
+
+  /**
+   * Lifetime of an authenticated session in milliseconds (#2129).
+   *
+   * Sourced from SESSION_TTL_MS. Defaults to 3600000 (1 hour) when unset.
+   * Must be a positive integer; used to enforce session timeouts.
+   */
+  sessionTtlMs: number;
+
+  /**
+   * Shared secret used to verify HMAC-SHA256 request signatures for critical
+   * operations (#2131).
+   *
+   * Sourced from REQUEST_SIGNING_SECRET. Empty when unset; signature
+   * verification for critical operations must refuse to run without it.
+   */
+  requestSigningSecret: string;
 }
 
 /**
@@ -474,6 +506,15 @@ function loadEnv(): Env {
       'DISPUTE_WINDOW_SECONDS',
       DEFAULT_DISPUTE_WINDOW_SECONDS
     ),
+    corsAllowedOrigins: parseString(
+      'CORS_ALLOWED_ORIGINS',
+      parseString('ALLOWED_ORIGINS', '')
+    )
+      .split(',')
+      .map((origin) => origin.trim())
+      .filter((origin) => origin.length > 0),
+    sessionTtlMs: parsePositiveInt('SESSION_TTL_MS', DEFAULT_SESSION_TTL_MS),
+    requestSigningSecret: parseString('REQUEST_SIGNING_SECRET', ''),
   };
 }
 

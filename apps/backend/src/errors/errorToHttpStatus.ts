@@ -117,45 +117,47 @@ export function errorToCode(error: unknown): ErrorCode {
  * unrecognized error is, by definition, an unexpected server-side failure.
  */
 export function errorToHttpStatus(error: unknown): number {
-  if (error instanceof ProviderFetchError) {
-    return error.policy === 'retry' ? 503 : 422;
+  // Derive the status from the same classification `errorToCode` uses, so
+  // the code and status in an error response can never disagree.
+  switch (errorToCode(error)) {
+    case 'PROVIDER_FETCH_ERROR':
+      // 503 — retryable upstream failure; 422 — non-retryable upstream
+      // response the caller cannot fix by retrying.
+      return error instanceof ProviderFetchError && error.policy === 'retry'
+        ? 503
+        : 422;
+
+    // 400 — malformed/invalid input; the caller must change the request.
+    case 'VALIDATION_ERROR':
+      return 400;
+
+    // 404 — the match, the game on the upstream chess platform, or the
+    // upstream player account does not exist.
+    case 'NOT_FOUND':
+      return 404;
+
+    // 409 — conflicts with existing state (e.g. a duplicate gameId).
+    case 'CONFLICT':
+      return 409;
+
+    // 429 — an upstream API rate limit was hit after exhausting internal
+    // retries. Distinct from 500 so callers know this is retryable, not a
+    // permanent failure.
+    case 'RATE_LIMIT':
+      return 429;
+
+    // 504 — an upstream Soroban RPC call did not respond within its
+    // configured timeout (#1718). Distinct from 500: the server itself is
+    // fine, a downstream dependency did not respond in time.
+    case 'RPC_TIMEOUT':
+      return 504;
+
+    case 'INTERNAL_ERROR':
+      break;
   }
 
-  // 400 — malformed/invalid input; the caller must change the request.
-  if (error instanceof ValidationError) {
-    return 400;
-  }
-
-  // 404 — the match, the game on the upstream chess platform, or the
-  // upstream player account does not exist.
-  if (
-    error instanceof NotFoundError ||
-    error instanceof LichessFetcherGameNotFoundError ||
-    error instanceof LichessServiceGameNotFoundError ||
-    error instanceof UserNotFoundError
-  ) {
-    return 404;
-  }
-
-  // 409 — conflicts with existing state (e.g. a duplicate gameId).
-  if (error instanceof ConflictError) {
-    return 409;
-  }
-
-  // 429 — an upstream API rate limit was hit after exhausting internal
-  // retries. Distinct from 500 so callers know this is retryable, not a
-  // permanent failure.
-  if (RateLimitError.isRateLimitError(error)) {
-    return 429;
-  }
-
-  // 504 — an upstream Soroban RPC call did not respond within its configured
-  // timeout (#1718). Distinct from 500: the server itself is fine, a
-  // downstream dependency did not respond in time.
-  if (RpcTimeoutError.isRpcTimeoutError(error)) {
-    return 504;
-  }
-
+  // Unrecognized errors that still carry an explicit HTTP status (e.g. from
+  // a third-party library) are honored when it is a valid error status.
   if (error && typeof error === 'object') {
     const status =
       'status' in error

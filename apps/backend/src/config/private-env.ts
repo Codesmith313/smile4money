@@ -11,6 +11,8 @@ export interface PrivateEnv {
   mainnetDeployerSecretKey: string | undefined;
   mongodbUrl: string | undefined;
   credentialRotationAdminToken: string | undefined;
+  requestSigningSecret: string | undefined;
+  sessionSecret: string | undefined;
 }
 
 export const privateEnv: PrivateEnv = {
@@ -37,5 +39,11 @@ export const privateEnv: PrivateEnv = {
   },
   get credentialRotationAdminToken() {
     return process.env.CREDENTIAL_ROTATION_ADMIN_TOKEN;
+  },
+  get requestSigningSecret() {
+    return process.env.REQUEST_SIGNING_SECRET;
+  },
+  get sessionSecret() {
+    return process.env.SESSION_SECRET;
   },
 };

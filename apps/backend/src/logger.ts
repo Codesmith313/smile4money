@@ -45,6 +45,13 @@ const ENUM_FIELDS: Record<string, readonly string[]> = {
   replay_result: ['success', 'failed'],
   stall_state: ['stalled', 'progressing'],
   integrity_status: ['ok', 'failed'],
+  auth_failure_reason: [
+    'missing_header',
+    'invalid_payload',
+    'expired',
+    'invalid_signature',
+    'unknown',
+  ],
 };
 const STRING_FIELD_PATTERNS: Record<string, RegExp> = {
   trace_id: /^[a-f0-9]{32}$/,
@@ -52,6 +59,8 @@ const STRING_FIELD_PATTERNS: Record<string, RegExp> = {
   span_id: /^[a-f0-9]{16}$/,
   parent_span_id: /^[a-f0-9]{16}$/,
   request_id: /^[a-f0-9]{16}$/,
+  // Stellar account address (ed25519 public key, StrKey base32 encoding).
+  user_id: /^G[A-Z2-7]{55}$/,
 };
 
 function safeErrorDetails(error: unknown): Record<string, unknown> {

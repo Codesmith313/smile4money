@@ -78,6 +78,14 @@ export const SQLITE_SCHEMA_MIGRATIONS: Record<string, SqliteMigration[]> = {
       ],
       down: ["ALTER TABLE settlement_evidence DROP COLUMN provider"],
     },
+    {
+      version: 5,
+      name: "add-match-cancellation-reason",
+      statements: [
+        "ALTER TABLE matches ADD COLUMN cancellationReason TEXT",
+      ],
+      down: ["ALTER TABLE matches DROP COLUMN cancellationReason"],
+    },
   ],
   "oracle-queue": [
     {
@@ -235,6 +243,26 @@ export const SQLITE_SCHEMA_MIGRATIONS: Record<string, SqliteMigration[]> = {
       down: [
         "DROP INDEX IF EXISTS idx_api_credentials_status_expires_at",
         "DROP TABLE IF EXISTS api_credentials",
+      ],
+    },
+  ],
+  sessions: [
+    {
+      version: 1,
+      name: "create-sessions",
+      statements: [
+        `CREATE TABLE IF NOT EXISTS sessions (
+          session_id TEXT PRIMARY KEY NOT NULL,
+          principal TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          revoked_at INTEGER
+        )`,
+        "CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)",
+      ],
+      down: [
+        "DROP INDEX IF EXISTS idx_sessions_expires_at",
+        "DROP TABLE IF EXISTS sessions",
       ],
     },
   ],
