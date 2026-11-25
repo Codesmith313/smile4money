@@ -1,6 +1,8 @@
 import { Router } from 'express';
 import { matchStore, evidenceStore } from '../store/index.js';
 import { authenticate } from '../middleware/auth.js';
+import { requirePermission, requireSignature } from '../middleware/permissions.js';
+import { Permission } from '../permissions.js';
 import { validateSubmitResultInput, verifyGameResult } from '../services/oracle-service.js';
 import {
   getOracleConfig,
@@ -146,7 +148,11 @@ router.get('/dashboard', (_req, res) => {
  * The oracle (a privileged service) must then sign the result and call the
  * escrow contract's `submit_result` method on Stellar Soroban.
  */
-router.post('/submit-result', async (req, res, next) => {
+router.post(
+  '/submit-result',
+  requirePermission(Permission.submit_results),
+  requireSignature,
+  async (req, res, next) => {
   const payload = req.body;
 
   if (!payload || typeof payload !== 'object') {
@@ -202,6 +208,7 @@ router.post('/submit-result', async (req, res, next) => {
         ),
       );
   }
-});
+  },
+);
 
 export default router;

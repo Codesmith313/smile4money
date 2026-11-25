@@ -9,10 +9,25 @@ import {
 
 const RETRY_ATTEMPT_BUCKETS = [0, 1, 2, 3, 5, 10, 25, 50, 100];
 
-export function renderDlqMetrics(
+export interface DlqRetryHistogramBucket {
+  le: number | "+Inf";
+  count: number;
+}
+
+export interface DlqMetricsSnapshot {
+  depth: number;
+  oldestEntryAgeMs: number;
+  retryAttempts: {
+    buckets: DlqRetryHistogramBucket[];
+    sum: number;
+    count: number;
+  };
+}
+
+export function buildDlqMetricsSnapshot(
   entries: readonly DlqEntry[],
   nowMs = Date.now(),
-): string {
+): DlqMetricsSnapshot {
   if (!Number.isFinite(nowMs)) {
     throw new Error("Metrics timestamp must be finite");
   }
@@ -36,8 +51,34 @@ export function renderDlqMetrics(
   }
 
   const depth = entries.length;
-  const oldestAgeSeconds =
-    depth === 0 ? 0 : Math.max(0, (nowMs - oldestCreatedAt) / 1000);
+  const oldestEntryAgeMs =
+    depth === 0 ? 0 : Math.max(0, nowMs - oldestCreatedAt);
+  const buckets: DlqRetryHistogramBucket[] = RETRY_ATTEMPT_BUCKETS.map(
+    (bucket) => ({
+      le: bucket,
+      count: attempts.filter((value) => value <= bucket).length,
+    }),
+  );
+  buckets.push({ le: "+Inf", count: depth });
+
+  return {
+    depth,
+    oldestEntryAgeMs,
+    retryAttempts: {
+      buckets,
+      sum: retryAttemptSum,
+      count: depth,
+    },
+  };
+}
+
+export function renderDlqMetrics(
+  entries: readonly DlqEntry[],
+  nowMs = Date.now(),
+): string {
+  const snapshot = buildDlqMetricsSnapshot(entries, nowMs);
+  const depth = snapshot.depth;
+  const oldestAgeSeconds = snapshot.oldestEntryAgeMs / 1000;
   const lines = [
     "# HELP oracle_dlq_depth Number of pending dead-letter queue entries.",
     "# TYPE oracle_dlq_depth gauge",
@@ -49,14 +90,14 @@ export function renderDlqMetrics(
     "# TYPE oracle_dlq_retry_attempts histogram",
   ];
 
-  for (const bucket of RETRY_ATTEMPT_BUCKETS) {
-    const count = attempts.filter((value) => value <= bucket).length;
-    lines.push(`oracle_dlq_retry_attempts_bucket{le="${bucket}"} ${count}`);
+  for (const bucket of snapshot.retryAttempts.buckets) {
+    lines.push(
+      `oracle_dlq_retry_attempts_bucket{le="${bucket.le}"} ${bucket.count}`,
+    );
   }
   lines.push(
-    `oracle_dlq_retry_attempts_bucket{le="+Inf"} ${depth}`,
-    `oracle_dlq_retry_attempts_sum ${retryAttemptSum}`,
-    `oracle_dlq_retry_attempts_count ${depth}`,
+    `oracle_dlq_retry_attempts_sum ${snapshot.retryAttempts.sum}`,
+    `oracle_dlq_retry_attempts_count ${snapshot.retryAttempts.count}`,
   );
 
   return `${lines.join("\n")}\n`;
@@ -166,6 +207,15 @@ export function createMetricsRouter(
         .send(
           `${metrics.render()}${renderDlqMetrics(entries)}${renderOracleMetrics(oracleSnapshot)}`,
         );
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  router.get("/dlq", async (_req, res, next) => {
+    try {
+      const entries = await loadEntries();
+      return res.status(200).json(buildDlqMetricsSnapshot(entries));
     } catch (error) {
       return next(error);
     }

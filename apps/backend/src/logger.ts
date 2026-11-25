@@ -55,6 +55,13 @@ const ENUM_FIELDS: Record<string, readonly string[]> = {
   operation: ['submit_result', 'has_result', 'fetch_result'],
   config_field: ['endpoint', 'credential'],
   alert: ['degraded', 'ok'],
+  auth_failure_reason: [
+    'missing_header',
+    'invalid_payload',
+    'expired',
+    'invalid_signature',
+    'unknown',
+  ],
 };
 const STRING_FIELD_PATTERNS: Record<string, RegExp> = {
   trace_id: /^[a-f0-9]{32}$/,
@@ -62,6 +69,8 @@ const STRING_FIELD_PATTERNS: Record<string, RegExp> = {
   span_id: /^[a-f0-9]{16}$/,
   parent_span_id: /^[a-f0-9]{16}$/,
   request_id: /^[a-f0-9]{16}$/,
+  // Stellar account address (ed25519 public key, StrKey base32 encoding).
+  user_id: /^G[A-Z2-7]{55}$/,
 };
 
 function safeErrorDetails(error: unknown): Record<string, unknown> {
@@ -347,8 +356,6 @@ class Logger {
     } else {
       this.errorWithDeduplication(context, message || '');
     }
-    this.log('error', { ...ctx, severity }, msg);
-    this.maybeAlert(severity, ctx, msg);
   }
 
   critical(context: LogContext | string, message?: string): void {
