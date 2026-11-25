@@ -24,6 +24,7 @@ A Soroban smart contract for trustless chess match wagering on Stellar. It holds
   - [create_match](#create_match)
   - [deposit](#deposit)
   - [submit_result](#submit_result)
+  - [enforce_timeout](#enforce_timeout)
   - [cancel_match](#cancel_match)
   - [get_match](#get_match)
   - [is_funded](#is_funded)
@@ -41,15 +42,19 @@ A Soroban smart contract for trustless chess match wagering on Stellar. It holds
 Player1 + Player2 agree on a stake
         │
         ▼
-   create_match()  ──► Pending
-        │
-   deposit() x2   ──► Active
-        │
-  submit_result() ──► PendingResult  (dispute window; admin may correct)
-        │
-  finalize_result() ──► Completed  (winner gets 2× stake, or draw refunds both)
-        │
-   cancel_match() ──► Cancelled  (refunds any deposits already made)
+       create_match() ──► Pending ── deposit() × 2 ──► Active
+                           │                            │
+                     cancel_match()              submit_result()
+                           │                            │
+                           ▼                            ▼
+                       Cancelled                  PendingResult
+                                                      │
+                                               finalize_result()
+                                                      │
+                                                      ▼
+                                                  Completed
+
+                 Active ── enforce_timeout() ──► Cancelled
 ```
 
 The contract is initialized once with an **admin** and an **oracle** address. The admin controls administrative operations (pause/unpause, oracle rotation). The oracle is the only address authorized to submit match results.
@@ -78,7 +83,7 @@ pub enum MatchState {
     Active,     // Both players deposited; game in progress
     PendingResult, // Result submitted; dispute window is open
     Completed,  // Result finalized; payout executed
-    Cancelled,  // Cancelled before activation
+    Cancelled,  // Cancelled before activation or after timeout
 }
 ```
 
@@ -355,7 +360,7 @@ pub fn create_match(
 | `player2` | `Address` | Second player |
 | `stake_amount` | `i128` | Amount each player must deposit (must be > 0) |
 | `token` | `Option<Address>` | SEP-41 token for this match. `None` uses the contract's default token. A non-`None` value must be on the admin-managed allowlist (see [`add_token`](#add_token)). |
-| `game_id` | `String` | Unique identifier for the chess game (max 64 bytes) |
+| `game_id` | `String` | Identifier for the chess game (max 64 bytes; duplicates rejected while the match record is retained) |
 | `platform` | `Platform` | Chess platform (`Lichess` or `ChessDotCom`) |
 
 The resolved token is stored on the match and is the token `deposit` pulls and
@@ -372,7 +377,7 @@ same contract.
 | `InvalidAmount` | `stake_amount` is ≤ 0 |
 | `InvalidPlayers` | `player1 == player2` |
 | `InvalidGameId` | `game_id` length exceeds 64 bytes |
-| `DuplicateGameId` | A match with this `game_id` already exists |
+| `DuplicateGameId` | A match with this `game_id` is still retained |
 | `AlreadyExists` | Internal: match ID collision (should not occur in practice) |
 | `Overflow` | Internal match counter overflow |
 
@@ -382,7 +387,7 @@ Emits `("match", "created")` with data `(match_id, player1, player2, stake_amoun
 
 **Storage**
 
-Match data is stored with a TTL of ~30 days (518,400 ledgers at 5s/ledger). The `game_id` is also stored to prevent reuse.
+Match data is stored with a TTL of ~30 days (518,400 ledgers at 5s/ledger). The `game_id` deduplication index is refreshed whenever the match is updated and expires with the match, preventing reuse throughout the match-retention window.
 
 **Example**
 
@@ -553,6 +558,29 @@ client.cancel_match(&match_id, &player1);
 
 ---
 
+### `enforce_timeout`
+
+Permissionlessly cancels an `Active` match and refunds both players after the
+configured `timeout_ledgers` have elapsed without an oracle result.
+
+```rust
+pub fn enforce_timeout(env: Env, match_id: u64) -> Result<(), Error>
+```
+
+Soroban contracts cannot submit transactions on their own. A player, keeper,
+or any other account must invoke this function after the deadline; the contract
+checks the activation ledger and performs the cancellation and refunds
+atomically. Oracle submissions after the timeout are rejected.
+
+| Error | Condition |
+|-------|-----------|
+| `MatchNotFound` | No match exists for `match_id` |
+| `InvalidState` | Match is not `Active` |
+| `TimeoutNotReached` | The configured timeout has not elapsed |
+| `InsufficientReserve` | The contract cannot refund both stakes and preserve its reserve |
+
+---
+
 ### `get_match`
 
 Returns the full `Match` struct for a given match ID.
@@ -665,15 +693,13 @@ create_match()
   deposit() × 2
       │
       ▼
-  [Active]
-      │
-  submit_result()
-      │
-      ▼
-  [Completed]
+  [Active] ── submit_result() ──► [PendingResult] ── finalize_result() ──► [Completed]
+     │
+     └── enforce_timeout() ──► [Cancelled]
 ```
 
-- A match in `Active` or `Completed` state **cannot** be cancelled.
+- A match in `Active` state can be cancelled by mutual player agreement or
+  permissionlessly after its timeout. Completed matches are terminal.
 - A match in `Pending` state **cannot** have a result submitted.
 - Deposits are only accepted in `Pending` state.
 
@@ -683,14 +709,21 @@ create_match()
 
 | Topic | Data | Emitted By |
 |-------|------|------------|
+| `("match", "transition")` | `(match_id, from_state, to_state, player1, player2, stake_amount, player1_amount, player2_amount)` | Every match lifecycle transition |
 | `("match", "created")` | `(match_id, player1, player2, stake_amount)` | `create_match` |
 | `("match", "deposit")` | `(match_id, player)` | `deposit` |
 | `("match", "activated")` | `match_id` | `deposit` (when both deposited) |
-| `("match", "completed")` | `(match_id, winner)` | `submit_result` |
-| `("match", "cancelled")` | `match_id` | `cancel_match` |
+| `("match", "completed")` | `(match_id, winner, payout_amount)` | `finalize_result` |
+| `("match", "cancelled")` | `(match_id, caller, player1_refund, player2_refund)` | `cancel_match` |
+| `("match", "timeout")` | `(match_id, caller)` | `claim_timeout` |
 | `("admin", "oracle")` | `new_oracle` | `update_oracle` |
 | `("admin", "paused")` | `()` | `pause` |
 | `("admin", "unpaused")` | `()` | `unpause` |
+
+The transition event uses `None` for `from_state` when a newly created match
+enters `Pending`. The two per-player amounts are zero for non-payout
+transitions; for completion or cancellation they record the amount paid or
+refunded to each player.
 
 ---
 

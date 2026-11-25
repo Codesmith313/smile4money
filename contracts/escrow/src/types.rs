@@ -49,15 +49,15 @@ pub enum MatchState {
     ///
     /// Funds are held in escrow by the contract. The only way to leave this
     /// state is for the trusted oracle to call
-    /// [`submit_result`](crate::EscrowContract::submit_result) or for a
-    /// player to call [`claim_timeout`](crate::EscrowContract::claim_timeout)
-    /// after `TIMEOUT_LEDGERS` have elapsed since activation.
+    /// [`submit_result`](crate::EscrowContract::submit_result) or for any
+    /// account to call [`enforce_timeout`](crate::EscrowContract::enforce_timeout)
+    /// after the configured timeout has elapsed since activation.
     ///
     /// Valid transitions from `Active`:
     /// - → [`PendingResult`](MatchState::PendingResult): oracle submits a result;
     ///   dispute window begins.
-    /// - → [`Cancelled`](MatchState::Cancelled): either player calls
-    ///   `claim_timeout` after the match has been active for `TIMEOUT_LEDGERS`.
+    /// - → [`Cancelled`](MatchState::Cancelled): any account calls
+    ///   `enforce_timeout` after the configured timeout.
     Active,
 
     /// The oracle has submitted a result but the dispute window has not yet
@@ -85,7 +85,7 @@ pub enum MatchState {
     /// respective player at the time of cancellation. A match can only be
     /// cancelled while in the [`Pending`](MatchState::Pending) state (via
     /// `cancel_match`) or timed out from the [`Active`](MatchState::Active)
-    /// state (via `claim_timeout`).
+    /// state (via `enforce_timeout`).
     Cancelled,
 }
 
@@ -209,9 +209,9 @@ pub struct Match {
 
     /// The platform-specific identifier for the chess game being wagered on.
     ///
-    /// Must be non-empty and at most 64 bytes long. Each `game_id` can only
-    /// be used in a single match — duplicates are rejected with
-    /// [`Error::DuplicateGameId`](crate::errors::Error::DuplicateGameId).
+    /// Must be non-empty and at most 64 bytes long. A `game_id` cannot be
+    /// reused while its match record is retained; the deduplication index has
+    /// the same refreshed TTL as its match record.
     /// The oracle uses this value to look up the game result on the external
     /// platform API.
     pub game_id: String,
@@ -519,19 +519,18 @@ pub enum DataKey {
     /// The configured match timeout duration in ledgers.
     ///
     /// Set during [`initialize`](crate::EscrowContract::initialize). Determines
-    /// how long a match can remain `Active` without an oracle result before
-    /// either player may call [`claim_timeout`](crate::EscrowContract::claim_timeout)
-    /// to reclaim their stakes. Defaults to `TIMEOUT_LEDGERS` (~7 days) if not
-    /// provided. Stored in **instance** storage.
+    /// how long a match can remain `Active` without an oracle result before a
+    /// player or any caller can invoke timeout enforcement and refund both
+    /// stakes. Defaults to `TIMEOUT_LEDGERS` (~7 days) if not provided.
+    /// Stored in **instance** storage.
     TimeoutLedgers,
 
     /// Deduplication index mapping a `game_id` string to its match ID.
     ///
-    /// Written by [`create_match`](crate::EscrowContract::create_match) to
-    /// prevent the same chess game from being used in more than one match.
-    /// Before creating a match, the contract checks whether this key already
-    /// exists; if it does, the call is rejected with
-    /// [`Error::DuplicateGameId`](crate::errors::Error::DuplicateGameId).
+    /// Written and refreshed alongside the match record so duplicate game IDs
+    /// remain blocked for the entire match-retention window. Before creating a
+    /// match, the contract checks whether this key exists; if it does, the call
+    /// is rejected with [`Error::DuplicateGameId`](crate::errors::Error::DuplicateGameId).
     /// Stored in **persistent** storage with the same TTL as the match.
     GameId(String),
 
