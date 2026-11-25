@@ -15,354 +15,14 @@ import type { MatchStorePort } from '../store/match-store.js';
 import type { EvidenceStore } from '../store/evidence-store.js';
 import { withGameLock } from '../store/evidence-store.js';
 import logger from '../logger.js';
-import { logProviderInteraction } from '../lib/provider-request-logger.js';
 import { errorToHttpStatus, ValidationError, NotFoundError } from '../errors/errorToHttpStatus.js';
-
-// ---------------------------------------------------------------------------
-// #2121 — Oracle configuration management
-// ---------------------------------------------------------------------------
-
-export interface OracleProviderConfig {
-  /** Base endpoint URL used to fetch results for this provider. */
-  endpoint: string;
-  /**
-   * Opaque reference to the provider credential held in the secure config
-   * store. The plaintext secret is never stored on this object or logged.
-   */
-  credentialRef?: string;
-}
-
-export interface OracleConfig {
-  lichess: OracleProviderConfig;
-  chessdotcom: OracleProviderConfig;
-  /** ISO timestamp of the last successful update. */
-  updatedAt: string;
-  /** Actor that performed the last successful update. */
-  updatedBy: string;
-}
-
-export interface OracleConfigPatch {
-  lichess?: Partial<OracleProviderConfig>;
-  chessdotcom?: Partial<OracleProviderConfig>;
-}
-
-export interface OracleConfigUpdateResult {
-  ok: boolean;
-  config?: OracleConfig;
-  error?: string;
-}
-
-/**
- * Minimal port for persisting oracle configuration. Implementations are
- * expected to store credentials securely (e.g. an encrypted/secrets store);
- * only credential *references* are ever passed through this interface.
- */
-export interface OracleConfigStorePort {
-  load(): Promise<OracleConfig | null>;
-  save(config: OracleConfig): Promise<void>;
-}
-
-const DEFAULT_ORACLE_CONFIG: OracleConfig = {
-  lichess: { endpoint: 'https://lichess.org' },
-  chessdotcom: { endpoint: 'https://api.chess.com' },
-  updatedAt: new Date(0).toISOString(),
-  updatedBy: 'system',
-};
-
-let currentOracleConfig: OracleConfig = { ...DEFAULT_ORACLE_CONFIG };
-let oracleConfigStore: OracleConfigStorePort | null = null;
-
-/** Return the current (in-memory) oracle configuration. */
-export function getOracleConfig(): OracleConfig {
-  return currentOracleConfig;
-}
-
-/** Register the secure config store used to persist oracle configuration. */
-export function setOracleConfigStore(store: OracleConfigStorePort | null): void {
-  oracleConfigStore = store;
-}
-
-function allowedOracleHosts(): string[] {
-  return (process.env.ORACLE_ALLOWED_HOSTS ?? '')
-    .split(',')
-    .map((host) => host.trim().toLowerCase())
-    .filter((host) => host.length > 0);
-}
-
-function isLocalhost(hostname: string): boolean {
-  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
-}
-
-/**
- * Validate an oracle endpoint URL.
- *
- * Rules:
- *  - must parse as a URL
- *  - must use https (http is only permitted for localhost in non-production)
- *  - must not embed credentials in the URL
- *  - host must be present in the ORACLE_ALLOWED_HOSTS allowlist (when set)
- *
- * Returns an error string on failure, or null when valid.
- */
-export function validateEndpoint(url: string): string | null {
-  if (typeof url !== 'string' || url.trim().length === 0) {
-    return 'endpoint must be a non-empty string';
-  }
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return 'endpoint must be a valid URL';
-  }
-  if (parsed.username || parsed.password) {
-    return 'endpoint must not contain embedded credentials';
-  }
-  const isDev = process.env.NODE_ENV !== 'production';
-  if (parsed.protocol === 'https:') {
-    // ok
-  } else if (parsed.protocol === 'http:' && isDev && isLocalhost(parsed.hostname)) {
-    // http permitted only for localhost in development
-  } else {
-    return 'endpoint must use https (http is only allowed for localhost in development)';
-  }
-  const allowlist = allowedOracleHosts();
-  if (allowlist.length > 0 && !allowlist.includes(parsed.hostname.toLowerCase())) {
-    return `endpoint host '${parsed.hostname}' is not in the allowed hosts list`;
-  }
-  return null;
-}
-
-/**
- * Update the oracle configuration.
- *
- * Validates the patch, atomically swaps the in-memory config, persists it via
- * the secure config store, and emits an audit log event. Credentials are never
- * logged or returned in plaintext — only credential references are handled.
- */
-export async function updateOracleConfig(
-  patch: OracleConfigPatch,
-  actor: string,
-): Promise<OracleConfigUpdateResult> {
-  const next: OracleConfig = {
-    lichess: { ...currentOracleConfig.lichess },
-    chessdotcom: { ...currentOracleConfig.chessdotcom },
-    updatedAt: currentOracleConfig.updatedAt,
-    updatedBy: currentOracleConfig.updatedBy,
-  };
-
-  const providers: Array<'lichess' | 'chessdotcom'> = ['lichess', 'chessdotcom'];
-  for (const provider of providers) {
-    const providerPatch = patch[provider];
-    if (!providerPatch) continue;
-    if (providerPatch.endpoint !== undefined) {
-      const endpointError = validateEndpoint(providerPatch.endpoint);
-      if (endpointError) {
-        logger.warn(
-          { actor, provider, reason: endpointError },
-          'oracle_config_update_rejected',
-        );
-        return { ok: false, error: `${provider}: ${endpointError}` };
-      }
-      next[provider].endpoint = providerPatch.endpoint;
-    }
-    if (providerPatch.credentialRef !== undefined) {
-      next[provider].credentialRef = providerPatch.credentialRef;
-    }
-  }
-
-  next.updatedAt = new Date().toISOString();
-  next.updatedBy = actor;
-
-  // Persist first so a failed write leaves the in-memory config untouched.
-  if (oracleConfigStore) {
-    try {
-      await oracleConfigStore.save(next);
-    } catch (error) {
-      logger.error(
-        { actor, err: error instanceof Error ? error.message : String(error) },
-        'oracle_config_update_rejected',
-      );
-      return { ok: false, error: 'failed to persist oracle configuration' };
-    }
-  }
-
-  // Atomic swap.
-  currentOracleConfig = next;
-
-  logger.info(
-    {
-      actor,
-      updatedAt: next.updatedAt,
-      lichess: { endpoint: next.lichess.endpoint, credentialRef: next.lichess.credentialRef },
-      chessdotcom: {
-        endpoint: next.chessdotcom.endpoint,
-        credentialRef: next.chessdotcom.credentialRef,
-      },
-    },
-    'oracle_config_updated',
-  );
-
-  return { ok: true, config: next };
-}
+import { getOracleConfig } from './oracle-config.js';
 
 export interface SubmitResultInput {
   matchId: number;
   gameId: string;
   platform: string;
   username?: string;
-  /**
-   * #2106 — address of the oracle submitting this result. When omitted the
-   * primary oracle is assumed. Used to attribute authority per submission.
-   */
-  oracleAddress?: string;
-}
-
-/**
- * #2106 — a single authorized oracle signer.
- */
-export interface OracleKeypair {
-  /** Stellar public key (G...) identifying this oracle. */
-  address: string;
-  /** Secret key used to sign submissions. Never logged. */
-  secret: string;
-  /** Whether this oracle is the configured primary. Exactly one should be primary. */
-  primary?: boolean;
-}
-
-/**
- * #2106 — configuration for the fallback oracle mechanism.
- */
-export interface OracleConfig {
-  /** All authorized oracles (primary + fallbacks). */
-  oracles: OracleKeypair[];
-  /**
-   * Optional explicit primary address. When set it takes precedence over the
-   * `primary` flag on individual keypairs.
-   */
-  primaryAddress?: string;
-}
-
-/**
- * #2106 — the resolved signer for a submission, including whether it is the
- * primary oracle and why it was selected.
- */
-export interface ResolvedOracle {
-  address: string;
-  secret: string;
-  isPrimary: boolean;
-  reason: 'primary' | 'fallback' | 'explicit';
-}
-
-/**
- * #2106 — error raised when no authorized oracle can be selected.
- */
-export class OracleUnavailableError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'OracleUnavailableError';
-  }
-}
-
-/**
- * #2106 — resolve which oracle should sign a submission.
- *
- * Selection rules:
- *   1. If `requestedAddress` is provided it must be an authorized oracle;
- *      otherwise the request is rejected (no silent fallback to another key).
- *   2. Otherwise the configured primary oracle is used when available.
- *   3. If the primary is unavailable (not configured, or reported down via
- *      `isAvailable`), the first available fallback oracle is used.
- *
- * @param config     Oracle configuration (multiple keypairs + primary indicator).
- * @param requestedAddress Optional address the caller explicitly wants to use.
- * @param isAvailable Optional predicate to probe liveness of an oracle.
- */
-export function resolveOracle(
-  config: OracleConfig,
-  requestedAddress?: string,
-  isAvailable?: (address: string) => boolean,
-): ResolvedOracle {
-  const { oracles, primaryAddress } = config;
-  if (!oracles || oracles.length === 0) {
-    throw new OracleUnavailableError('No oracle keypairs configured');
-  }
-
-  const available = (address: string): boolean =>
-    isAvailable ? isAvailable(address) : true;
-
-  const primary =
-    (primaryAddress
-      ? oracles.find((o) => o.address === primaryAddress)
-      : oracles.find((o) => o.primary)) ?? oracles.find((o) => o.primary);
-
-  if (requestedAddress) {
-    const requested = oracles.find((o) => o.address === requestedAddress);
-    if (!requested) {
-      throw new OracleUnavailableError(
-        `Requested oracle ${requestedAddress} is not authorized`,
-      );
-    }
-    if (!available(requested.address)) {
-      throw new OracleUnavailableError(
-        `Requested oracle ${requestedAddress} is unavailable`,
-      );
-    }
-    return {
-      address: requested.address,
-      secret: requested.secret,
-      isPrimary: primary?.address === requested.address,
-      reason: 'explicit',
-    };
-  }
-
-  if (primary && available(primary.address)) {
-    return {
-      address: primary.address,
-      secret: primary.secret,
-      isPrimary: true,
-      reason: 'primary',
-    };
-  }
-
-  const fallback = oracles.find(
-    (o) => o.address !== primary?.address && available(o.address),
-  );
-  if (fallback) {
-    return {
-      address: fallback.address,
-      secret: fallback.secret,
-      isPrimary: false,
-      reason: 'fallback',
-    };
-  }
-
-  throw new OracleUnavailableError(
-    'No available oracle: primary is down and no fallback oracle is available',
-  );
-}
-
-/**
- * #2106 — build the on-chain submission payload, attributing the submitting
- * oracle's authority to the result.
- */
-export function buildOracleSubmissionPayload(
-  resolved: ResolvedOracle,
-  input: SubmitResultInput,
-  result: string | null,
-): {
-  matchId: number;
-  gameId: string;
-  result: string | null;
-  oracleAddress: string;
-  isPrimaryOracle: boolean;
-} {
-  return {
-    matchId: input.matchId,
-    gameId: input.gameId,
-    result,
-    oracleAddress: resolved.address,
-    isPrimaryOracle: resolved.isPrimary,
-  };
 }
 
 export interface SubmitResultSuccess {
@@ -373,14 +33,11 @@ export interface SubmitResultSuccess {
   gameId: string;
   result: string | null;
   provider: 'lichess' | 'chessdotcom';
+  decisionId?: number;
   whitePlayer: string;
   blackPlayer: string;
   status: string;
   message: string;
-  /** #2106 — address of the oracle that authorized this submission. */
-  oracleAddress?: string;
-  /** #2106 — whether the submitting oracle was the primary. */
-  isPrimaryOracle?: boolean;
 }
 
 export interface SubmitResultFailure {
@@ -435,28 +92,8 @@ export function verifyGameResult(
   store: MatchStorePort,
   input: SubmitResultInput,
   ledger?: EvidenceStore,
-  oracleConfig?: OracleConfig,
 ): Promise<SubmitResultOutcome> {
-  // #2106 — resolve the signing oracle up front so an unauthorized or
-  // unavailable oracle is rejected before any verification work happens.
-  let resolvedOracle: ResolvedOracle | undefined;
-  if (oracleConfig) {
-    try {
-      resolvedOracle = resolveOracle(oracleConfig, input.oracleAddress);
-    } catch (error) {
-      if (error instanceof OracleUnavailableError) {
-        return Promise.resolve({
-          ok: false,
-          status: 403,
-          error: 'Oracle unavailable',
-          details: error.message,
-        });
-      }
-      throw error;
-    }
-  }
-
-  const verify = () => verifyGameResultCore(store, input, ledger, resolvedOracle);
+  const verify = () => verifyGameResultCore(store, input, ledger);
   return ledger ? withGameLock(input.gameId, verify) : verify();
 }
 
@@ -464,7 +101,6 @@ async function verifyGameResultCore(
   store: MatchStorePort,
   input: SubmitResultInput,
   ledger?: EvidenceStore,
-  resolvedOracle?: ResolvedOracle,
 ): Promise<SubmitResultOutcome> {
   const { matchId, gameId, platform, username } = input;
   const history = ledger ? await ledger.history(gameId) : [];
@@ -509,11 +145,11 @@ async function verifyGameResultCore(
     };
   }
 
-  const priorHistory = ledger ? await ledger.history(gameId) : [];
-  const latestPriorDecision = priorHistory[priorHistory.length - 1];
+  const priorHistory = evidenceStore ? await evidenceStore.history(gameId) : [];
+  const latestDecision = priorHistory[priorHistory.length - 1];
   if (
-    latestPriorDecision?.state === 'review_required' ||
-    latestPriorDecision?.state === 'operator_decided'
+    latestDecision?.state === 'review_required' ||
+    latestDecision?.state === 'operator_decided'
   ) {
     return {
       ok: false,
@@ -550,30 +186,28 @@ async function verifyGameResultCore(
     };
   }
 
+  // #2124 — read the tunable oracle parameters on every verification so that
+  // operator changes (retry count, timeout, batch size) take effect without a
+  // restart. Defaults are used when no override has been configured.
+  const oracleConfig = getOracleConfig();
+
   // Fetch the game result from the chess platform API, using the match's own
   // recorded platform (now confirmed consistent with the request above) as
-  // the sole source of truth for fetcher selection.
+  // the sole source of truth for fetcher selection. The upstream fetch is
+  // bounded by the runtime-configurable timeout.
   let apiResult;
   try {
     if (match.platform === 'lichess') {
-      apiResult = await logProviderInteraction(
-        {
-          provider: 'lichess',
-          operation: 'fetch_result',
-          request: { gameId },
-          context: { matchId: match.matchId, gameId },
-        },
-        () => fetchLichessResult(gameId),
+      apiResult = await withTimeout(
+        fetchLichessResult(gameId),
+        oracleConfig.timeoutMs,
+        `Lichess fetch for game ${gameId}`,
       );
     } else if (match.platform === 'chessdotcom') {
-      apiResult = await logProviderInteraction(
-        {
-          provider: 'chessdotcom',
-          operation: 'fetch_result',
-          request: { gameId, username },
-          context: { matchId: match.matchId, gameId },
-        },
-        () => fetchChessDotComResult(username as string, gameId),
+      apiResult = await withTimeout(
+        fetchChessDotComResult(username as string, gameId),
+        oracleConfig.timeoutMs,
+        `Chess.com fetch for game ${gameId}`,
       );
     } else {
       return {
@@ -585,15 +219,16 @@ async function verifyGameResultCore(
     }
   } catch (error) {
     if (error instanceof AmbiguousEvidenceError) {
-      await ledger?.append({
-        matchId,
-        gameId,
-        state: 'review_required',
-        reason: error.message,
-        provider: error.evidence.provider,
-        evidence: error.evidence,
-        recordedAt: new Date().toISOString(),
-      });
+      if (evidenceStore) {
+        await evidenceStore.append({
+          matchId: match.matchId,
+          gameId,
+          state: 'review_required',
+          reason: error.message,
+          evidence: error.evidence,
+          recordedAt: new Date().toISOString(),
+        });
+      }
       logger.warn(
         { game_id: gameId, match_id: match.matchId, reason: error.message },
         'oracle_ambiguous_result_requires_review',
@@ -613,15 +248,34 @@ async function verifyGameResultCore(
         details: error.message,
       };
     }
+    if (error instanceof AmbiguousEvidenceError) {
+      await ledger?.append({
+        matchId,
+        gameId,
+        state: 'review_required',
+        reason: error.message,
+        provider: error.evidence.provider,
+        evidence: error.evidence,
+        recordedAt: new Date().toISOString(),
+      });
+      return {
+        ok: false,
+        status: 409,
+        error: 'Evidence requires operator review',
+        details: error.message,
+      };
+    }
     throw error;
   }
 
   const provider = apiResult.evidence.provider;
-  const previousProvider = history
-    .slice()
-    .reverse()
-    .map((decision) => decision.provider ?? decision.evidence?.provider)
-    .find((decision) => decision !== undefined);
+  // #2124 — scan the decision history in runtime-configurable batches so a
+  // large history does not block the event loop in one pass.
+  const previousProvider = await findInBatches(
+    history,
+    oracleConfig.batchSize,
+    (decision) => decision.provider ?? decision.evidence?.provider,
+  );
   if (previousProvider && previousProvider !== provider) {
     await ledger?.append({
       matchId: match.matchId,
@@ -739,10 +393,10 @@ async function verifyGameResultCore(
   }
 
   if (apiResult.result !== null) {
-    const previousVerifiedFromOtherProvider = history
-      .slice()
-      .reverse()
-      .find((decision) => {
+    const previousVerifiedFromOtherProvider = await findInBatches(
+      history,
+      oracleConfig.batchSize,
+      (decision) => {
         const decisionProvider =
           decision.provider ?? decision.evidence?.provider;
         return (
@@ -752,7 +406,8 @@ async function verifyGameResultCore(
           decision.evidence?.outcome !== undefined &&
           decision.evidence.outcome !== null
         );
-      });
+      },
+    );
     const conflictingProvider =
       previousVerifiedFromOtherProvider?.provider ??
       previousVerifiedFromOtherProvider?.evidence?.provider;
@@ -786,10 +441,11 @@ async function verifyGameResultCore(
       };
     }
 
-    const previousVerified = history
-      .slice()
-      .reverse()
-      .find((decision) => decision.state === 'verified');
+    const previousVerified = await findInBatches(
+      history,
+      oracleConfig.batchSize,
+      (decision) => decision.state === 'verified',
+    );
     if (
       previousVerified?.evidence?.outcome !== undefined &&
       previousVerified.evidence.outcome !== apiResult.result
@@ -811,23 +467,6 @@ async function verifyGameResultCore(
     }
     await store.saveSettlementEvidence({ ...evidence, decision: 'verified' });
   }
-
-  // #2106 — attribute the submitting oracle's authority to this decision.
-  const oracleAddress = resolvedOracle?.address;
-  const isPrimaryOracle = resolvedOracle?.isPrimary;
-  if (resolvedOracle) {
-    logger.info(
-      {
-        game_id: gameId,
-        match_id: match.matchId,
-        oracle_address: resolvedOracle.address,
-        is_primary_oracle: resolvedOracle.isPrimary,
-        selection_reason: resolvedOracle.reason,
-      },
-      'oracle_submission_authority',
-    );
-  }
-
   const decisionId = await ledger?.append({
     matchId: match.matchId,
     gameId,
@@ -836,9 +475,21 @@ async function verifyGameResultCore(
     provider,
     evidence: apiResult.evidence,
     recordedAt: evidence.evaluatedAt,
-    oracleAddress,
-    isPrimaryOracle,
   });
+
+  const decisionId = evidenceStore
+    ? await evidenceStore.append({
+        matchId: match.matchId,
+        gameId,
+        state: apiResult.result === null ? 'in_progress' : 'verified',
+        reason:
+          apiResult.result === null
+            ? 'Game is still in progress'
+            : 'Game result verified',
+        evidence: apiResult.evidence,
+        recordedAt: new Date().toISOString(),
+      })
+    : undefined;
 
   return {
     ok: true,
@@ -848,11 +499,65 @@ async function verifyGameResultCore(
     gameId: apiResult.gameId,
     result: apiResult.result,
     provider,
+    decisionId,
     whitePlayer: apiResult.whitePlayer,
     blackPlayer: apiResult.blackPlayer,
     status: apiResult.status,
     message: 'Game result verified. Players match registered identities.',
-    oracleAddress,
-    isPrimaryOracle,
   };
+}
+
+/**
+ * Reject with a descriptive error if `promise` does not settle within
+ * `timeoutMs`. Used to bound upstream platform fetches by the runtime
+ * configurable oracle timeout.
+ */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return promise;
+  }
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
+      (timer as { unref: () => void }).unref();
+    }
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
+ * Search `items` from newest to oldest in chunks of `batchSize`, yielding to
+ * the event loop between chunks. Returns the first item for which `predicate`
+ * produces a defined value, or undefined if none matches.
+ */
+async function findInBatches<T, R>(
+  items: readonly T[],
+  batchSize: number,
+  predicate: (item: T) => R | undefined,
+): Promise<R | undefined> {
+  const size = Number.isFinite(batchSize) && batchSize > 0 ? Math.floor(batchSize) : items.length || 1;
+  for (let end = items.length; end > 0; end -= size) {
+    const start = Math.max(0, end - size);
+    for (let i = end - 1; i >= start; i -= 1) {
+      const result = predicate(items[i]);
+      if (result !== undefined) {
+        return result;
+      }
+    }
+    if (start > 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  }
+  return undefined;
 }

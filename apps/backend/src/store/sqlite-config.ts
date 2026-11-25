@@ -376,3 +376,195 @@ export async function openSqliteDatabase(
   }
   return db;
 }
+
+/** Tunable oracle parameters persisted in SQLite. */
+export interface OracleParams {
+  retryCount: number;
+  timeoutMs: number;
+  batchSize: number;
+}
+
+const ORACLE_PARAM_KEYS = ["retryCount", "timeoutMs", "batchSize"] as const;
+type OracleParamKey = (typeof ORACLE_PARAM_KEYS)[number];
+
+const ORACLE_PARAM_ENV: Record<OracleParamKey, string> = {
+  retryCount: "ORACLE_RETRY_COUNT",
+  timeoutMs: "ORACLE_TIMEOUT_MS",
+  batchSize: "ORACLE_BATCH_SIZE",
+};
+
+const ORACLE_PARAM_DEFAULTS: OracleParams = {
+  retryCount: 3,
+  timeoutMs: 30000,
+  batchSize: 100,
+};
+
+let oracleDb: sqlite3.Database | null = null;
+let oracleCache: OracleParams | null = null;
+let oracleInitPromise: Promise<void> | null = null;
+
+function validatePositiveInteger(key: string, value: unknown): number {
+  const num = typeof value === "string" ? Number(value) : value;
+  if (
+    typeof num !== "number" ||
+    !Number.isSafeInteger(num) ||
+    num < 1
+  ) {
+    throw new Error(`${key} must be a positive integer`);
+  }
+  return num;
+}
+
+function envDefaults(env = process.env): OracleParams {
+  const result: OracleParams = { ...ORACLE_PARAM_DEFAULTS };
+  for (const key of ORACLE_PARAM_KEYS) {
+    const raw = env[ORACLE_PARAM_ENV[key]];
+    if (raw !== undefined && raw !== "") {
+      result[key] = validatePositiveInteger(ORACLE_PARAM_ENV[key], raw);
+    }
+  }
+  return result;
+}
+
+function run(db: sqlite3.Database, sql: string, params: unknown[] = []): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    db.run(sql, params, (err: Error | null) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+function all(
+  db: sqlite3.Database,
+  sql: string,
+  params: unknown[] = [],
+): Promise<Record<string, unknown>[]> {
+  return new Promise<Record<string, unknown>[]>((resolve, reject) => {
+    db.all(sql, params, (err: Error | null, rows: Record<string, unknown>[]) => {
+      if (err) reject(err);
+      else resolve(rows ?? []);
+    });
+  });
+}
+
+async function ensureOracleConfigTable(db: sqlite3.Database): Promise<void> {
+  await run(
+    db,
+    `CREATE TABLE IF NOT EXISTS oracle_config (
+       key TEXT PRIMARY KEY,
+       value TEXT NOT NULL,
+       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+     )`,
+  );
+}
+
+async function loadOracleParams(db: sqlite3.Database): Promise<OracleParams> {
+  await ensureOracleConfigTable(db);
+  const rows = await all(db, "SELECT key, value FROM oracle_config");
+  const stored = new Map<string, string>();
+  for (const row of rows) {
+    stored.set(String(row.key), String(row.value));
+  }
+  const defaults = envDefaults();
+  const result: OracleParams = { ...defaults };
+  for (const key of ORACLE_PARAM_KEYS) {
+    const raw = stored.get(key);
+    if (raw !== undefined) {
+      result[key] = validatePositiveInteger(key, raw);
+    }
+  }
+  // Seed any missing values so subsequent reads are stable.
+  for (const key of ORACLE_PARAM_KEYS) {
+    if (!stored.has(key)) {
+      await run(
+        db,
+        `INSERT INTO oracle_config (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO NOTHING`,
+        [key, String(result[key])],
+      );
+    }
+  }
+  return result;
+}
+
+/**
+ * Initializes the oracle config store against the given database handle.
+ * Safe to call multiple times; the first successful call wins.
+ */
+export async function initOracleConfigStore(
+  db: sqlite3.Database,
+): Promise<void> {
+  if (oracleInitPromise) return oracleInitPromise;
+  oracleInitPromise = (async () => {
+    oracleDb = db;
+    oracleCache = await loadOracleParams(db);
+  })();
+  try {
+    await oracleInitPromise;
+  } catch (err) {
+    oracleInitPromise = null;
+    oracleDb = null;
+    oracleCache = null;
+    throw err;
+  }
+}
+
+function requireDb(): sqlite3.Database {
+  if (!oracleDb) {
+    throw new Error(
+      "Oracle config store not initialized; call initOracleConfigStore() first",
+    );
+  }
+  return oracleDb;
+}
+
+/**
+ * Returns the current oracle parameters. Values are cached in memory and
+ * refreshed whenever setOracleParams() writes new values, so tuning takes
+ * effect on the next oracle operation without a restart.
+ */
+export async function getOracleParams(): Promise<OracleParams> {
+  if (oracleCache) return { ...oracleCache };
+  const db = requireDb();
+  oracleCache = await loadOracleParams(db);
+  return { ...oracleCache };
+}
+
+/**
+ * Persists the given oracle parameters (partial updates allowed) and
+ * invalidates the in-memory cache so the next read reflects the change.
+ */
+export async function setOracleParams(
+  updates: Partial<OracleParams>,
+): Promise<OracleParams> {
+  const db = requireDb();
+  const validated: Partial<OracleParams> = {};
+  for (const key of ORACLE_PARAM_KEYS) {
+    const value = updates[key];
+    if (value !== undefined) {
+      validated[key] = validatePositiveInteger(key, value);
+    }
+  }
+  await ensureOracleConfigTable(db);
+  for (const key of ORACLE_PARAM_KEYS) {
+    const value = validated[key];
+    if (value === undefined) continue;
+    await run(
+      db,
+      `INSERT INTO oracle_config (key, value, updated_at)
+       VALUES (?, ?, datetime('now'))
+       ON CONFLICT(key) DO UPDATE SET
+         value = excluded.value,
+         updated_at = excluded.updated_at`,
+      [key, String(value)],
+    );
+  }
+  oracleCache = null;
+  return getOracleParams();
+}
+
+/** Clears the in-memory cache. Primarily useful for tests. */
+export function resetOracleConfigCache(): void {
+  oracleCache = null;
+}

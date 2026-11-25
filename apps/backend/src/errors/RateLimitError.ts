@@ -3,63 +3,43 @@
  * Callers should catch this error specifically and retry with backoff,
  * rather than treating it as a permanent failure.
  */
-
-/**
- * Optional request context attached to a RateLimitError so that errors can be
- * logged with full context (which request failed, which attempt, and any
- * correlation/trace identifier).
- */
-export interface RateLimitErrorContext {
-  /** The URL (or endpoint) of the request that hit the rate limit. */
-  url?: string;
-  /** The attempt number (1-based) on which the rate limit was hit. */
-  attempt?: number;
-  /** A correlation/trace identifier for the request. */
-  traceId?: string;
-}
-
 export class RateLimitError extends Error {
   readonly policy = 'retry' as const;
-  public readonly url?: string;
-  public readonly attempt?: number;
-  public readonly traceId?: string;
+
+  /** The maximum number of requests allowed in the current window. */
+  public readonly limit?: number;
+  /** The number of requests remaining in the current window. */
+  public readonly remaining?: number;
+  /** Unix timestamp (ms) or Date at which the current window resets. */
+  public readonly reset?: number | Date;
+  /** Number of seconds the client should wait before retrying. */
+  public readonly retryAfterSeconds?: number;
 
   constructor(
     message: string = 'Rate limit exceeded',
     public readonly retryAfterMs?: number,
-    context?: RateLimitErrorContext,
+    options?: {
+      limit?: number;
+      remaining?: number;
+      reset?: number | Date;
+      retryAfterSeconds?: number;
+    },
   ) {
-    super(RateLimitError.buildMessage(message, retryAfterMs, context));
+    super(message);
     this.name = 'RateLimitError';
-    this.url = context?.url;
-    this.attempt = context?.attempt;
-    this.traceId = context?.traceId;
     Object.setPrototypeOf(this, RateLimitError.prototype);
-  }
 
-  /**
-   * Build the error message, appending any available context so that the
-   * message itself is useful when logged.
-   */
-  private static buildMessage(
-    message: string,
-    retryAfterMs?: number,
-    context?: RateLimitErrorContext,
-  ): string {
-    const parts: string[] = [message];
-    if (retryAfterMs !== undefined) {
-      parts.push(`retryAfterMs=${retryAfterMs}`);
+    if (options) {
+      this.limit = options.limit;
+      this.remaining = options.remaining;
+      this.reset = options.reset;
+      this.retryAfterSeconds = options.retryAfterSeconds;
     }
-    if (context?.url !== undefined) {
-      parts.push(`url=${context.url}`);
+
+    // Derive retryAfterSeconds from retryAfterMs when not explicitly provided.
+    if (this.retryAfterSeconds === undefined && this.retryAfterMs !== undefined) {
+      this.retryAfterSeconds = Math.max(0, Math.ceil(this.retryAfterMs / 1000));
     }
-    if (context?.attempt !== undefined) {
-      parts.push(`attempt=${context.attempt}`);
-    }
-    if (context?.traceId !== undefined) {
-      parts.push(`traceId=${context.traceId}`);
-    }
-    return parts.join(' ');
   }
 
   /**
@@ -70,3 +50,4 @@ export class RateLimitError extends Error {
     return error instanceof RateLimitError;
   }
 }
+</｜｜DSML｜｜ parameter>

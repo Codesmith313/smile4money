@@ -28,6 +28,57 @@ export interface RateLimitBackend {
 }
 
 /**
+ * Per-tier rate-limit configuration (#2126).
+ *
+ * Each authenticated user is assigned a tier (via `resolveUserTier`), and each
+ * tier gets its own capacity/refill budget. Unauthenticated requests fall back
+ * to the `anonymous` tier, keyed by IP address.
+ */
+export interface RateLimitTierConfig {
+  /** Maximum tokens (requests) in the bucket. */
+  capacity: number;
+  /** How often tokens are added, in milliseconds. */
+  refillIntervalMs: number;
+  /** How many tokens are added per refill interval. */
+  refillAmount: number;
+}
+
+export type RateLimitTier = 'anonymous' | 'free' | 'pro' | 'enterprise';
+
+export const DEFAULT_RATE_LIMIT_TIERS: Record<RateLimitTier, RateLimitTierConfig> = {
+  anonymous: { capacity: 60, refillIntervalMs: 60_000, refillAmount: 60 },
+  free: { capacity: 100, refillIntervalMs: 60_000, refillAmount: 100 },
+  pro: { capacity: 1_000, refillIntervalMs: 60_000, refillAmount: 1_000 },
+  enterprise: { capacity: 10_000, refillIntervalMs: 60_000, refillAmount: 10_000 },
+};
+
+/**
+ * Resolve the rate-limit tier for a request. Defaults to reading the
+ * authenticated user's `tier` (set by the auth middleware) and falling back to
+ * `anonymous` when there is no authenticated user.
+ */
+export function resolveUserTier(req: Request): RateLimitTier {
+  const user = (req as Request & { user?: { tier?: string } }).user;
+  const tier = user?.tier?.toLowerCase();
+  if (tier === 'free' || tier === 'pro' || tier === 'enterprise') {
+    return tier;
+  }
+  return 'anonymous';
+}
+
+/**
+ * Resolve the rate-limit key for a request: the authenticated user id when
+ * present, otherwise the client IP address (#2126).
+ */
+export function resolveRateLimitKey(req: Request, trustedProxies: string[] = []): string {
+  const user = (req as Request & { user?: { id?: string | number } }).user;
+  if (user?.id !== undefined && user?.id !== null) {
+    return `user:${user.id}`;
+  }
+  return `ip:${getClientIp(req, trustedProxies)}`;
+}
+
+/**
  * In-memory token-bucket rate limiter. Tracks requests per IP address.
  *
  * Each process keeps its own counters — in a horizontally scaled deployment
@@ -153,6 +204,15 @@ interface RateLimitMiddlewareOptions {
   statusCode?: number;
   message?: string;
   /**
+   * Per-tier rate-limit configuration (#2126). When omitted, the middleware
+   * uses a single flat limit derived from the store's own capacity.
+   */
+  tiers?: Record<RateLimitTier, RateLimitTierConfig>;
+  /**
+   * Resolve which tier a request belongs to. Defaults to `resolveUserTier`.
+   */
+  tierResolver?: (req: Request) => RateLimitTier;
+  /**
    * IP addresses of proxies that this server trusts to set the X-Forwarded-For
    * header (e.g. a reverse proxy like nginx or a load balancer).
    *
@@ -182,20 +242,40 @@ export function createRateLimitMiddleware(
   options?: RateLimitMiddlewareOptions,
 ) {
   const trustedProxies = options?.trustedProxies || [];
-  const keyExtractor = options?.keyExtractor || ((req: Request) => getClientIp(req, trustedProxies));
+  const keyExtractor =
+    options?.keyExtractor || ((req: Request) => resolveRateLimitKey(req, trustedProxies));
   const statusCode = options?.statusCode || 429;
   const message = options?.message || 'Too many requests, please try again later';
+  const tiers = options?.tiers;
+  const tierResolver = options?.tierResolver || resolveUserTier;
 
   return (req: Request, res: Response, next: NextFunction) => {
     const clientId = keyExtractor(req);
+    const tier = tierResolver(req);
+    const tierConfig = tiers?.[tier];
+
+    // When per-tier limits are configured, namespace the key by tier so that
+    // a user's counters are tracked against the budget for their tier.
+    const storeKey = tierConfig ? `${tier}:${clientId}` : clientId;
+    const capacity = tierConfig?.capacity;
 
     store
-      .isAllowed(clientId)
+      .isAllowed(storeKey, capacity)
       .then(async (result) => {
         // Set rate limit headers for all responses
-        const remainingTokens = await store.getRemainingTokens(clientId);
-        res.setHeader('X-RateLimit-Limit', '100'); // capacity
-        res.setHeader('X-RateLimit-Remaining', String(Math.max(0, remainingTokens)));
+        const remainingTokens = await store.getRemainingTokens(storeKey, capacity);
+        const limit = capacity ?? 100;
+        const remaining = Math.max(0, remainingTokens);
+        res.setHeader('X-RateLimit-Limit', String(limit));
+        res.setHeader('X-RateLimit-Remaining', String(remaining));
+
+        // X-RateLimit-Reset: seconds until the bucket is fully replenished.
+        const refillIntervalMs = tierConfig?.refillIntervalMs ?? 60_000;
+        const refillAmount = tierConfig?.refillAmount ?? limit;
+        const tokensMissing = Math.max(0, limit - remaining);
+        const resetSeconds =
+          refillAmount > 0 ? Math.ceil((tokensMissing / refillAmount) * (refillIntervalMs / 1000)) : 0;
+        res.setHeader('X-RateLimit-Reset', String(resetSeconds));
 
         if (!result.allowed) {
           // Set Retry-After header per RFC 6585
@@ -287,7 +367,7 @@ export async function createRateLimitStore(
  * from a trusted proxy; otherwise a client could spoof the header to cycle
  * through fake IPs and bypass per-IP rate limiting.
  */
-function getClientIp(req: Request, trustedProxies: string[]): string {
+export function getClientIp(req: Request, trustedProxies: string[]): string {
   const remoteAddress = req.socket.remoteAddress || 'unknown';
 
   if (trustedProxies.includes(remoteAddress)) {

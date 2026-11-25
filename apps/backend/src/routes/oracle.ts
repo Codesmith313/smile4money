@@ -4,12 +4,7 @@ import { authenticate } from '../middleware/auth.js';
 import { requirePermission, requireSignature } from '../middleware/permissions.js';
 import { Permission } from '../permissions.js';
 import { validateSubmitResultInput, verifyGameResult } from '../services/oracle-service.js';
-import {
-  getOracleConfig,
-  updateOracleConfig,
-  validateOracleConfigInput,
-} from '../services/oracle-config-service.js';
-import { getDashboardMetrics } from '../services/oracle-metrics.js';
+import { oracleConfigStore } from '../services/oracle-config.js';
 import { errorToHttpStatus } from '../errors/errorToHttpStatus.js';
 import {
   errorEnvelope,
@@ -21,158 +16,63 @@ import {
 const router = Router();
 const store = matchStore;
 
-/**
- * Dispute window duration in milliseconds. Configurable via the
- * DISPUTE_WINDOW_MS environment variable; defaults to 24 hours.
- */
-const DEFAULT_DISPUTE_WINDOW_MS = 24 * 60 * 60 * 1000;
-
-function getDisputeWindowMs(): number {
-  const raw = process.env.DISPUTE_WINDOW_MS;
-  if (!raw) return DEFAULT_DISPUTE_WINDOW_MS;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_DISPUTE_WINDOW_MS;
-  return parsed;
-}
-
-function logDisputeWindowEvent(event: string, details: Record<string, unknown>): void {
-  console.info(JSON.stringify({ event, ...details, timestamp: new Date().toISOString() }));
-}
-
-/**
- * Opens the dispute window for a match once its result has been submitted.
- * Records the submission time and deadline on the match and logs the event.
- */
-function openDisputeWindow(matchId: number | string): { resultSubmittedAt: string; disputeDeadline: string } {
-  const windowMs = getDisputeWindowMs();
-  const submittedAt = new Date();
-  const deadline = new Date(submittedAt.getTime() + windowMs);
-  const resultSubmittedAt = submittedAt.toISOString();
-  const disputeDeadline = deadline.toISOString();
-
-  const match = store.getMatch(matchId);
-  if (match) {
-    store.updateMatch(matchId, { resultSubmittedAt, disputeDeadline });
-  }
-
-  logDisputeWindowEvent('dispute_window_opened', {
-    matchId,
-    resultSubmittedAt,
-    disputeDeadline,
-    windowMs,
-  });
-
-  return { resultSubmittedAt, disputeDeadline };
-}
-
-/**
- * Returns true when the dispute window for the given match is still open.
- * A match with no recorded deadline is treated as having no open window.
- */
-function isDisputeWindowOpen(matchId: number | string): boolean {
-  const match = store.getMatch(matchId);
-  if (!match || !match.disputeDeadline) return false;
-  const deadline = new Date(match.disputeDeadline).getTime();
-  if (!Number.isFinite(deadline)) return false;
-  return Date.now() <= deadline;
-}
-
 // Oracle endpoints require authentication
 router.use(authenticate);
 
 /**
- * Admin allowlist for oracle configuration endpoints. Configured via the
- * `ORACLE_ADMIN_ADDRESSES` env var as a comma-separated list of addresses.
- * When unset, no caller is treated as an admin (fail closed).
- */
-function getAdminAllowlist(): Set<string> {
-  const raw = process.env.ORACLE_ADMIN_ADDRESSES ?? '';
-  return new Set(
-    raw
-      .split(',')
-      .map((entry) => entry.trim())
-      .filter((entry) => entry.length > 0),
-  );
-}
-
-function isAdmin(req: { user?: { address?: string } }): boolean {
-  const address = req.user?.address;
-  if (!address) return false;
-  return getAdminAllowlist().has(address);
-}
-
-/**
  * GET /api/oracle/config
  *
- * Returns the current oracle configuration with credentials redacted.
- * Admin only.
+ * Read the current oracle runtime parameters (retry count, timeout, batch size).
  */
-router.get('/config', (req, res) => {
-  if (!isAdmin(req as { user?: { address?: string } })) {
-    return res
-      .status(403)
-      .json(errorEnvelope(ErrorCode.FORBIDDEN, 'Admin access required'));
-  }
-
-  return res.status(200).json({ config: getOracleConfig() });
+router.get('/config', (_req, res) => {
+  return res.status(200).json(oracleConfigStore.get());
 });
 
 /**
  * PUT /api/oracle/config
  *
- * Update provider credentials and endpoints. Admin only.
+ * Update oracle runtime parameters without redeployment. All fields are
+ * optional; only the provided ones are validated and applied.
  *
- * Request body may contain any subset of:
+ * Request body:
  * ```json
  * {
- *   "endpoints": { "lichess": "https://...", "chesscom": "https://..." },
- *   "credentials": { "lichess": "token", "chesscom": "token" }
+ *   "retryCount": 3,
+ *   "timeoutMs": 5000,
+ *   "batchSize": 50
  * }
  * ```
  */
 router.put('/config', (req, res) => {
-  if (!isAdmin(req as { user?: { address?: string } })) {
-    return res
-      .status(403)
-      .json(errorEnvelope(ErrorCode.FORBIDDEN, 'Admin access required'));
-  }
-
   const payload = req.body;
-  if (!payload || typeof payload !== 'object') {
-    return res
-      .status(400)
-      .json(errorEnvelope(ErrorCode.VALIDATION_ERROR, 'Request body must be JSON'));
+
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return res.status(400).json(errorEnvelope(ErrorCode.VALIDATION_ERROR, 'Request body must be a JSON object'));
   }
 
-  const inputError = validateOracleConfigInput(payload);
-  if (inputError) {
+  const fields = ['retryCount', 'timeoutMs', 'batchSize'] as const;
+  const updates: Partial<Record<(typeof fields)[number], number>> = {};
+
+  for (const field of fields) {
+    if (payload[field] === undefined) continue;
+    const value = payload[field];
+    if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+      return res
+        .status(400)
+        .json(errorEnvelope(ErrorCode.VALIDATION_ERROR, `${field} must be a positive integer`));
+    }
+    updates[field] = value;
+  }
+
+  if (Object.keys(updates).length === 0) {
     return res
       .status(400)
-      .json(errorEnvelope(ErrorCode.VALIDATION_ERROR, inputError));
+      .json(errorEnvelope(ErrorCode.VALIDATION_ERROR, 'At least one of retryCount, timeoutMs, batchSize is required'));
   }
 
   try {
-    const updated = updateOracleConfig(payload, {
-      actor: (req as { user?: { address?: string } }).user?.address ?? 'unknown',
-    });
-    return res.status(200).json({ config: updated });
-  } catch (error) {
-    const status = errorToHttpStatus(error);
-    return res
-      .status(status)
-      .json(errorEnvelope(statusToErrorCode(status), userFacingErrorMessage(status)));
-  }
-});
-
-/**
- * GET /api/oracle/dashboard
- *
- * Aggregated oracle performance metrics for monitoring dashboards:
- * submissions/hour, success rate, and per-operation latency percentiles.
- */
-router.get('/dashboard', (_req, res) => {
-  try {
-    return res.status(200).json(getDashboardMetrics());
+    const config = oracleConfigStore.update(updates);
+    return res.status(200).json(config);
   } catch (error) {
     const status = errorToHttpStatus(error);
     return res
@@ -192,22 +92,14 @@ router.get('/dashboard', (_req, res) => {
  *   "matchId": 1,
  *   "gameId": "abc123",
  *   "platform": "lichess",
- *   "username": "alice",  // Optional, required for Chess.com
- *   "proof": {            // Optional cryptographic proof of the result
- *     "algorithm": "sha256",
- *     "hash": "0x...",
- *     "signature": "0x...",   // Optional provider signature
- *     "publicKey": "0x..."    // Optional signer public key
- *   },
- *   "oracleAddress": "G..."  // Optional: select primary or fallback oracle
+ *   "username": "alice"  // Optional, required for Chess.com
  * }
  * ```
  *
  * This endpoint:
  * 1. Fetches the game result from the chess platform API
  * 2. Verifies that the players in the API response match the registered players
- * 3. Verifies the cryptographic proof (if provided) against provider data
- * 4. Returns the verified result for the oracle to submit on-chain
+ * 3. Returns the verified result for the oracle to submit on-chain
  *
  * The oracle (a privileged service) must then sign the result and call the
  * escrow contract's `submit_result` method on Stellar Soroban.
@@ -228,25 +120,12 @@ router.post(
     return res.status(400).json(errorEnvelope(ErrorCode.VALIDATION_ERROR, inputError));
   }
 
-  const proofError = validateResultProof(payload.proof);
-  if (proofError) {
-    return res.status(400).json(errorEnvelope(ErrorCode.VALIDATION_ERROR, proofError));
-  }
-
-  if (payload.oracleAddress !== undefined && typeof payload.oracleAddress !== 'string') {
-    return res
-      .status(400)
-      .json(errorEnvelope(ErrorCode.VALIDATION_ERROR, 'oracleAddress must be a string'));
-  }
-
   try {
     const result = await verifyGameResult(store, {
       matchId: payload.matchId,
       gameId: payload.gameId,
       platform: payload.platform,
       username: typeof payload.username === 'string' ? payload.username : undefined,
-      proof: payload.proof,
-      oracleAddress: typeof payload.oracleAddress === 'string' ? payload.oracleAddress : undefined,
     }, evidenceStore);
 
     if (!result.ok) {
@@ -260,8 +139,6 @@ router.post(
       return res.status(result.status).json(errorEnvelope(statusToErrorCode(result.status), message, extra));
     }
 
-    const { resultSubmittedAt, disputeDeadline } = openDisputeWindow(result.matchId);
-
     return res.status(200).json({
       decisionId: result.decisionId,
       verified: result.verified,
@@ -273,8 +150,6 @@ router.post(
       blackPlayer: result.blackPlayer,
       status: result.status,
       message: result.message,
-      resultSubmittedAt,
-      disputeDeadline,
     });
   } catch (error) {
     // #47 — mapped centrally so e.g. an upstream RateLimitError surfaces as
@@ -291,80 +166,5 @@ router.post(
   }
   },
 );
-
-/**
- * POST /api/oracle/dispute
- *
- * Raise a dispute against a submitted result. Only accepted while the
- * dispute window opened at result submission is still active.
- *
- * Request body:
- * ```json
- * {
- *   "matchId": 1,
- *   "reason": "Incorrect result reported"
- * }
- * ```
- */
-router.post('/dispute', async (req, res) => {
-  const payload = req.body;
-
-  if (!payload || typeof payload !== 'object') {
-    return res.status(400).json(errorEnvelope(ErrorCode.VALIDATION_ERROR, 'Request body must be JSON'));
-  }
-
-  const matchId = payload.matchId;
-  if (matchId === undefined || matchId === null || matchId === '') {
-    return res.status(400).json(errorEnvelope(ErrorCode.VALIDATION_ERROR, 'matchId is required'));
-  }
-
-  const match = store.getMatch(matchId);
-  if (!match) {
-    return res.status(404).json(errorEnvelope(ErrorCode.NOT_FOUND, 'Match not found'));
-  }
-
-  if (!match.disputeDeadline) {
-    logDisputeWindowEvent('dispute_rejected_outside_window', {
-      matchId,
-      reason: 'no_result_submitted',
-    });
-    return res
-      .status(409)
-      .json(
-        errorEnvelope(
-          ErrorCode.VALIDATION_ERROR,
-          'No result has been submitted for this match; disputes are not yet available',
-        ),
-      );
-  }
-
-  if (!isDisputeWindowOpen(matchId)) {
-    logDisputeWindowEvent('dispute_rejected_outside_window', {
-      matchId,
-      disputeDeadline: match.disputeDeadline,
-    });
-    return res
-      .status(409)
-      .json(
-        errorEnvelope(
-          ErrorCode.VALIDATION_ERROR,
-          `Dispute window closed at ${match.disputeDeadline}`,
-        ),
-      );
-  }
-
-  const reason = typeof payload.reason === 'string' ? payload.reason : undefined;
-  logDisputeWindowEvent('dispute_accepted', {
-    matchId,
-    disputeDeadline: match.disputeDeadline,
-    reason,
-  });
-
-  return res.status(200).json({
-    matchId,
-    status: 'dispute_open',
-    disputeDeadline: match.disputeDeadline,
-  });
-});
 
 export default router;

@@ -8,195 +8,19 @@
  * Implements idempotent submission: if a result already exists on-chain for a match_id,
  * the submission is skipped and logged as informational, not an error.
  *
- * Configurable via environment variables:
+ * Configurable via environment variables (used as fallback defaults):
  * - ORACLE_MAX_RETRIES: Maximum number of retry attempts (default: 5)
  * - ORACLE_RETRY_BASE_MS: Base interval for exponential backoff in milliseconds (default: 1000)
  * - ORACLE_RETRY_MAX_MS: Maximum interval between retries in milliseconds (default: 60000)
- * - ORACLE_PRIMARY_SECRET_KEY: Secret key of the primary oracle (falls back to ORACLE_SECRET_KEY)
- * - ORACLE_FALLBACK_SECRET_KEYS: Comma-separated secret keys of authorized fallback oracles
- * - ORACLE_PRIMARY_UNAVAILABLE_ERRORS: Comma-separated error substrings that indicate the
- *   primary oracle is unavailable and the fallback should be used (default: "insufficient balance,
- *   account not found,unauthorized,op_underfunded,op_no_source_account")
+ * - ORACLE_TIMEOUT_MS: Per-attempt submission timeout in milliseconds (default: 30000)
+ *
+ * Runtime-tunable parameters (retry count and timeout) are read from the oracle
+ * parameter store on every invocation, so changes apply without a restart.
  */
 
 import logger from '../logger.js';
 import { DlqEntry, writeToDlq } from '../queue.js';
-
-/**
- * Operation types tracked by the oracle performance monitor. Each type keeps
- * its own latency samples and success/failure counters so degradation in one
- * operation (e.g. status polling) does not mask health of another.
- */
-export type OracleOperation =
-  | 'existence_check'
-  | 'submit'
-  | 'status_poll'
-  | 'prepare'
-  | 'send';
-
-/** Latency percentiles (ms) computed from recorded samples. */
-export interface OperationPercentiles {
-  p50: number;
-  p95: number;
-  p99: number;
-}
-
-/** Aggregated performance snapshot for a single operation type. */
-export interface OperationMetrics {
-  operation: OracleOperation;
-  /** Total recorded attempts (successes + failures). */
-  total: number;
-  successes: number;
-  failures: number;
-  /** Success rate in [0, 1]; 0 when no attempts recorded. */
-  successRate: number;
-  /** Mean latency (ms) across all recorded attempts. */
-  avgLatencyMs: number;
-  /** Latency percentiles (ms) across all recorded attempts. */
-  percentiles: OperationPercentiles;
-  /** Timestamp (ms) of the most recent recorded attempt. */
-  lastUpdated: number;
-}
-
-/** Thresholds that trigger a degradation alert for an operation type. */
-export interface DegradationThresholds {
-  /** Minimum attempts before success-rate alerts are evaluated. */
-  minSamples: number;
-  /** Success rate below this value (0..1) triggers an alert. */
-  minSuccessRate: number;
-  /** p95 latency above this value (ms) triggers an alert. */
-  maxP95LatencyMs: number;
-}
-
-const DEFAULT_THRESHOLDS: DegradationThresholds = {
-  minSamples: 20,
-  minSuccessRate: 0.9,
-  maxP95LatencyMs: 5000,
-};
-
-/** Maximum number of latency samples retained per operation (ring buffer). */
-const MAX_SAMPLES = 1000;
-
-interface OperationState {
-  latencies: number[];
-  successes: number;
-  failures: number;
-  lastUpdated: number;
-}
-
-/**
- * Shared, in-process aggregator of oracle operation performance. Records
- * latency and outcome per operation type and exposes snapshots for the
- * dashboard/API. Recording is synchronous and allocation-light so it can wrap
- * every submission attempt without affecting retry behavior.
- */
-export class OraclePerformanceMonitor {
-  private readonly state = new Map<OracleOperation, OperationState>();
-  private readonly thresholds: DegradationThresholds;
-
-  constructor(thresholds: Partial<DegradationThresholds> = {}) {
-    this.thresholds = { ...DEFAULT_THRESHOLDS, ...thresholds };
-  }
-
-  private getState(operation: OracleOperation): OperationState {
-    let s = this.state.get(operation);
-    if (!s) {
-      s = { latencies: [], successes: 0, failures: 0, lastUpdated: 0 };
-      this.state.set(operation, s);
-    }
-    return s;
-  }
-
-  /** Record a completed attempt for an operation type. */
-  record(operation: OracleOperation, latencyMs: number, success: boolean): void {
-    const s = this.getState(operation);
-    if (success) s.successes += 1;
-    else s.failures += 1;
-    s.latencies.push(latencyMs);
-    if (s.latencies.length > MAX_SAMPLES) s.latencies.shift();
-    s.lastUpdated = Date.now();
-  }
-
-  /**
-   * Time an async operation, recording its latency and outcome. Errors are
-   * re-thrown unchanged so callers keep their existing control flow.
-   */
-  async measure<T>(
-    operation: OracleOperation,
-    fn: () => Promise<T>,
-  ): Promise<T> {
-    const start = Date.now();
-    try {
-      const result = await fn();
-      this.record(operation, Date.now() - start, true);
-      return result;
-    } catch (err) {
-      this.record(operation, Date.now() - start, false);
-      throw err;
-    }
-  }
-
-  private static percentiles(sorted: number[]): OperationPercentiles {
-    if (sorted.length === 0) return { p50: 0, p95: 0, p99: 0 };
-    const at = (q: number): number => {
-      const idx = Math.min(
-        sorted.length - 1,
-        Math.max(0, Math.ceil(q * sorted.length) - 1),
-      );
-      return sorted[idx];
-    };
-    return { p50: at(0.5), p95: at(0.95), p99: at(0.99) };
-  }
-
-  /** Snapshot metrics for a single operation type. */
-  snapshot(operation: OracleOperation): OperationMetrics {
-    const s = this.getState(operation);
-    const total = s.successes + s.failures;
-    const sorted = [...s.latencies].sort((a, b) => a - b);
-    const sum = sorted.reduce((acc, v) => acc + v, 0);
-    return {
-      operation,
-      total,
-      successes: s.successes,
-      failures: s.failures,
-      successRate: total === 0 ? 0 : s.successes / total,
-      avgLatencyMs: total === 0 ? 0 : sum / sorted.length,
-      percentiles: OraclePerformanceMonitor.percentiles(sorted),
-      lastUpdated: s.lastUpdated,
-    };
-  }
-
-  /** Snapshot metrics for every operation type seen so far. */
-  snapshotAll(): OperationMetrics[] {
-    return Array.from(this.state.keys()).map((op) => this.snapshot(op));
-  }
-
-  /**
-   * Evaluate degradation for an operation type. Returns a human-readable
-   * reason when thresholds are breached, otherwise null.
-   */
-  checkDegradation(operation: OracleOperation): string | null {
-    const m = this.snapshot(operation);
-    if (m.total < this.thresholds.minSamples) return null;
-    if (m.successRate < this.thresholds.minSuccessRate) {
-      return `success rate ${(m.successRate * 100).toFixed(1)}% below ${(
-        this.thresholds.minSuccessRate * 100
-      ).toFixed(1)}%`;
-    }
-    if (m.percentiles.p95 > this.thresholds.maxP95LatencyMs) {
-      return `p95 latency ${m.percentiles.p95}ms above ${this.thresholds.maxP95LatencyMs}ms`;
-    }
-    return null;
-  }
-
-  /** Reset all recorded metrics (primarily for tests). */
-  reset(): void {
-    this.state.clear();
-  }
-}
-
-/** Process-wide monitor shared by submission and settlement code paths. */
-export const oraclePerformanceMonitor = new OraclePerformanceMonitor();
+import { getOracleParams } from './oracle-params.js';
 
 /** Configuration for retry behavior. */
 export interface RetryConfig {
@@ -206,10 +30,9 @@ export interface RetryConfig {
   baseDelayMs: number;
   /** Maximum interval (ms) between retries; prevents unbounded growth. */
   maxDelayMs: number;
+  /** Per-attempt timeout (ms) applied to the submission handler. */
+  timeoutMs: number;
 }
-
-/** Identifies which authorized oracle submitted (or is submitting) a result. */
-export type OracleRole = 'primary' | 'fallback';
 
 /** Submission details sent to the retry handler. */
 export interface OracleSubmission {
@@ -221,62 +44,6 @@ export interface OracleSubmission {
   gameId: string;
   /** Game outcome. */
   result: 'Player1Wins' | 'Player2Wins' | 'Draw';
-  /** Which authorized oracle is submitting this result. */
-  oracleRole?: OracleRole;
-  /** Public key of the oracle that submitted (or is submitting) this result. */
-  oracleAddress?: string;
-}
-
-/** Configuration for the set of authorized oracles. */
-export interface OracleConfig {
-  /** Public key of the primary oracle. */
-  primaryAddress: string;
-  /** Public keys of authorized fallback oracles, in preference order. */
-  fallbackAddresses: string[];
-  /** Error substrings (lowercased) that indicate the primary oracle is unavailable. */
-  primaryUnavailableErrors: string[];
-}
-
-/** Load oracle configuration (primary + fallback addresses) from environment. */
-export function loadOracleConfig(): OracleConfig {
-  const primarySecret =
-    process.env.ORACLE_PRIMARY_SECRET_KEY ?? process.env.ORACLE_SECRET_KEY;
-  if (!primarySecret) {
-    throw new Error(
-      'ORACLE_PRIMARY_SECRET_KEY (or ORACLE_SECRET_KEY) is required for oracle settlement'
-    );
-  }
-  const fallbackAddresses = (process.env.ORACLE_FALLBACK_SECRET_KEYS ?? '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((secret) => Keypair.fromSecret(secret).publicKey());
-  const primaryUnavailableErrors = (
-    process.env.ORACLE_PRIMARY_UNAVAILABLE_ERRORS ??
-    'insufficient balance,account not found,unauthorized,op_underfunded,op_no_source_account'
-  )
-    .split(',')
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-  return {
-    primaryAddress: Keypair.fromSecret(primarySecret).publicKey(),
-    fallbackAddresses,
-    primaryUnavailableErrors,
-  };
-}
-
-/**
- * Determine whether an error indicates the primary oracle is unavailable and
- * a fallback oracle should be used instead.
- */
-export function isPrimaryUnavailable(
-  err: unknown,
-  config: OracleConfig
-): boolean {
-  const message = (err instanceof Error ? err.message : String(err)).toLowerCase();
-  return config.primaryUnavailableErrors.some((needle) =>
-    message.includes(needle)
-  );
 }
 
 /** Handler to check if a result already exists on-chain. */
@@ -292,12 +59,22 @@ export interface SubmissionAttempt {
   nextRetryDelayMs?: number;
 }
 
-/** Load retry configuration from environment. */
+/**
+ * Load retry configuration.
+ *
+ * Retry count and timeout are read from the runtime oracle parameter store
+ * (cached, refreshed without restart) and fall back to environment variables.
+ * Backoff intervals remain environment-driven.
+ */
 export function loadRetryConfig(): RetryConfig {
+  const params = getOracleParams();
   return {
-    maxRetries: parseInt(process.env.ORACLE_MAX_RETRIES ?? '5', 10),
+    maxRetries:
+      params?.retryCount ?? parseInt(process.env.ORACLE_MAX_RETRIES ?? '5', 10),
     baseDelayMs: parseInt(process.env.ORACLE_RETRY_BASE_MS ?? '1000', 10),
     maxDelayMs: parseInt(process.env.ORACLE_RETRY_MAX_MS ?? '60000', 10),
+    timeoutMs:
+      params?.timeoutMs ?? parseInt(process.env.ORACLE_TIMEOUT_MS ?? '30000', 10),
   };
 }
 
@@ -329,79 +106,40 @@ export function calculateBackoffDelay(
  * retries with exponential backoff up to maxRetries times. After all retries are
  * exhausted, the submission is written to the dead-letter queue for manual inspection.
  *
+ * Retry count and timeout are re-read from the runtime parameter store on each
+ * invocation so tuning applies without a restart.
+ *
  * @param submission - The result to submit
  * @param handler - Async function to execute the actual blockchain submission
- * @param config - Retry configuration
+ * @param config - Optional retry configuration override; defaults to runtime config
  * @returns A DLQ entry if written, undefined if successful or still retrying
  */
 export async function submitWithRetry(
   submission: OracleSubmission,
   handler: (sub: OracleSubmission) => Promise<void>,
-  config: RetryConfig,
-  oracleConfig?: OracleConfig
+  config: RetryConfig = loadRetryConfig()
 ): Promise<DlqEntry | undefined> {
   let lastError: Error | undefined;
-  let current: OracleSubmission = {
-    ...submission,
-    oracleRole: submission.oracleRole ?? 'primary',
-    oracleAddress: submission.oracleAddress ?? oracleConfig?.primaryAddress,
-  };
-  let switchedToFallback = false;
 
   for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
     try {
-      await oraclePerformanceMonitor.measure('submit', () =>
-        handler(submission)
-      );
+      await withTimeout(handler(submission), config.timeoutMs);
       if (attempt > 0) {
         logger.info(
-          {
-            matchId: current.matchId,
-            attempt,
-            oracleRole: current.oracleRole,
-            oracleAddress: current.oracleAddress,
-          },
+          { matchId: submission.matchId, attempt },
           'oracle_submit: success after retries'
         );
       }
       return undefined;
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
-
-      // If the primary oracle is unavailable and a fallback is authorized,
-      // switch to the fallback oracle and retry immediately.
-      if (
-        !switchedToFallback &&
-        current.oracleRole === 'primary' &&
-        oracleConfig &&
-        oracleConfig.fallbackAddresses.length > 0 &&
-        isPrimaryUnavailable(lastError, oracleConfig)
-      ) {
-        switchedToFallback = true;
-        current = {
-          ...current,
-          oracleRole: 'fallback',
-          oracleAddress: oracleConfig.fallbackAddresses[0],
-        };
-        logger.warn(
-          {
-            matchId: current.matchId,
-            attempt,
-            oracleAddress: current.oracleAddress,
-            error: lastError.message,
-          },
-          'oracle_submit: primary oracle unavailable, switching to fallback oracle'
-        );
-        continue;
-      }
-
+      
       if (attempt < config.maxRetries) {
         const nextDelay = calculateBackoffDelay(attempt + 1, config);
         logger.warn(
           {
-            matchId: current.matchId,
+            matchId: submission.matchId,
             attempt,
-            oracleRole: current.oracleRole,
             nextRetryDelayMs: nextDelay,
             error: lastError.message,
           },
@@ -413,14 +151,12 @@ export async function submitWithRetry(
   }
 
   // All retries exhausted — write to DLQ
-  const dlqEntry = await writeToDlq(current, lastError?.message ?? 'Unknown error');
+  const dlqEntry = await writeToDlq(submission, lastError?.message ?? 'Unknown error');
   logger.error(
     {
-      matchId: current.matchId,
+      matchId: submission.matchId,
       dlqId: dlqEntry.id,
       attempts: config.maxRetries + 1,
-      oracleRole: current.oracleRole,
-      oracleAddress: current.oracleAddress,
       lastError: lastError?.message,
     },
     'oracle_submit: exhausted retries, written to DLQ'
@@ -444,7 +180,7 @@ export async function retryDlqEntry(
 ): Promise<boolean> {
   try {
     const submission = entry.payload as OracleSubmission;
-    await oraclePerformanceMonitor.measure('submit', () => handler(submission));
+    await handler(submission);
     logger.info(
       { dlqId: entry.id, totalAttempts: entry.attempts },
       'oracle_submit: DLQ entry resolved'
@@ -473,24 +209,23 @@ export async function retryDlqEntry(
  * This protects against duplicate submissions when the oracle service crashes and
  * restarts mid-submission cycle.
  *
+ * Retry count and timeout are re-read from the runtime parameter store on each
+ * invocation so tuning applies without a restart.
+ *
  * @param submission - The result to submit
  * @param handler - Async function to execute the actual blockchain submission
  * @param existenceChecker - Async function to check if result already exists on-chain
- * @param config - Retry configuration
+ * @param config - Optional retry configuration override; defaults to runtime config
  * @returns A DLQ entry if written, undefined if successful (including idempotent skips)
  */
 export async function submitWithIdempotence(
   submission: OracleSubmission,
   handler: (sub: OracleSubmission) => Promise<void>,
   existenceChecker: ExistenceChecker,
-  config: RetryConfig,
-  oracleConfig?: OracleConfig
+  config: RetryConfig = loadRetryConfig()
 ): Promise<DlqEntry | undefined> {
   try {
-    const alreadyExists = await oraclePerformanceMonitor.measure(
-      'existence_check',
-      () => existenceChecker(submission.matchId)
-    );
+    const alreadyExists = await existenceChecker(submission.matchId);
     if (alreadyExists) {
       logger.info(
         { matchId: submission.matchId, gameId: submission.gameId },
@@ -509,12 +244,30 @@ export async function submitWithIdempotence(
     // Continue with submission attempt even if existence check fails
   }
 
-  return submitWithRetry(submission, handler, config, oracleConfig);
+  return submitWithRetry(submission, handler, config);
 }
 
 /** Sleep for a given number of milliseconds. */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Race a promise against a timeout. Rejects with a timeout error if the
+ * promise does not settle within `ms` milliseconds.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  if (!Number.isFinite(ms) || ms <= 0) return promise;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`oracle_submit: timed out after ${ms}ms`)),
+      ms
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 // The escrow contract's submit_result starts its dispute window. The separate
@@ -557,7 +310,6 @@ export interface SettlementClient {
 export class SorobanSettlementClient implements SettlementClient {
   readonly server: rpc.Server;
   readonly signer: Keypair;
-  readonly fallbackSigner?: Keypair;
   readonly contract: Contract;
   constructor(
     readonly config: {
@@ -565,13 +317,9 @@ export class SorobanSettlementClient implements SettlementClient {
       networkPassphrase: string;
       secretKey: string;
       escrowContract: string;
-      fallbackSecretKey?: string;
     },
   ) {
     this.signer = Keypair.fromSecret(config.secretKey);
-    this.fallbackSigner = config.fallbackSecretKey
-      ? Keypair.fromSecret(config.fallbackSecretKey)
-      : undefined;
     this.contract = new Contract(config.escrowContract);
     const url = new URL(config.rpcUrl);
     const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
@@ -592,14 +340,8 @@ export class SorobanSettlementClient implements SettlementClient {
     return new SorobanSettlementClient({
       rpcUrl: required("STELLAR_RPC_URL"),
       networkPassphrase: required("STELLAR_NETWORK_PASSPHRASE"),
-      secretKey:
-        process.env.ORACLE_PRIMARY_SECRET_KEY ??
-        required("ORACLE_SECRET_KEY"),
+      secretKey: required("ORACLE_SECRET_KEY"),
       escrowContract: required("CONTRACT_ESCROW"),
-      fallbackSecretKey: (process.env.ORACLE_FALLBACK_SECRET_KEYS ?? "")
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean)[0],
     });
   }
 
@@ -615,63 +357,54 @@ export class SorobanSettlementClient implements SettlementClient {
   }
 
   async getMatch(matchId: number): Promise<ChainMatch> {
-    return oraclePerformanceMonitor.measure('status_poll', async () => {
-      const tx = await this.build(
-        this.contract.call(
-          "get_match",
-          nativeToScVal(BigInt(matchId), { type: "u64" }),
-        ),
-      );
-      const simulation = await this.server.simulateTransaction(tx);
-      if (!rpc.Api.isSimulationSuccess(simulation) || !simulation.result) {
-        throw new Error("Unable to read escrow match");
-      }
-      return scValToNative(simulation.result.retval) as ChainMatch;
-    });
+    const tx = await this.build(
+      this.contract.call(
+        "get_match",
+        nativeToScVal(BigInt(matchId), { type: "u64" }),
+      ),
+    );
+    const simulation = await this.server.simulateTransaction(tx);
+    if (!rpc.Api.isSimulationSuccess(simulation) || !simulation.result) {
+      throw new Error("Unable to read escrow match");
+    }
+    return scValToNative(simulation.result.retval) as ChainMatch;
   }
 
   async prepare(submission: OracleSubmission) {
-    return oraclePerformanceMonitor.measure('prepare', async () => {
-      const winner = {
-        Player1Wins: "Player1",
-        Player2Wins: "Player2",
-        Draw: "Draw",
-      }[submission.result];
-      const tx = await this.server.prepareTransaction(
-        await this.build(
-          this.contract.call(
-            "submit_result",
-            nativeToScVal(BigInt(submission.matchId), { type: "u64" }),
-            nativeToScVal(submission.gameId, { type: "string" }),
-            xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(winner)]),
-            new Address(this.signer.publicKey()).toScVal(),
-          ),
+    const winner = {
+      Player1Wins: "Player1",
+      Player2Wins: "Player2",
+      Draw: "Draw",
+    }[submission.result];
+    const tx = await this.server.prepareTransaction(
+      await this.build(
+        this.contract.call(
+          "submit_result",
+          nativeToScVal(BigInt(submission.matchId), { type: "u64" }),
+          nativeToScVal(submission.gameId, { type: "string" }),
+          xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(winner)]),
+          new Address(this.signer.publicKey()).toScVal(),
         ),
-      );
-      tx.sign(this.signer);
-      return {
-        hash: tx.hash().toString("hex"),
-        envelope: tx.toXDR(),
-        expiresAt: Number(tx.timeBounds!.maxTime) * 1000,
-      };
-    });
+      ),
+    );
+    tx.sign(this.signer);
+    return {
+      hash: tx.hash().toString("hex"),
+      envelope: tx.toXDR(),
+      expiresAt: Number(tx.timeBounds!.maxTime) * 1000,
+    };
   }
 
   async send(envelope: string): Promise<void> {
-    await oraclePerformanceMonitor.measure('send', async () => {
-      const response = await this.server.sendTransaction(
-        TransactionBuilder.fromXDR(envelope, this.config.networkPassphrase),
-      );
-      if (response.status === "ERROR")
-        throw new Error("Soroban rejected transaction; reconciliation required");
-    });
+    const response = await this.server.sendTransaction(
+      TransactionBuilder.fromXDR(envelope, this.config.networkPassphrase),
+    );
+    if (response.status === "ERROR")
+      throw new Error("Soroban rejected transaction; reconciliation required");
   }
 
   async status(hash: string) {
-    return oraclePerformanceMonitor.measure(
-      'status_poll',
-      async () => (await this.server.getTransaction(hash)).status,
-    );
+    return (await this.server.getTransaction(hash)).status;
   }
 }
 
