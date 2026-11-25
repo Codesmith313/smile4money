@@ -1,1622 +1,1159 @@
 # smile4money — Issue Tracker
 
-125 tracked issues across smart contracts, oracle, backend, frontend, infrastructure, testing, and documentation.
+This tracker contains 125 proposed work items. Each issue identifies an owning area, priority, problem, and acceptance criteria. The entries are intended to describe distinct work from the previously tracked issue set; verify current upstream status before opening them as GitHub issues.
+
+Priority guide: **Critical** blocks safe operation; **High** affects correctness, funds, or a core workflow; **Medium** is important product or reliability work; **Low** is a contained improvement.
 
 ---
 
-## Smart Contract — Escrow
+## Tournament Bracket Contract
 
-### Issue #1 — `initialize` panics instead of returning a typed error on re-initialization
+### Issue #1 — Require the tournament creator to authorize initialization
+**Area:** `contracts/tournament-bracket/src/lib.rs`  
+**Priority:** Critical  
+**Type:** Authorization / Security
 
-**Area:** `contracts/escrow/src/lib.rs`
-**Priority:** High
-**Type:** Bug / API Consistency
+**Problem:** Initialization establishes the tournament administrator and trusted dependencies. If the initial call does not prove the intended creator's authorization, an unrelated account can seize control of a newly deployed instance.
 
-**Description:**
-`initialize` calls `panic!("Contract already initialized")` when called a second time. Every other guard in the contract returns `Err(Error::AlreadyInitialized)` or a typed variant. A panic produces an opaque host error on-chain and cannot be distinguished from other panics by client code. The oracle contract correctly returns `Err(Error::AlreadyInitialized)` for the same guard.
+**Acceptance criteria:** Initialization requires authorization from the designated admin; tests prove an unauthorized caller cannot initialize and the authorized caller can initialize only once.
 
-**Expected behaviour:** Return `Err(Error::AlreadyInitialized)` so callers can pattern-match the error code.
+### Issue #2 — Persist a unique game identifier for each bracket node
+**Area:** `contracts/tournament-bracket/src/lib.rs`, `contracts/tournament-bracket/src/types.rs`  
+**Priority:** High  
+**Type:** Data Integrity
 
-**Steps to reproduce:** Call `initialize` twice on a freshly deployed escrow contract; observe `WasmVm` host error instead of `Error(Contract, #7)`.
+**Problem:** A node needs a durable association to the external game whose result advances its winner. Without a stored game identifier, later submissions cannot reliably prove they refer to that node's game.
 
----
+**Acceptance criteria:** Each playable node stores its game ID; duplicate IDs within a tournament and attempts to replace a finalized node's ID are rejected with typed errors.
 
-### Issue #2 — `override_result` error name is semantically inverted
+### Issue #3 — Add a review window before accepting a bracket result as final
+**Area:** `contracts/tournament-bracket/src/lib.rs`  
+**Priority:** High  
+**Type:** Product / Dispute Handling
 
-**Area:** `contracts/escrow/src/lib.rs` — `override_result`
-**Priority:** Medium
-**Type:** Bug / Logic Error
+**Problem:** Immediately advancing a player on the first reported result leaves no defined process for correcting a verified-but-contested outcome.
 
-**Description:**
-When the dispute window has expired, `override_result` returns `Err(Error::DisputeWindowActive)`. The error name reads "the window is still active," but the code path is reached when the window has already *expired*. This makes client-side error handling confusing — a caller that catches `DisputeWindowActive` would interpret it as "try again later," when the correct interpretation is "too late, use `finalize_result`."
+**Acceptance criteria:** A result enters a reviewable state with a configurable or documented deadline; only an authorized reviewer can amend it during that window, and advancement is blocked until the result becomes final.
 
-**Expected behaviour:** Introduce `Error::DisputeWindowExpired` (or reuse `Error::InvalidState`) and return it when `current > pending_result_ledger + DISPUTE_WINDOW_LEDGERS` inside `override_result`.
+### Issue #4 — Separate registration deadlines from tournament completion deadlines
+**Area:** `contracts/tournament-bracket/src/lib.rs`, `contracts/tournament-bracket/src/types.rs`  
+**Priority:** Medium  
+**Type:** Lifecycle Design
 
----
+**Problem:** A single deadline can either stop late-joining registration too early or give activated tournaments insufficient time to finish.
 
-### Issue #3 — `finalize_result` is callable by anyone, including adversaries who can time it to cause MEV
+**Acceptance criteria:** Registration close and tournament completion have distinct stored deadlines; tests cover activation near registration close and completion after registration has closed.
 
-**Area:** `contracts/escrow/src/lib.rs` — `finalize_result`
-**Priority:** Medium
-**Type:** Security / Design
+### Issue #5 — Define deterministic handling for drawn or abandoned bracket games
+**Area:** `contracts/tournament-bracket/src/lib.rs`, `contracts/tournament-bracket/src/types.rs`  
+**Priority:** High  
+**Type:** Lifecycle / Funds
 
-**Description:**
-`finalize_result` requires no authorization and can be called by any account the instant the dispute window expires. While payout correctness is unaffected, it means a third party can trigger the payout transaction and collect any XDR fee rebate or simply grief a player who intended to call it themselves. In a MEV-sensitive context this is worth restricting or at least documenting explicitly.
+**Problem:** A bracket node that ends in a draw, cancellation, or unplayed game needs an explicit outcome; otherwise the tournament can remain permanently blocked.
 
-**Expected behaviour:** Either restrict `finalize_result` to the matched players / oracle / admin, or add a clear doc comment stating it is intentionally permissionless and why.
+**Acceptance criteria:** The contract exposes documented, authorized paths for each supported non-win outcome, with tests proving the node can progress or be refunded without assigning an arbitrary winner.
 
----
+### Issue #6 — Add a tournament emergency mode that preserves participant exits
+**Area:** `contracts/tournament-bracket/src/lib.rs`  
+**Priority:** High  
+**Type:** Resilience / Funds
 
-### Issue #4 — `claim_timeout` reuses `Error::MatchTimedOut` to mean "too early"
+**Problem:** Operators need a response to an incident affecting tournament progression, but a blanket pause could also trap participants who need an allowed exit.
 
-**Area:** `contracts/escrow/src/lib.rs` — `claim_timeout`
-**Priority:** Medium
-**Type:** API Clarity / Bug
+**Acceptance criteria:** An authorized pause blocks new tournament progression while documented cancellation or refund paths remain available; tests cover the exact allowed operations while paused.
 
-**Description:**
-When the timeout period has not yet elapsed, `claim_timeout` returns `Err(Error::MatchTimedOut)` with the comment "callers should interpret it as 'timeout not yet reached'." The error name `MatchTimedOut` strongly implies the match *has* timed out, not that it has not timed out yet. This is semantically backwards and will cause bugs in any client that reads the error name.
+### Issue #7 — Support safe administrator handoff for tournament deployments
+**Area:** `contracts/tournament-bracket/src/lib.rs`  
+**Priority:** Medium  
+**Type:** Administration
 
-**Expected behaviour:** Introduce `Error::TimeoutNotReached` (or `Error::TooEarly`) for the "not yet elapsed" case and reserve `MatchTimedOut` for when a match actually needs claiming.
+**Problem:** A permanently fixed administrator address makes operations brittle when a key is rotated or its owner leaves.
 
----
+**Acceptance criteria:** Add a two-step propose-and-accept handoff, emit auditable events, and test acceptance by the proposed address plus rejection of unauthorized or stale proposals.
 
-### Issue #5 — `cancel_match` cannot cancel an `Active` match even by mutual consent
+### Issue #8 — Bind tournament result submissions to a specific tournament and node
+**Area:** `contracts/tournament-bracket/src/lib.rs`, `apps/backend/src`  
+**Priority:** High  
+**Type:** Cross-Contract Integration
 
-**Area:** `contracts/escrow/src/lib.rs` — `cancel_match`
-**Priority:** Medium
-**Type:** Feature Gap
+**Problem:** Result relaying must identify the exact tournament and bracket node, not merely a game or match, or identical identifiers across tournaments can update the wrong bracket.
 
-**Description:**
-`cancel_match` is restricted to `Pending` matches only. Once both players have deposited and the match becomes `Active`, there is no on-chain mechanism for them to mutually agree to cancel before the oracle submits a result — even if the game was never played. The only escape hatch then becomes `claim_timeout`, which requires waiting 7 days (~120 960 ledgers).
+**Acceptance criteria:** The submission interface includes tournament and node identifiers; integration tests prove a result for one tournament cannot mutate another tournament's node.
 
-**Expected behaviour:** Allow `cancel_match` in the `Active` state when both `player1` and `player2` authorize the call, refunding both stakes immediately.
+### Issue #9 — Expose bracket rounds in a compact read model
+**Area:** `contracts/tournament-bracket/src/lib.rs`  
+**Priority:** Medium  
+**Type:** API Design
 
----
+**Problem:** Clients that need to render a bracket should not have to fetch every node individually and reconstruct round membership from implementation details.
 
-### Issue #6 — `is_paused` clones `Env` unnecessarily on every call site
+**Acceptance criteria:** Add a bounded read method returning a documented round slice with stable node identifiers and state; test empty, partial, and completed rounds.
 
-**Area:** `contracts/escrow/src/lib.rs`
-**Priority:** Low
-**Type:** Performance / Code Quality
+### Issue #10 — Prevent a participant from occupying both sides of a bracket match
+**Area:** `contracts/tournament-bracket/src/lib.rs`  
+**Priority:** High  
+**Type:** Tournament Integrity
 
-**Description:**
-Every call to `Self::is_paused(env.clone())` clones the environment. `is_paused` only performs a read and does not need ownership. The signature should accept `&Env` to avoid the clone cost (and the associated budget usage on-chain).
+**Problem:** Advancement logic must preserve the bracket invariant that two sides of a playable node represent distinct participants.
 
-**Expected behaviour:** Change `pub fn is_paused(env: Env)` to `pub fn is_paused(env: &Env)` and update all call sites to pass `&env`.
+**Acceptance criteria:** Bracket construction and advancement reject identical participant addresses in both slots; property tests exercise byes and all supported bracket sizes.
 
----
+### Issue #11 — Make byes explicit in bracket state rather than inferred from empty slots
+**Area:** `contracts/tournament-bracket/src/types.rs`, `contracts/tournament-bracket/src/lib.rs`  
+**Priority:** Medium  
+**Type:** Data Model
 
-### Issue #7 — `deposit` reads `is_paused` via a full `env.clone()` before loading the match
+**Problem:** Treating an empty participant slot as a bye conflates a valid tournament state with incomplete registration or corrupted storage.
 
-**Area:** `contracts/escrow/src/lib.rs` — `deposit`
-**Priority:** Low
-**Type:** Performance
+**Acceptance criteria:** Represent byes explicitly in the node model and define how they advance; tests distinguish a bye from an unfilled or malformed node.
 
-**Description:**
-`deposit` calls `Self::is_paused(env.clone())` which clones the environment before any other work. If the contract is not paused (the common case), the clone is wasted. The pause check should use a borrow once `is_paused` accepts `&Env` (see Issue #6), and should be moved after the cheap `validate_match_id` check that can fail early with no clone cost.
-
----
-
-### Issue #8 — `create_match` event publishes stale `m.player1` / `m.player2` after move
-
-**Area:** `contracts/escrow/src/lib.rs` — `create_match`
-**Priority:** Medium
-**Type:** Bug
-
-**Description:**
-After `let m = Match { player1, player2, ... }`, the code calls `env.events().publish(... (id, m.player1, m.player2, ...))`. Because `player1` and `player2` were moved into `m`, this compiles only because `Address` is `Clone`. However if the struct field ordering or a refactor causes partial moves, the event could silently publish default/zero values. The event should capture the original `player1` / `player2` locals before they are moved into the struct, or clone explicitly.
-
----
-
-### Issue #9 — No `get_match_count` public view function
-
-**Area:** `contracts/escrow/src/lib.rs`
-**Priority:** Low
-**Type:** Feature Gap
-
-**Description:**
-`get_match_count` is a private helper. Frontend and off-chain tooling have no way to query the total number of matches without enumerating via `list_matches`. Exposing it as a public read-only function would enable efficient pagination and progress displays.
-
-**Expected behaviour:** Add `pub fn match_count(env: Env) -> u64` that returns `Self::get_match_count(&env)`.
-
----
-
-### Issue #10 — `list_matches` silently caps at 100 without signalling the cap to callers
-
-**Area:** `contracts/escrow/src/lib.rs` — `list_matches`
-**Priority:** Low
-**Type:** API Usability
-
-**Description:**
-When a caller requests `limit > 100`, the cap is applied silently. Callers have no way to detect whether they received fewer results because the count was exhausted or because the limit was silently reduced. The function should either document this clearly or return a tuple `(Vec<u64>, bool)` where the bool indicates whether more results exist.
-
----
-
-### Issue #11 — `emergency_drain` emits event with `balance` before the transfer succeeds
-
-**Area:** `contracts/escrow/src/lib.rs` — `emergency_drain`
-**Priority:** Medium
-**Type:** Bug
-
-**Description:**
-The event `(balance, to, admin)` is published after `client.transfer(...)` is called, but the emitted `balance` value was captured before the transfer. If `client.transfer` panics (e.g. due to insufficient contract balance from a race condition), the event is never emitted. However the event is emitted with `balance` even when `balance == 0` and the transfer is skipped, producing a misleading `drain` event with amount 0.
-
-**Expected behaviour:** Skip the event entirely when `balance == 0`. Emit the event only on a successful non-zero drain.
-
----
-
-### Issue #12 — `transfer_admin` on escrow does not validate new admin is not the zero address
-
-**Area:** `contracts/escrow/src/lib.rs` — `transfer_admin`
-**Priority:** High
-**Type:** Security
-
-**Description:**
-`transfer_admin` only checks against the specific zero-address constant `GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF` and checks `new_admin == current_admin`. It does not guard against other obviously invalid addresses. Additionally, the zero-address check uses a string comparison via `new_admin.to_string()` which is expensive on-chain and fragile if the string representation ever changes.
-
-**Expected behaviour:** Compare `Address` values directly (not via string) and add a dedicated helper `fn is_zero_address(addr: &Address) -> bool` so the check is readable and maintainable.
-
----
-
-### Issue #13 — `update_oracle` does not validate that `new_oracle` is different from the current oracle
-
-**Area:** `contracts/escrow/src/lib.rs` — `update_oracle`
-**Priority:** Low
-**Type:** Defensive Programming
-
-**Description:**
-`update_oracle` allows the admin to set the oracle to the same address it already holds. This is a no-op on state but emits an `oracle_updated` event with `old_oracle == new_oracle`, which would confuse off-chain listeners parsing event logs.
-
-**Expected behaviour:** Return `Err(Error::InvalidAdmin)` (or a new `Error::NoChange`) when `new_oracle == old_oracle`.
-
----
-
-### Issue #14 — `submit_result` on oracle has a redundant duplicate `game_id` length check
-
-**Area:** `contracts/oracle/src/lib.rs` — `submit_result`
-**Priority:** Low
-**Type:** Code Quality
-
-**Description:**
-`submit_result` checks `game_id_len == 0 || game_id_len > MAX_GAME_ID_LEN` and returns early, then later checks `if game_id.len() > 64` again. The second check is always unreachable because the function already returned if `game_id_len > 64`. This dead code can mislead readers into thinking the first check only catches the empty-string case.
-
-**Expected behaviour:** Remove the second redundant check at `if game_id.len() > 64`.
-
----
-
-### Issue #15 — Oracle `withdraw` does not validate `amount > 0`
-
-**Area:** `contracts/oracle/src/lib.rs` — `withdraw`
-**Priority:** Medium
-**Type:** Defensive Programming
-
-**Description:**
-`withdraw` allows `amount = 0` to be passed. The SEP-41 token standard may or may not reject zero-amount transfers depending on the token implementation. A zero-amount withdraw emits no event and silently succeeds, wasting compute budget. An explicit guard prevents confusion.
-
-**Expected behaviour:** Return `Err(Error::InvalidAmount)` (add this variant to oracle errors) when `amount <= 0`.
-
----
-
-### Issue #16 — `cancel_match` does not set `cancelled_ledger` on timeout path
-
-**Area:** `contracts/escrow/src/lib.rs` — `claim_timeout`
-**Priority:** Medium
-**Type:** Bug / Data Integrity
-
-**Description:**
-When `claim_timeout` transitions the match to `Cancelled`, it does not set `m.cancelled_ledger = Some(env.ledger().sequence())`. The `cancelled_ledger` field is set only in `cancel_match`, leaving it as `None` for timeout-cancelled matches. Off-chain indexers that use `cancelled_ledger` to determine when a match ended will incorrectly report `None` for timed-out matches.
-
-**Expected behaviour:** Add `m.cancelled_ledger = Some(env.ledger().sequence());` in `claim_timeout` before writing back to storage.
-
----
-
-### Issue #17 — `get_escrow_balance` returns `0` for `PendingResult` state even though funds are still locked
-
-**Area:** `contracts/escrow/src/lib.rs` — `get_escrow_balance`
-**Priority:** Medium
-**Type:** Bug
-
-**Description:**
-`get_escrow_balance` only returns `0` for `Completed` and `Cancelled` states. In `PendingResult` state the funds are still locked in escrow, so returning the balance would be correct. But the logic is also correct currently — `PendingResult` falls through to the deposit-flag calculation. However, the function does *not* handle the `Active` state where only one player may have deposited — actually both must have for Active, so that case is fine. The real issue is there is no test covering `PendingResult` balance reporting.
-
-**Expected behaviour:** Add a test verifying `get_escrow_balance` returns `stake_amount * 2` for a match in `PendingResult` state.
-
----
-
-### Issue #18 — Contract-level TTL is not extended on `deposit` when only one player has deposited
-
-**Area:** `contracts/escrow/src/lib.rs` — `deposit`
-**Priority:** Medium
-**Type:** Storage / Correctness
-
-**Description:**
-`deposit` extends the persistent TTL of the `Match` record on every call. However, it does not extend the `instance` storage TTL (which holds `Oracle`, `Admin`, `Token`, `MatchCount`, `Paused`). If many deposits happen near the end of the instance TTL, the instance storage could expire before matches complete, making `submit_result` fail because it cannot read `DataKey::Oracle`.
-
-**Expected behaviour:** Call `env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT)` in `deposit` (and other mutating functions that don't already do this).
-
----
-
-### Issue #19 — No `get_oracle` or `get_admin` public view functions on escrow contract
-
-**Area:** `contracts/escrow/src/lib.rs`
-**Priority:** Low
-**Type:** Feature Gap
-
-**Description:**
-There are no public read functions to query the current oracle or admin address from the escrow contract. Off-chain tooling and frontends need to verify these addresses for trust validation and display. Without them, clients must parse raw storage slots.
-
-**Expected behaviour:** Add `pub fn get_oracle(env: Env) -> Result<Address, Error>` and `pub fn get_admin(env: Env) -> Result<Address, Error>`.
-
----
-
-### Issue #20 — `finalize_result` double-matches `winner` with unnecessary clone
-
-**Area:** `contracts/escrow/src/lib.rs` — `finalize_result`
-**Priority:** Low
-**Type:** Code Quality
-
-**Description:**
-`finalize_result` first matches `winner` to compute `payout_amount` (consuming or cloning it), then calls `winner.clone()` again to match inside the transfer block. The pattern can be simplified by merging both matches into one, reducing the clone cost and making the code easier to read.
-
----
-
-### Issue #21 — `MAX_STAKE` constant has no corresponding test for the exact boundary value
-
-**Area:** `contracts/escrow/src/lib.rs`, `contracts/escrow/src/tests.rs`
-**Priority:** Low
-**Type:** Testing Gap
-
-**Description:**
-There is a test for `stake_amount = MAX_STAKE + 1` returning `StakeTooHigh`, but no test confirming that `stake_amount = MAX_STAKE` exactly is accepted. Off-by-one errors at the boundary are common and should be explicitly covered.
-
-**Expected behaviour:** Add a test: `create_match` with `stake_amount = MAX_STAKE` should succeed.
-
----
-
-### Issue #22 — No test for `finalize_result` called exactly at the dispute window boundary ledger
-
-**Area:** `contracts/escrow/src/tests.rs`
-**Priority:** Low
-**Type:** Testing Gap
-
-**Description:**
-Tests cover `finalize_result` being called well after the window and being rejected before. There is no test for calling it at exactly `pending_result_ledger + DISPUTE_WINDOW_LEDGERS` (the boundary, which should still be rejected since the guard is `current <= ...`). Boundary tests are critical for time-locked functions.
-
----
-
-### Issue #23 — `override_result` does not emit an event when the `pending_winner` is changed to the same value
-
-**Area:** `contracts/escrow/src/lib.rs` — `override_result`
-**Priority:** Low
-**Type:** Code Quality
-
-**Description:**
-`override_result` always emits `(match_id, old_winner, new_winner)` even when `old_winner == new_winner`. This produces misleading events on-chain suggesting a change occurred when none did.
-
-**Expected behaviour:** Check `if old_winner != new_winner` before emitting the override event, or add the check as a guard that returns `Err(Error::NoChange)`.
-
----
-
-### Issue #24 — `pause` and `unpause` do not check current state before toggling
-
-**Area:** `contracts/escrow/src/lib.rs` — `pause`, `unpause`
-**Priority:** Low
-**Type:** Defensive Programming
-
-**Description:**
-Calling `pause` on an already-paused contract succeeds silently and emits a `paused` event. Similarly, `unpause` on an already-unpaused contract emits an `unpaused` event. These duplicate events pollute the event log and can confuse off-chain listeners expecting state transitions.
-
-**Expected behaviour:** Return an error (e.g. `Error::AlreadyPaused` / `Error::NotPaused`) or simply skip the write and event when the state is already as requested.
-
----
-
-### Issue #25 — `create_match` does not enforce that `game_id` contains only printable ASCII
-
-**Area:** `contracts/escrow/src/lib.rs` — `create_match`
-**Priority:** Medium
+### Issue #12 — Reject tournament configuration that cannot form a valid bracket
+**Area:** `contracts/tournament-bracket/src/lib.rs`  
+**Priority:** High  
 **Type:** Input Validation
 
-**Description:**
-The only `game_id` validation is length (1–64 bytes). A caller could submit a `game_id` containing null bytes, control characters, or non-UTF-8 sequences. The oracle backend matches game IDs against Lichess/Chess.com API identifiers which are always alphanumeric. Allowing arbitrary bytes could cause silent mismatches between the stored ID and the oracle's lookup key.
+**Problem:** Invalid entrant counts or bracket dimensions can create unreachable nodes and permanently stalled rounds.
 
-**Expected behaviour:** Add a `game_id` character-set validation (alphanumeric + hyphen/underscore only) or at minimum document the accepted character set and add a test for a null-byte game_id being rejected.
+**Acceptance criteria:** Validate supported entrant counts and computed node totals before storing a tournament; boundary tests cover minimum, maximum, and unsupported sizes.
 
----
+### Issue #13 — Make tournament enrollment close atomically at the deadline
+**Area:** `contracts/tournament-bracket/src/lib.rs`  
+**Priority:** High  
+**Type:** Concurrency / Lifecycle
 
-### Issue #26 — Oracle `list_results` scans by sequential match IDs even for sparse data
+**Problem:** Enrollment and activation need a single ledger-based rule at the boundary so transaction ordering cannot admit entrants after the bracket is frozen.
 
-**Area:** `contracts/oracle/src/lib.rs` — `list_results`
-**Priority:** Medium
-**Type:** Performance
+**Acceptance criteria:** Enrollment checks the current ledger against the stored close ledger; tests at one ledger before, exactly at, and one ledger after the boundary document the policy.
 
-**Description:**
-`list_results` iterates `start..start+cap` and calls `env.storage().persistent().get(...)` for every ID in that range, even if most have no stored result. In a production deployment with thousands of matches, requesting a wide range will burn significant compute budget on storage misses. 
+### Issue #14 — Record tournament prize allocation rules at creation time
+**Area:** `contracts/tournament-bracket/src/types.rs`, `contracts/tournament-bracket/src/lib.rs`  
+**Priority:** High  
+**Type:** Funds / Product Rules
 
-**Expected behaviour:** Consider a linked-list approach or maintain an explicit result count in instance storage that clients can use to construct efficient page requests.
+**Problem:** Participants need immutable, inspectable payout terms before joining; deriving prize allocation from mutable off-chain configuration can produce inconsistent expectations.
 
----
+**Acceptance criteria:** Store the prize schedule and token with the tournament; reject schedules whose total exceeds deposited funds and expose the final schedule through a read method.
 
-### Issue #27 — No `get_token` view function on the escrow contract
+### Issue #15 — Define refunds when a tournament fails to reach its minimum field
+**Area:** `contracts/tournament-bracket/src/lib.rs`  
+**Priority:** High  
+**Type:** Funds / Lifecycle
 
-**Area:** `contracts/escrow/src/lib.rs`
-**Priority:** Low
-**Type:** Feature Gap
+**Problem:** A tournament that never reaches its required number of entrants needs an explicit way to return entry funds instead of locking them indefinitely.
 
-**Description:**
-The token address is stored in instance storage but there is no public accessor. Frontends and integrators cannot verify which token a deployed contract accepts without parsing raw WASM storage or deploying their own read call.
+**Acceptance criteria:** Store a minimum entrant requirement and provide a post-deadline refund path when it is unmet; test that each eligible entrant can claim at most once.
 
-**Expected behaviour:** Add `pub fn get_token(env: Env) -> Result<Address, Error>`.
+### Issue #16 — Emit a stable event for each bracket advancement
+**Area:** `contracts/tournament-bracket/src/lib.rs`  
+**Priority:** Medium  
+**Type:** Observability / Integration
 
----
+**Problem:** Consumers need to discover which participant advanced from which node without polling and diffing the entire bracket.
 
-### Issue #28 — `Match.activated_ledger` is `u32` but is initialized to `0`, which is a valid ledger number
+**Acceptance criteria:** Publish a versioned event containing tournament ID, node ID, winner, and resulting next node; tests verify event fields for normal advancement and byes.
 
-**Area:** `contracts/escrow/src/types.rs`
-**Priority:** Medium
-**Type:** Data Integrity / Design
+### Issue #17 — Guard tournament payout against partial-transfer state changes
+**Area:** `contracts/tournament-bracket/src/lib.rs`  
+**Priority:** Critical  
+**Type:** Funds / Atomicity
 
-**Description:**
-`activated_ledger: 0` is used as a sentinel meaning "not yet activated." However, ledger 0 is technically a valid ledger sequence number (the genesis ledger). If a match were somehow created at ledger 0, the timeout logic `current <= 0 + TIMEOUT_LEDGERS` would still work, but the field's meaning is ambiguous. Using `Option<u32>` would make the "not activated" state explicit and type-safe.
+**Problem:** Multi-recipient payouts must not leave the tournament marked complete if one transfer fails after earlier transfer attempts.
 
-**Expected behaviour:** Change `activated_ledger: u32` to `activated_ledger: Option<u32>` and update `claim_timeout` to handle `None` as `InvalidState`.
+**Acceptance criteria:** State changes and transfers execute atomically or use a retryable claims model; fault-injection tests prove no recipient is underpaid or paid twice.
 
----
+### Issue #18 — Add a resumable tournament settlement path for large prize lists
+**Area:** `contracts/tournament-bracket/src/lib.rs`  
+**Priority:** Medium  
+**Type:** Scalability
 
-### Issue #29 — `Match.pending_result_ledger` has the same sentinel-zero ambiguity as `activated_ledger`
+**Problem:** Paying every prize recipient in one invocation can exceed Soroban resource limits as tournament size grows.
 
-**Area:** `contracts/escrow/src/types.rs`
-**Priority:** Medium
-**Type:** Data Integrity / Design
+**Acceptance criteria:** Settlement records the allocation once and lets each recipient claim independently or processes bounded batches; resource tests cover the maximum supported field.
 
-**Description:**
-Same issue as #28. `pending_result_ledger: 0` is used as "no result submitted yet" but `0` is a valid ledger. `finalize_result` would incorrectly allow finalization at `current > 0 + DISPUTE_WINDOW_LEDGERS` if the contract is ever deployed at genesis ledgers.
+### Issue #19 — Include an explicit tournament version in stored state
+**Area:** `contracts/tournament-bracket/src/types.rs`  
+**Priority:** Medium  
+**Type:** Upgrade Compatibility
 
-**Expected behaviour:** Change to `pending_result_ledger: Option<u32>` and handle `None` as `InvalidState` in `finalize_result` and `override_result`.
+**Problem:** Persisted tournament records need a detectable schema version before future contract upgrades change field layout or meaning.
 
----
+**Acceptance criteria:** New records contain a version field and decoding has a tested migration or rejection policy for older versions.
 
-### Issue #30 — No on-chain event emitted when `emergency_drain` is called with zero balance
+### Issue #20 — Define an archival policy for completed tournament records
+**Area:** `contracts/tournament-bracket/src/lib.rs`, `contracts/tournament-bracket/README.md`  
+**Priority:** Low  
+**Type:** Storage Lifecycle
 
-**Area:** `contracts/escrow/src/lib.rs` — `emergency_drain`
-**Priority:** Low
-**Type:** Observability
+**Problem:** Completed tournament state has no explicit retention and archival contract, leaving clients unsure which records remain queryable over time.
 
-**Description:**
-When `balance == 0`, the transfer is skipped but the function still returns `Ok(())`. No event is emitted. An admin calling `emergency_drain` with zero balance gets silent success with no audit trail entry, which complicates incident post-mortems.
-
-**Expected behaviour:** Either return an error when `balance == 0` or emit a `drain_noop` event to preserve the audit trail.
-
----
-
-### Issue #31 — `transfer_admin` on escrow emits event before confirming `new_admin` is stored
-
-**Area:** `contracts/escrow/src/lib.rs` — `transfer_admin`
-**Priority:** Low
-**Type:** Code Quality
-
-**Description:**
-`env.storage().instance().set(&DataKey::Admin, &new_admin)` is called before the event is emitted. This is the correct order — the event should be the last operation. But there is also no `extend_ttl` call after the admin transfer, meaning if the instance TTL is near expiry, the new admin's first read could fail.
-
-**Expected behaviour:** Add `env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT)` at the end of `transfer_admin`.
+**Acceptance criteria:** Document retention guarantees and provide a bounded archival or permanent-record policy; tests verify archival cannot alter settlement facts.
 
 ---
 
-### Issue #32 — No test for `claim_timeout` when called by a third party (non-player)
+## Leaderboard Contract
 
-**Area:** `contracts/escrow/src/tests.rs`
-**Priority:** Low
-**Type:** Testing Gap
+### Issue #21 — Make result recording idempotent by settlement identifier
+**Area:** `contracts/leaderboard/src/lib.rs`  
+**Priority:** High  
+**Type:** Data Integrity
 
-**Description:**
-Tests confirm that a player can call `claim_timeout` after the timeout period. There is no test verifying that a third party (an address that is neither `player1` nor `player2`) is rejected with `Error::Unauthorized`.
+**Problem:** A result reporter can submit the same completed match more than once and inflate player statistics if the contract has no durable processed-settlement key.
 
----
+**Acceptance criteria:** Require a stable escrow settlement ID and record it once; repeated submissions return a typed duplicate result without changing any statistic.
 
-### Issue #33 — No test for `emergency_drain` when contract has zero balance
+### Issue #22 — Keep earnings separated by asset denomination
+**Area:** `contracts/leaderboard/src/lib.rs`, `contracts/leaderboard/src/types.rs`  
+**Priority:** High  
+**Type:** Accounting
 
-**Area:** `contracts/escrow/src/tests.rs`
-**Priority:** Low
-**Type:** Testing Gap
+**Problem:** Summing token smallest-units across assets makes the displayed total economically meaningless when assets have different decimals or exchange values.
 
-**Description:**
-`emergency_drain` silently succeeds when balance is zero. There is no test exercising this path. A test should confirm the function returns `Ok(())` and emits no transfer event.
+**Acceptance criteria:** Store per-asset totals or a documented conversion basis, and expose denomination with every amount; tests combine two assets with different decimals.
 
----
+### Issue #23 — Represent an unset asset separately from a player's first asset
+**Area:** `contracts/leaderboard/src/lib.rs`, `contracts/leaderboard/src/types.rs`  
+**Priority:** High  
+**Type:** Data Model
 
-### Issue #34 — `submit_result` on the escrow contract does not check `NotFunded` before `InvalidState`
+**Problem:** A newly requested player record should not fabricate an asset address as a default value, since clients may interpret that address as a valid earning denomination.
 
-**Area:** `contracts/escrow/src/lib.rs` — `submit_result`
-**Priority:** Low
-**Type:** Code Quality / API Clarity
+**Acceptance criteria:** Use an optional asset or per-asset collection for empty records; tests show an unseen player returns an unambiguous empty state.
 
-**Description:**
-`submit_result` checks `m.state != MatchState::Active` returning `InvalidState`, then checks `!m.player1_deposited || !m.player2_deposited` returning `NotFunded`. But by design, a match can only reach `Active` state if both players have deposited. So the `NotFunded` check is dead code — it can never be reached after `state == Active` passes. The check should either be removed (with a comment explaining why it's invariant) or moved to a test assertion.
+### Issue #24 — Use checked arithmetic for leaderboard aggregates
+**Area:** `contracts/leaderboard/src/lib.rs`, `contracts/leaderboard/src/types.rs`  
+**Priority:** High  
+**Type:** Numeric Safety
 
----
+**Problem:** Wins, losses, draws, and token earnings can overflow fixed-width integers over the contract lifetime and trap result recording.
 
-### Issue #35 — Contract registry has no maximum entries guard against unbounded growth
+**Acceptance criteria:** All aggregate updates use checked arithmetic and return a documented error without partially updating any player record.
 
-**Area:** `contracts/contract-registry/src/lib.rs`
-**Priority:** Medium
-**Type:** Security / Resource Exhaustion
+### Issue #25 — Replace full-roster ranking work with a bounded ranking strategy
+**Area:** `contracts/leaderboard/src/lib.rs`  
+**Priority:** High  
+**Type:** Scalability / Soroban Budget
 
-**Description:**
-The contract registry allows an unbounded number of entries to be registered. On Stellar, each persistent storage entry costs ledger rent. An admin with malicious intent or a misconfigured script could register thousands of entries, inflating storage costs and eventually making the registry unusable due to budget exhaustion during reads.
+**Problem:** Loading and sorting the entire player roster in one invocation makes ranking cost grow with all historical participants.
 
-**Expected behaviour:** Add a `MAX_ENTRIES` constant (e.g. 256) and return `Error::MaxEntriesReached` when the limit is hit, or implement entry expiry.
+**Acceptance criteria:** Adopt a storage/index design with bounded read work for requested ranks; resource-budget tests demonstrate limits at the declared maximum population.
 
----
+### Issue #26 — Refresh leaderboard authorization state while the contract is active
+**Area:** `contracts/leaderboard/src/lib.rs`  
+**Priority:** High  
+**Type:** Storage Lifecycle
 
-### Issue #36 — No `get_platform` view function — platform is stored in `Match` but not queryable alone
+**Problem:** Long-lived deployments can lose instance-level admin or reporter configuration even while result writes continue unless that storage lifetime is extended.
 
-**Area:** `contracts/escrow/src/lib.rs`
-**Priority:** Low
-**Type:** API Usability
+**Acceptance criteria:** Mutating entry points extend the required instance TTL; tests advance ledger sequence and verify authorization remains available after normal writes.
 
-**Description:**
-The `platform` field (Lichess vs ChessDotCom) is embedded in the `Match` struct returned by `get_match`. There is no dedicated view that returns only the platform for a given match ID. While callers can call `get_match`, a lightweight oracle service might want just the platform without deserializing the full struct.
+### Issue #27 — Add a token-denominated rank view for each leaderboard asset
+**Area:** `contracts/leaderboard/src/lib.rs`  
+**Priority:** Medium  
+**Type:** Ranking Semantics
 
----
+**Problem:** A single cross-asset score cannot compare players fairly when recorded assets use different decimals or have different market values.
 
-### Issue #37 — `create_match` does not validate that `player2` is not the zero address
+**Acceptance criteria:** Expose per-asset rankings without implying an exchange-rate conversion; tests verify separate orderings for two assets and document ties.
 
-**Area:** `contracts/escrow/src/lib.rs` — `create_match`
-**Priority:** Medium
-**Type:** Input Validation
+### Issue #28 — Validate asset contracts before accepting leaderboard amounts
+**Area:** `contracts/leaderboard/src/lib.rs`  
+**Priority:** High  
+**Type:** Input Integrity
 
-**Description:**
-`create_match` checks `player1 == player2` but does not check whether either address is the zero/burn address `GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF`. A match created with player2 as the zero address would result in stakes being sent to an uncontrolled address on payout.
+**Problem:** A trusted reporting address can still send malformed token identifiers or amounts that corrupt display and ranking data.
 
-**Expected behaviour:** Validate both `player1` and `player2` are not the zero address before creating the match.
+**Acceptance criteria:** Verify the asset is a valid contract address and amount is nonnegative under the API's defined semantics; invalid values do not write records.
 
----
+### Issue #29 — Identify the changed reporter in source-management events
+**Area:** `contracts/leaderboard/src/lib.rs`  
+**Priority:** Low  
+**Type:** Auditability
 
-### Issue #38 — `list_matches` and `list_results` have no cursor/offset-based pagination support
+**Problem:** An event that only says reporter permissions changed cannot reconstruct which address was granted or revoked.
 
-**Area:** `contracts/escrow/src/lib.rs`, `contracts/oracle/src/lib.rs`
-**Priority:** Medium
-**Type:** Feature Gap
+**Acceptance criteria:** Publish the affected reporter address and operation in a stable event; event tests cover grant and revoke.
 
-**Description:**
-Both listing functions use `start` + `limit` pagination. If matches are deleted or sparse, callers cannot distinguish "end of data" from "gap in IDs." A standard cursor-based approach using the last seen match ID would be more robust for production indexing.
+### Issue #30 — Reject duplicate reporter grants explicitly
+**Area:** `contracts/leaderboard/src/lib.rs`  
+**Priority:** Low  
+**Type:** API Consistency
 
----
+**Problem:** Repeating an already-applied reporter grant can silently conceal caller mistakes and make transaction success appear to represent a new policy change.
 
-### Issue #39 — No on-chain event when `deposit` transitions match from `Pending` to `Active` with only one deposit
+**Acceptance criteria:** Return a documented no-op or duplicate error consistently; tests assert both return behavior and unchanged storage.
 
-**Area:** `contracts/escrow/src/lib.rs` — `deposit`
-**Priority:** Low
-**Type:** Observability
+### Issue #31 — Define tie-breaking rules for equal leaderboard scores
+**Area:** `contracts/leaderboard/src/lib.rs`, `apps/frontend/src/pages/Leaderboard.tsx`  
+**Priority:** Medium  
+**Type:** Ranking Semantics
 
-**Description:**
-When the first player deposits, only a `deposit` event is emitted. When the second player deposits, both a `deposit` event and an `activated` event are emitted. Off-chain listeners cannot tell from events alone which player deposited first or track the half-funded state. Adding a `half_funded` or `first_deposit` event when only one player has deposited would improve observability.
+**Problem:** Equal scores can reorder between queries, causing unstable ranks and confusing cursor-based consumers.
 
----
+**Acceptance criteria:** Document and implement deterministic secondary ordering, such as wins then address bytes; tests verify repeatable order for equal primary scores.
 
-### Issue #40 — `DISPUTE_WINDOW_LEDGERS` and `TIMEOUT_LEDGERS` are not configurable at initialization time
+### Issue #32 — Add a ranking snapshot identifier to multi-page reads
+**Area:** `contracts/leaderboard/src/lib.rs`, `apps/frontend/src/pages/Leaderboard.tsx`  
+**Priority:** Medium  
+**Type:** Consistent Reads
 
-**Area:** `contracts/escrow/src/lib.rs`
-**Priority:** Medium
-**Type:** Design / Flexibility
+**Problem:** A result arriving between page requests may shift the leaderboard and duplicate or omit players across the rendered page set.
 
-**Description:**
-`DISPUTE_WINDOW_LEDGERS` (24h) and `TIMEOUT_LEDGERS` (7 days) are hardcoded constants. Different deployments (testnet vs mainnet, casual vs high-stakes) may need different windows. Making them configurable parameters in `initialize` would avoid redeployment for timing adjustments.
+**Acceptance criteria:** Provide a snapshot ledger or stable cursor token and tests that page retrieval remains consistent while a new result is recorded.
 
-**Expected behaviour:** Accept optional `dispute_window` and `timeout_ledgers` parameters in `initialize`, defaulting to the current constants when not provided.
+### Issue #33 — Separate lifetime totals from season-specific leaderboard records
+**Area:** `contracts/leaderboard/src/types.rs`, `contracts/leaderboard/src/lib.rs`  
+**Priority:** Medium  
+**Type:** Product Feature
 
----
+**Problem:** A single lifetime ranking cannot support time-bounded competitions without off-chain recomputation that may disagree with chain data.
 
-### Issue #41 — No test verifying that a paused contract still allows `cancel_match`
+**Acceptance criteria:** Add an explicit season identifier to reporting and reads; season reset or rollover cannot mutate prior season totals.
 
-**Area:** `contracts/escrow/src/tests.rs`
-**Priority:** Medium
-**Type:** Testing Gap
+### Issue #34 — Allow a player to query their own full asset breakdown
+**Area:** `contracts/leaderboard/src/lib.rs`, `apps/frontend/src/pages/Leaderboard.tsx`  
+**Priority:** Medium  
+**Type:** Read API
 
-**Description:**
-The code comment says "Cancellation is allowed while the contract is paused so players can recover funds." There is no test confirming this. If `cancel_match` accidentally gains a pause check in a future refactor, the regression would go undetected.
+**Problem:** A single summary value does not let users audit which assets and settlements contributed to their rank.
 
-**Expected behaviour:** Add a test: pause the contract, then call `cancel_match` on a pending match and verify it succeeds.
+**Acceptance criteria:** Expose a bounded per-player asset breakdown with documented units and test the response for multiple assets and no recorded results.
 
----
+### Issue #35 — Define how refunded and reversed settlements affect statistics
+**Area:** `contracts/leaderboard/src/lib.rs`, `contracts/escrow/src/lib.rs`  
+**Priority:** High  
+**Type:** Cross-Contract Accounting
 
-### Issue #42 — Oracle contract has no TTL extension on `initialize`
+**Problem:** Leaderboard records need a policy for a settlement later refunded, disputed, or corrected; otherwise chain state and rankings may diverge.
 
-**Area:** `contracts/oracle/src/lib.rs` — `initialize`
-**Priority:** Medium
-**Type:** Storage / Correctness
+**Acceptance criteria:** Define immutable-final or compensating-entry semantics and test a correction path without deleting the original audit record.
 
-**Description:**
-The oracle `initialize` function stores `DataKey::Admin` in instance storage but never calls `extend_ttl`. On Stellar, new instance entries start with a default TTL. If no subsequent state-changing call is made before the TTL expires, the oracle becomes unresponsive. The escrow contract calls `extend_ttl` in its `initialize`; the oracle should too.
+### Issue #36 — Bound the size of per-player asset and season collections
+**Area:** `contracts/leaderboard/src/types.rs`, `contracts/leaderboard/src/lib.rs`  
+**Priority:** Medium  
+**Type:** Resource Limits
 
-**Expected behaviour:** Add `env.storage().instance().extend_ttl(MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS)` at the end of oracle `initialize`.
+**Problem:** Even if global ranking is bounded, unbounded per-player asset or season vectors can exceed serialization and instruction budgets.
 
+**Acceptance criteria:** Set documented limits or use paged storage; tests cover the maximum and reject additions beyond it without partial writes.
 
----
+### Issue #37 — Version leaderboard events for downstream indexers
+**Area:** `contracts/leaderboard/src/lib.rs`  
+**Priority:** Low  
+**Type:** Integration Compatibility
 
-## Backend (Oracle Service)
+**Problem:** Consumers have no explicit schema version when event payload semantics evolve, making an indexer unable to distinguish old and new formats.
 
-### Issue #43 — Oracle backend has no retry logic for failed on-chain `submit_result` transactions
-
-**Area:** `apps/backend/src/`
-**Priority:** High
-**Type:** Reliability
-
-**Description:**
-The backend oracle service fetches a game result from Lichess/Chess.com and calls `submit_result` on the on-chain escrow contract. If the Stellar transaction fails due to transient network issues (fee bump needed, sequence number stale, RPC timeout), the result is never submitted and the match stays `Active` until it times out 7 days later. There is no retry queue or dead-letter store.
-
-**Expected behaviour:** Implement exponential-backoff retry with a configurable max-attempts limit. Failed submissions after all retries should be written to a dead-letter queue and trigger an alert.
-
----
-
-### Issue #44 — No idempotency guard in the oracle backend — duplicate submissions are possible
-
-**Area:** `apps/backend/src/`
-**Priority:** High
-**Type:** Reliability / Correctness
-
-**Description:**
-If the oracle service crashes and restarts mid-submission, it may attempt to call `submit_result` again for the same `match_id`. The on-chain contract rejects the second call with `Error::AlreadySubmitted`, but the backend currently treats this as an unexpected error rather than an idempotent success.
-
-**Expected behaviour:** Before submitting, check `oracle.has_result(match_id)` and treat `true` as "already done — skip." Log as informational, not error.
+**Acceptance criteria:** Include an event version or versioned topic and document backward-compatibility rules with event decoding tests.
 
 ---
 
-### Issue #45 — No authentication on the backend REST API endpoints
+## Contract Registry
 
-**Area:** `apps/backend/src/routes/`
-**Priority:** High
-**Type:** Security
+### Issue #38 — Store a contract address alongside each registry name
+**Area:** `contracts/contract-registry/src/lib.rs`, `docs/architecture.md`  
+**Priority:** High  
+**Type:** Registry API
 
-**Description:**
-The backend exposes REST endpoints for creating matches and querying status. None of the routes require API key authentication or JWT validation. Any actor who discovers the backend URL can submit match creation requests or query sensitive match data.
+**Problem:** A symbolic registration is not enough for a client to resolve the deployed contract if the record does not persist the corresponding contract address.
 
-**Expected behaviour:** Implement JWT-based authentication middleware on all mutating endpoints. Read-only status endpoints may be public but should still be rate-limited.
+**Acceptance criteria:** Registration and update accept a contract address, reads return it with metadata, and redeployment tests verify clients resolve the replacement address.
 
----
+### Issue #39 — Make registry enumeration return stable pages
+**Area:** `contracts/contract-registry/src/lib.rs`  
+**Priority:** Medium  
+**Type:** Read API
 
-### Issue #46 — Backend does not validate that the game result belongs to the expected players
+**Problem:** A count plus lookup-by-name cannot discover all registered names, limiting bootstrap clients and audit tooling.
 
-**Area:** `apps/backend/src/fetchers/`
-**Priority:** High
-**Type:** Security
+**Acceptance criteria:** Add a bounded enumeration API with deterministic ordering and tests for empty, partial, and final pages.
 
-**Description:**
-When the oracle fetches a game result, it trusts the game ID without verifying that the players in the API response match the on-chain match record. A malicious actor who knows the `match_id` could register a different game's result if the oracle does not cross-check player identities.
+### Issue #40 — Preserve registration history when a contract is replaced
+**Area:** `contracts/contract-registry/src/lib.rs`  
+**Priority:** Medium  
+**Type:** Auditability
 
-**Expected behaviour:** After fetching the result, verify that the platform's reported player usernames correspond to the Stellar addresses registered in the on-chain match.
+**Problem:** Replacing a live address overwrites the information operators need to explain which deployment was active at a past ledger.
 
----
+**Acceptance criteria:** Emit an event or retain a bounded version history containing prior address, replacement address, actor, and ledger; test the history order.
 
-### Issue #47 — Backend job queue is in-memory only — all pending jobs lost on restart
+### Issue #41 — Define ownership semantics for registry records
+**Area:** `contracts/contract-registry/src/lib.rs`  
+**Priority:** Medium  
+**Type:** Authorization Model
 
-**Area:** `apps/backend/src/queue.ts`
-**Priority:** High
-**Type:** Reliability
+**Problem:** The contract should state whether record ownership belongs to the registry admin, initial registrant, or both; ambiguous ownership can prevent safe maintenance.
 
-**Description:**
-The oracle job queue is held in memory. If the backend process crashes or is restarted during a deployment, all pending jobs are lost. Matches queued for result submission will never be processed unless re-queued manually.
+**Acceptance criteria:** Document a single policy and enforce it consistently across register, update, and deregister operations with a role matrix test.
 
-**Expected behaviour:** Persist the job queue to a durable store (Redis, PostgreSQL, or SQLite) so jobs survive restarts.
+### Issue #42 — Prevent registry clients from accepting stale deployment records
+**Area:** `contracts/contract-registry/src/lib.rs`, `apps/frontend/src`  
+**Priority:** High  
+**Type:** Deployment Integrity
 
----
+**Problem:** Clients need a way to distinguish an intentionally current deployment from a stale or superseded entry returned by cache or an older registry version.
 
-### Issue #48 — No rate limiting on Lichess/Chess.com API calls in the backend fetchers
+**Acceptance criteria:** Add deployment revision or effective-ledger metadata and make the client validate the expected network and registry identity before using an address.
 
-**Area:** `apps/backend/src/fetchers/`
-**Priority:** Medium
-**Type:** Reliability
+### Issue #43 — Add a read-only registry health and schema query
+**Area:** `contracts/contract-registry/src/lib.rs`  
+**Priority:** Low  
+**Type:** Operations API
 
-**Description:**
-The `bottleneck` package is listed as a dependency but its limiters are not verifiably configured with Lichess/Chess.com limits. Exceeding 60 req/min on Lichess results in 429 errors and temporary bans, blocking result delivery for all active matches.
+**Problem:** Deployment verification tools cannot cheaply establish whether the registry is initialized with the expected schema and administrator.
 
-**Expected behaviour:** Configure `Bottleneck` limiters at 30 req/min for Lichess and 20 req/min for Chess.com, exposed as environment variables.
+**Acceptance criteria:** Expose safe read-only metadata without secrets and cover initialized, uninitialized, and migrated states in tests.
 
----
+### Issue #44 — Validate registry names against a canonical naming policy
+**Area:** `contracts/contract-registry/src/lib.rs`, `contracts/contract-registry/README.md`  
+**Priority:** Medium  
+**Type:** Data Validation
 
-### Issue #49 — Backend health check endpoint does not verify RPC or DB connectivity
+**Problem:** Inconsistent names can create multiple registry entries for the same logical service and make client resolution dependent on spelling.
 
-**Area:** `apps/backend/src/routes/`
-**Priority:** Medium
-**Type:** Observability / Operations
-
-**Description:**
-`/health` returns HTTP 200 unconditionally. It does not verify Stellar RPC connectivity or that the oracle keypair is loaded. Kubernetes/ECS readiness probes will consider the pod ready even when it cannot process jobs.
-
-**Expected behaviour:** Run dependency connectivity checks and return HTTP 503 with a diagnostic JSON body if any dependency is unhealthy.
-
----
-
-### Issue #50 — Oracle private key is not validated at startup against the on-chain registered oracle address
-
-**Area:** `apps/backend/src/`
-**Priority:** High
-**Type:** Security / Operational Safety
-
-**Description:**
-The oracle signing key is read from an environment variable with no validation that it matches the on-chain registered oracle address. A misconfigured key causes all submissions to fail at runtime rather than failing fast at startup.
-
-**Expected behaviour:** At startup, derive the public key, call `get_oracle()` on the escrow contract, assert they match, and refuse to start if they do not.
+**Acceptance criteria:** Define allowed names and canonical case; reject aliases or normalize them deterministically with tests for invalid bytes and reserved names.
 
 ---
 
-### Issue #51 — Backend `matches.test.ts` missing test for querying a non-existent match ID
+## Backend and Oracle Runtime
 
-**Area:** `apps/backend/tests/matches.test.ts`
-**Priority:** Low
-**Type:** Testing Gap
+### Issue #45 — Submit verified outcomes to Soroban instead of returning a placeholder result
+**Area:** `apps/backend/src/server.ts`, `apps/backend/src/services/oracle-submit.ts`  
+**Priority:** Critical  
+**Type:** End-to-End Integration
 
-**Description:**
-`matches.test.ts` covers happy-path match creation and retrieval but has no test for querying a match ID that does not exist on-chain, verifying the API returns HTTP 404 with a structured error body.
+**Problem:** A verified game result is not useful to escrow unless the runtime constructs and submits the corresponding signed contract invocation.
+
+**Acceptance criteria:** Configure the signer and contract clients, submit a verified settlement, and return the transaction hash and final chain status in an integration test against a local network.
+
+### Issue #46 — Schedule monitoring when a match becomes eligible for oracle review
+**Area:** `apps/backend/src/server.ts`, `apps/backend/src/services/polling.ts`  
+**Priority:** High  
+**Type:** Workflow Integration
+
+**Problem:** Persisting a match does not ensure a worker will monitor its external game, so eligible matches can remain unsettled indefinitely.
+
+**Acceptance criteria:** Define the activation event or reconciliation source, enqueue eligible matches exactly once, and test restart recovery from persisted active matches.
+
+### Issue #47 — Preserve a completed game result until its chain submission is confirmed
+**Area:** `apps/backend/src/services/polling.ts`, `apps/backend/src/services/oracle-submit.ts`  
+**Priority:** Critical  
+**Type:** Reliability / Funds
+
+**Problem:** If a callback fails after a game is marked complete, removing its polling work can permanently lose the result needed to release escrow funds.
+
+**Acceptance criteria:** Persist the result as pending settlement before acknowledging completion; retry through a durable state transition until confirmed or explicitly quarantined.
+
+### Issue #48 — Reconcile uncertain transaction outcomes before retrying a settlement
+**Area:** `apps/backend/src/services/oracle-submit.ts`  
+**Priority:** High  
+**Type:** Transaction Safety
+
+**Problem:** A network timeout after submission does not reveal whether Soroban committed the transaction; blindly retrying can create confusing duplicate attempts.
+
+**Acceptance criteria:** Persist the transaction hash and query its status before resubmission; tests simulate timeout-before-commit and timeout-after-commit.
+
+### Issue #49 — Separate transient provider failures from invalid game data
+**Area:** `apps/backend/src/fetchers/lichess.ts`, `apps/backend/src/fetchers/chessdotcom.ts`  
+**Priority:** High  
+**Type:** Error Classification
+
+**Problem:** The worker needs different actions for rate limits, unavailable providers, malformed responses, and a genuinely nonexistent game.
+
+**Acceptance criteria:** Define typed fetch outcomes and retry policies for each class; unit tests assert the correct retry, stop, or operator-review behavior.
+
+### Issue #50 — Reject unrecognized Chess.com termination codes instead of guessing a draw
+**Area:** `apps/backend/src/fetchers/chessdotcom.ts`  
+**Priority:** Critical  
+**Type:** Result Integrity
+
+**Problem:** Mapping unknown provider labels to a draw can cause an incorrect payout when the upstream API adds or changes result codes.
+
+**Acceptance criteria:** Use an exhaustive mapping for documented terminal outcomes; unknown values produce a non-settleable review result and a redacted diagnostic.
+
+### Issue #51 — Reject provider payloads whose timestamps are internally inconsistent
+**Area:** `apps/backend/src/fetchers`, `apps/backend/src/services/oracle-service.ts`
+**Priority:** High  
+**Type:** Evidence Validation
+
+**Problem:** A result response with an end time earlier than its start time, a future completion time, or an impossible duration should not be accepted as settlement evidence.
+
+**Acceptance criteria:** Validate timestamp ordering and allowed clock skew at the provider boundary; tests show malformed chronology is quarantined and never submitted.
+
+### Issue #52 — Allow match identifier zero where the contract permits it
+**Area:** `apps/backend/src/services/oracle-service.ts`, `apps/backend/src/store/match-store.ts`  
+**Priority:** High  
+**Type:** Boundary Compatibility
+
+**Problem:** If the local store's first valid identifier is zero while API validation rejects zero, the first match cannot be verified.
+
+**Acceptance criteria:** Align accepted ranges with the contract and store; tests exercise zero, one, maximum supported value, and invalid negative or non-integer input.
+
+### Issue #53 — Align backend identifier validation with Soroban constraints
+**Area:** `apps/backend/src/services/match-service.ts`, `contracts/escrow/src/lib.rs`  
+**Priority:** High  
+**Type:** Cross-Layer Validation
+
+**Problem:** Accepting identifiers in the API that escrow cannot encode or accept creates orphan database records and non-settleable wagers.
+
+**Acceptance criteria:** Share or mirror the contract's exact length and character rules; contract/API conformance tests use the same boundary cases.
+
+### Issue #54 — Reject stake values that the escrow contract cannot accept before persistence
+**Area:** `apps/backend/src/services/match-service.ts`, `contracts/escrow/src/constants.rs`  
+**Priority:** High  
+**Type:** Cross-Layer Validation
+
+**Problem:** Persisting a match before checking all contract limits lets clients create records that can never be funded on-chain.
+
+**Acceptance criteria:** Validate the contract's precise amount bounds and asset precision before writing; invalid requests leave no stored match.
+
+### Issue #55 — Require cryptographic proof that a wallet controls its chess account
+**Area:** `apps/backend/src/services/player-identity.ts`, `apps/backend/src/services/match-service.ts`  
+**Priority:** High  
+**Type:** Identity Verification
+
+**Problem:** A stored username-to-wallet association is only trustworthy if the account holder proves control of both identities.
+
+**Acceptance criteria:** Add a nonce-based signed linking flow with expiry and one-time consumption; tests reject replayed, expired, or wrong-wallet proofs.
+
+### Issue #56 — Preserve the exact normalized evidence used for each settlement decision
+**Area:** `apps/backend/src/services/oracle-service.ts`, `apps/backend/src/store`
+**Priority:** High  
+**Type:** Auditability
+
+**Problem:** If the provider later changes or removes a game record, operators need to reproduce what the oracle actually evaluated without storing unnecessary raw personal data.
+
+**Acceptance criteria:** Persist a sanitized canonical evidence record and parser version before submission; access is restricted and retention is documented.
+
+### Issue #57 — Search Chess.com archives beyond a fixed recent-history window
+**Area:** `apps/backend/src/fetchers/chessdotcom.ts`  
+**Priority:** Medium  
+**Type:** Provider Coverage
+
+**Problem:** A valid wagered game may be older than the fetcher's finite archive scan and be incorrectly classified as missing.
+
+**Acceptance criteria:** Use a direct lookup when available or bounded configurable archive traversal; test a match at the oldest supported range and a true not-found result.
+
+### Issue #58 — Normalize provider timestamps and result enums at the fetcher boundary
+**Area:** `apps/backend/src/fetchers`  
+**Priority:** Medium  
+**Type:** Integration Contract
+
+**Problem:** Provider-specific timestamps and outcome spellings should not leak into settlement logic, where inconsistent formats can alter timeout or result decisions.
+
+**Acceptance criteria:** Fetchers return one validated internal schema with UTC timestamps and explicit terminal outcomes; contract tests cover representative provider payloads.
+
+### Issue #59 — Add an operator quarantine path for ambiguous provider evidence
+**Area:** `apps/backend/src/services/oracle-service.ts`, `apps/backend/src/store`  
+**Priority:** High  
+**Type:** Human Review
+
+**Problem:** Conflicting or incomplete provider data should not be silently retried forever or automatically settled.
+
+**Acceptance criteria:** Persist a review-required state with reason and evidence references; expose an authenticated administrative workflow that cannot directly bypass on-chain authorization.
+
+### Issue #60 — Persist provider response provenance for each settlement decision
+**Area:** `apps/backend/src/services/oracle-service.ts`, `apps/backend/src/store`  
+**Priority:** Medium  
+**Type:** Auditability
+
+**Problem:** After settlement, operators need to explain which provider response and parser version produced the submitted winner.
+
+**Acceptance criteria:** Store provider name, fetch time, normalized outcome, and parser version without retaining unnecessary personal data; tests verify provenance follows the result lifecycle.
+
+### Issue #61 — Add explicit backend schema migrations for SQLite stores
+**Area:** `apps/backend/src/store`, `apps/backend/src`  
+**Priority:** High  
+**Type:** Data Migration
+
+**Problem:** Persistent queue, match, and rate-limit tables need a controlled upgrade path as schemas evolve, or deployments can fail against existing databases.
+
+**Acceptance criteria:** Add ordered migrations with a schema-version table, transactional application, and tests upgrading a fixture from every supported prior version.
+
+### Issue #62 — Make database writes atomic across match and queue creation
+**Area:** `apps/backend/src/store/sqlite-match-store.ts`, `apps/backend/src/store/sqlite-queue-store.ts`  
+**Priority:** High  
+**Type:** Data Consistency
+
+**Problem:** If match persistence succeeds but work enqueueing fails, the application can accept a wager that no worker will settle.
+
+**Acceptance criteria:** Persist the match and outbox/job record in one database transaction; fault-injection tests prove neither half is committed alone.
+
+### Issue #63 — Use an outbox to deliver settlement events to asynchronous workers
+**Area:** `apps/backend/src/store`, `apps/backend/src/services`  
+**Priority:** High  
+**Type:** Distributed Systems
+
+**Problem:** Calling a queue after committing a database transaction creates a crash window in which committed work is never dispatched.
+
+**Acceptance criteria:** Add an outbox table and idempotent dispatcher; test process termination between write and dispatch followed by successful recovery.
+
+### Issue #64 — Bound queue growth and define retention for terminal work
+**Area:** `apps/backend/src/store/sqlite-queue-store.ts`, `apps/backend/src/services/polling.ts`  
+**Priority:** Medium  
+**Type:** Operations / Data Retention
+
+**Problem:** Durable queues can grow indefinitely unless completed, failed, and superseded records have an explicit retention policy.
+
+**Acceptance criteria:** Define per-state retention and maximum storage policy; cleanup is batched, preserves audit references, and is tested against active jobs.
+
+### Issue #65 — Make SQLite concurrency settings explicit for production deployment
+**Area:** `apps/backend/src/store`, `docs/infrastructure.md`  
+**Priority:** Medium  
+**Type:** Runtime Configuration
+
+**Problem:** Multiple worker processes or container replicas can contend for SQLite writes unless journal mode, busy timeout, and single-writer assumptions are explicit.
+
+**Acceptance criteria:** Configure and document supported concurrency mode; integration tests exercise simultaneous writes and fail startup when an unsupported multi-replica mode is requested.
+
+### Issue #66 — Redact credentials and player identifiers from API logs
+**Area:** `apps/backend/src`  
+**Priority:** High  
+**Type:** Privacy / Security
+
+**Problem:** Request logs and error objects can expose wallet addresses, provider tokens, or identity-linking data beyond the operational need.
+
+**Acceptance criteria:** Define a redaction policy and structured allowlist for logged fields; tests verify secrets and sensitive identifiers are masked in success and failure paths.
+
+### Issue #67 — Add a retention and deletion policy for linked chess identities
+**Area:** `apps/backend/src/services/player-identity.ts`, `docs/security.md`  
+**Priority:** Medium  
+**Type:** Privacy Governance
+
+**Problem:** The project needs to state how long platform usernames, proofs, and linkage records are retained and how a user can unlink them.
+
+**Acceptance criteria:** Document purpose, retention, deletion behavior, and on-chain data limits; implement removal of off-chain linkage data without rewriting immutable settlement records.
+
+### Issue #68 — Support key rotation without discarding pending settlement work
+**Area:** `apps/backend/src/services/oracle-submit.ts`, `apps/backend/src`  
+**Priority:** High  
+**Type:** Operations / Key Management
+
+**Problem:** Rotating a signer should not strand queued work or require editing durable jobs that were created under the previous key.
+
+**Acceptance criteria:** Load the current signer through a managed provider, validate its on-chain role before work begins, and test rotation while pending jobs remain queued.
+
+### Issue #69 — Add deterministic replay tooling for a failed settlement job
+**Area:** `apps/backend/src/services`, `apps/backend/tests`  
+**Priority:** Medium  
+**Type:** Incident Response
+
+**Problem:** Operators need to reproduce a failed decision from its stored inputs without re-fetching a changing upstream game response.
+
+**Acceptance criteria:** Provide a restricted replay command that uses persisted normalized evidence and a dry-run mode; test replay determinism and prevent duplicate on-chain submission.
 
 ---
 
-### Issue #52 — No circuit breaker for the Stellar RPC endpoint
+## Frontend and Player Experience
 
-**Area:** `apps/backend/src/`
-**Priority:** Medium
-**Type:** Reliability
+### Issue #70 — Render a single provider and routed application tree
+**Area:** `apps/frontend/src/main.tsx`  
+**Priority:** High  
+**Type:** Application Composition
 
-**Description:**
-If the Stellar RPC endpoint is degraded, the backend will keep retrying all pending jobs indefinitely, flooding the endpoint with failing requests. There is no circuit-breaker pattern.
+**Problem:** Rendering both a routed tree and a sibling application instance duplicates UI and can create independent wallet or network state.
 
-**Expected behaviour:** After N consecutive RPC failures, pause all job processing for a configurable cool-down period before retrying.
+**Acceptance criteria:** Mount one root composition with shared providers and router; tests verify one application shell and one wallet context are created.
 
----
+### Issue #71 — Make the core wager workflow reachable from primary navigation
+**Area:** `apps/frontend/src/routes/AppRouter.tsx`, `apps/frontend/src/pages/Home.tsx`  
+**Priority:** Critical  
+**Type:** Product Workflow
 
-### Issue #53 — Stellar transaction hash not logged after successful `submit_result`
+**Problem:** Users cannot complete the product's core create, deposit, and match-status journey if those components are not reachable from the routed application.
 
-**Area:** `apps/backend/src/`
-**Priority:** Medium
-**Type:** Observability
+**Acceptance criteria:** Add discoverable routes and navigation for create-match, deposit, match details, and history; route tests cover direct links and refreshes.
 
-**Description:**
-When the oracle successfully submits a result on-chain, the Stellar transaction hash is not logged. This hash is the primary audit trail linking off-chain oracle decisions to on-chain events, and is essential for post-incident investigation.
+### Issue #72 — Support fee-bump sponsorship for players without native XLM
+**Area:** `apps/frontend/src/hooks/useTransactions.ts`, backend transaction service
+**Priority:** Medium  
+**Type:** Transaction Access
 
-**Expected behaviour:** Log the transaction hash at `INFO` level after every successful submission, including `match_id`, `game_id`, `result`, and `tx_hash`.
+**Problem:** A player holding the stake asset but insufficient native XLM cannot submit the required network fee, even when a sponsor could safely cover it.
 
----
+**Acceptance criteria:** Define an opt-in fee-bump flow with explicit sponsor limits and replay protections; test sponsored and unsponsored transactions on testnet without exposing sponsor keys to the browser.
 
-### Issue #54 — `queue.test.ts` does not test job deduplication for the same `match_id`
+### Issue #73 — Remove or implement claim and burn controls that currently do not perform a chain action
+**Area:** `apps/frontend/src/hooks/useTransactions.ts`, `apps/frontend/src/components/claim-burn.tsx`  
+**Priority:** High  
+**Type:** Product Correctness
 
-**Area:** `apps/backend/tests/queue.test.ts`
-**Priority:** Low
-**Type:** Testing Gap
+**Problem:** A visible money-related control must not imply success when it only logs a request or submits mock data.
 
-**Description:**
-The queue tests verify enqueue and process but not what happens when the same `match_id` is enqueued twice. Without deduplication, a match could have its result submitted twice, triggering `AlreadySubmitted` errors.
+**Acceptance criteria:** Implement the documented on-chain operation end to end or remove the unavailable action; UI tests verify no success message appears without a confirmed transaction.
 
----
+### Issue #74 — Simulate the exact transaction the connected wallet will sign
+**Area:** `apps/frontend/src/hooks/useTransactions.ts`  
+**Priority:** High  
+**Type:** Transaction Safety
 
-### Issue #55 — Backend uses `console.log` throughout instead of structured logging
+**Problem:** Simulating a placeholder XDR does not validate the actual contract method, arguments, authorization tree, or network that will be submitted.
 
-**Area:** `apps/backend/src/`
-**Priority:** Low
-**Type:** Observability
+**Acceptance criteria:** Build once from typed operation inputs and simulate that exact invocation before signing; tests compare simulation and submission method and arguments.
 
-**Description:**
-The backend uses `console.log` throughout rather than a structured JSON logger. In production, log aggregation tools (Datadog, CloudWatch, Loki) require structured JSON with standard fields to enable searching and alerting.
+### Issue #75 — Wait for ledger inclusion before showing a transaction as successful
+**Area:** `apps/frontend/src/hooks/useTransactions.ts`  
+**Priority:** Critical  
+**Type:** Transaction State
 
-**Expected behaviour:** Replace all `console.log/error/warn` with a structured logger (e.g. `pino`) emitting JSON with `level`, `timestamp`, `service`, `match_id`, and `message` fields.
+**Problem:** A returned transaction hash can still fail during submission or never be included, so immediate success feedback misleads users about fund movement.
 
----
+**Acceptance criteria:** Track submitted, pending, confirmed, and failed states using Soroban transaction polling; tests cover timeout, inclusion, and terminal failure.
 
-### Issue #56 — Backend does not handle in-progress game status from platform APIs
+### Issue #76 — Resolve supported assets from network configuration before offering them
+**Area:** `apps/frontend/src/components/CreateMatch.tsx`, `apps/frontend/src/config`  
+**Priority:** High  
+**Type:** Asset Configuration
 
-**Area:** `apps/backend/src/fetchers/`
-**Priority:** Medium
-**Type:** Logic Error
+**Problem:** A hard-coded or empty token address can present an asset option that the selected network cannot actually use.
 
-**Description:**
-If the oracle polls a platform API for a game that is still in progress, the response includes a status like `"started"`. It is unclear whether the backend handles this explicitly as a "retry later" signal or treats it as an error, potentially leaving jobs in an unknown state.
+**Acceptance criteria:** Load token contract ID, symbol, and decimals from validated network configuration; hide or disable an asset when deployment metadata is missing.
 
-**Expected behaviour:** Explicitly detect in-progress game status and re-enqueue the job with a configurable polling interval (e.g. 30 seconds).
+### Issue #77 — Preserve the on-chain lifecycle state in match detail responses
+**Area:** `apps/frontend/src/components/DepositStake.tsx`, `apps/frontend/src/types.ts`  
+**Priority:** High  
+**Type:** State Modeling
 
----
+**Problem:** A component that receives participant addresses but not match state cannot reliably decide whether deposit is still allowed.
 
-### Issue #57 — Backend server has no graceful shutdown handler for `SIGTERM`
+**Acceptance criteria:** Include typed state and per-player deposit flags in match details; terminal states disable the action and render a reason from the contract state.
 
-**Area:** `apps/backend/src/server.ts`
-**Priority:** Medium
-**Type:** Reliability / Operations
+### Issue #78 — Base pending-match progress on deposit flags rather than address presence
+**Area:** `apps/frontend/src/components/MatchStatus.tsx`  
+**Priority:** Medium  
+**Type:** Status Accuracy
 
-**Description:**
-The server does not handle `SIGTERM` or `SIGINT`. On a container restart, in-flight requests are abruptly terminated and any in-progress oracle submissions may be left in an intermediate state.
+**Problem:** Participant addresses exist before either deposit, so showing them as evidence of deposited funds reports incorrect match progress.
 
-**Expected behaviour:** Register signal handlers that drain the queue, wait for in-flight requests (with a timeout), and then exit cleanly.
+**Acceptance criteria:** Read explicit deposit flags or verified deposit events and test zero, one, and two-deposit states.
 
----
+### Issue #79 — Scope cached match reads by network and contract deployment
+**Area:** `apps/frontend/src/pages/history-cache.ts`, `apps/frontend/src`
+**Priority:** High  
+**Type:** Cache Isolation
 
-### Issue #58 — Backend `tsconfig.json` does not set `moduleResolution` explicitly
+**Problem:** Reusing cached match data after switching networks or contract deployments can display a valid-looking record from a different chain.
 
-**Area:** `apps/backend/tsconfig.json`
-**Priority:** Low
-**Type:** Build Configuration
+**Acceptance criteria:** Include network identity and contract ID in every cache key; tests verify cache misses after either value changes and preserve valid same-deployment reuse.
 
-**Description:**
-`tsconfig.json` sets `"module": "ESNext"` without explicitly setting `moduleResolution`, causing potential import resolution inconsistencies between `tsx` dev runs and compiled output.
+### Issue #80 — Provide a default Soroban read path when no injected fetch callback is supplied
+**Area:** `apps/frontend/src/components/MatchStatus.tsx`  
+**Priority:** Medium  
+**Type:** Component Contract
 
-**Expected behaviour:** Explicitly set `"moduleResolution": "node16"` to match the Node.js ESM runtime environment.
+**Problem:** Required contract and RPC configuration is ineffective if the component silently requires an undocumented callback to read match state.
 
----
+**Acceptance criteria:** Either implement the default reader or make the callback an explicit required prop at compile time; tests cover missing configuration and successful reads.
 
-### Issue #59 — No end-to-end integration test between backend oracle and a local Stellar node
+### Issue #81 — Separate transaction history from wager history in the History page
+**Area:** `apps/frontend/src/pages/History.tsx`  
+**Priority:** High  
+**Type:** Data Presentation
 
-**Area:** `apps/backend/tests/integration/`
-**Priority:** High
-**Type:** Testing Gap
+**Problem:** Generic network transaction fee and success fields do not establish stake amount, winner, or payout for an escrow match.
 
-**Description:**
-The `tests/integration/` directory exists but contains no tests that exercise the full flow: deploy contracts → create match → deposit → oracle submits result → finalize → verify balances against a local standalone Stellar node.
+**Acceptance criteria:** Build wager rows from contract match records or decoded escrow events; label network transaction details separately and test win, draw, refund, and unrelated transaction cases.
 
-**Expected behaviour:** Implement at least one integration test using `stellar-sdk` against a local standalone node covering the complete match lifecycle.
+### Issue #82 — Convert leaderboard smallest-unit values using verified token metadata
+**Area:** `apps/frontend/src/pages/Leaderboard.tsx`  
+**Priority:** High  
+**Type:** Financial UX
 
----
+**Problem:** Raw integers and shortened token addresses are not meaningful monetary values to players.
 
-### Issue #60 — No Prometheus metrics endpoint in the backend
+**Acceptance criteria:** Display amount with symbol and decimals sourced from trusted network metadata; unknown assets remain explicitly denominated rather than guessed.
 
-**Area:** `apps/backend/src/`
-**Priority:** Low
-**Type:** Observability
+### Issue #83 — Add a wallet transaction review summary before signature
+**Area:** `apps/frontend/src/hooks/useTransactions.ts`, `apps/frontend/src/components`  
+**Priority:** High  
+**Type:** User Safety
 
-**Description:**
-There is no `/metrics` endpoint exposing operational counters: jobs processed, jobs failed, retries, RPC latency. Without metrics it is impossible to alert on degradation proactively.
+**Problem:** Before signing a wager, users need a readable summary of the opponent, asset, stake, network, and contract action.
 
-**Expected behaviour:** Add a Prometheus-compatible `/metrics` endpoint using `prom-client` exposing `oracle_jobs_total`, `oracle_jobs_failed_total`, `oracle_rpc_duration_seconds`.
+**Acceptance criteria:** Present a review step derived from the same typed inputs used to construct the transaction; tests prove the displayed summary matches the submitted arguments.
 
----
+### Issue #84 — Prevent duplicate submissions while wallet signing is unresolved
+**Area:** `apps/frontend/src/hooks/useTransactions.ts`  
+**Priority:** High  
+**Type:** Transaction UX
 
-### Issue #61 — No CORS configuration on the backend API
+**Problem:** Repeated clicks or a slow wallet prompt can start competing operations for one intent and leave users unsure which transaction to sign.
 
-**Area:** `apps/backend/src/app.ts`
-**Priority:** Medium
-**Type:** Security
+**Acceptance criteria:** Use an explicit operation state keyed by the action and form payload; repeated triggers are ignored until the attempt reaches a terminal state.
 
-**Description:**
-The Express app does not configure CORS headers, either blocking legitimate browser-based frontends or allowing any origin. Neither is acceptable for production.
+### Issue #85 — Keep wallet account changes synchronized with pending views
+**Area:** `apps/frontend/src/providers/WalletProvider.tsx`, `apps/frontend/src/hooks/useWallet.ts`  
+**Priority:** Medium  
+**Type:** Wallet State
 
-**Expected behaviour:** Configure `cors` middleware with an explicit allowed-origins list from environment variables, defaulting to the frontend URL in production.
+**Problem:** Changing accounts while a match or transaction view is open can leave actions bound to stale account data.
 
----
+**Acceptance criteria:** Subscribe to account-change events, invalidate account-scoped reads, and require a fresh confirmation before signing with the new account.
 
-### Issue #62 — Backend `package.json` uses caret ranges instead of exact dependency versions
+### Issue #86 — Detect network mismatch before any read or signature request
+**Area:** `apps/frontend/src/hooks/useNetworkStatus.ts`, `apps/frontend/src/hooks/useTransactions.ts`  
+**Priority:** High  
+**Type:** Network Safety
 
-**Area:** `apps/backend/package.json`
-**Priority:** Low
-**Type:** Build Reproducibility
+**Problem:** A wallet on the wrong Stellar network can sign an operation that targets an unexpected deployment or fails with confusing results.
 
-**Description:**
-Dependencies like `"express": "^4.18.3"` allow minor and patch updates on fresh installs, which can introduce breaking changes silently. Smart contract–adjacent services should pin exact versions for deterministic builds.
+**Acceptance criteria:** Compare wallet and app network identity before simulation and signing; tests verify mismatches block writes and explain the expected network.
 
-**Expected behaviour:** Replace all `^` prefixes with exact versions in `package.json`.
+### Issue #87 — Add a transaction recovery view for interrupted wallet flows
+**Area:** `apps/frontend/src/hooks/useTransactions.ts`, `apps/frontend/src/pages`  
+**Priority:** Medium  
+**Type:** Recovery UX
 
----
+**Problem:** A browser refresh after wallet approval can discard the pending hash and leave the user unable to determine whether the transaction settled.
 
-## Frontend
+**Acceptance criteria:** Persist only non-secret pending transaction references, restore their status after reload, and clear them after a terminal result.
 
-### Issue #63 — `vite.config.ts` sets `css: false` in tests, masking missing CSS file import errors
+### Issue #88 — Show a distinct state when a game is still being played
+**Area:** `apps/frontend/src/components/MatchStatus.tsx`  
+**Priority:** Medium  
+**Type:** Status UX
 
-**Area:** `apps/frontend/vite.config.ts`
-**Priority:** Medium
-**Type:** Testing / Configuration
+**Problem:** Users need to distinguish an unfinished external chess game from a failed oracle check or a completed result awaiting settlement.
 
-**Description:**
-`css: false` in the Vitest config suppresses CSS processing errors. If a component imports a CSS module that does not exist, the test silently succeeds rather than failing. This masked a real missing CSS import previously.
+**Acceptance criteria:** Map backend pending, verification, settlement, and failure states to separate accessible labels and tests.
 
-**Expected behaviour:** Either enable CSS processing in tests or add a lint rule that fails CI if any component imports a non-existent CSS file.
+### Issue #89 — Add safe external-link handling for chess game references
+**Area:** `apps/frontend/src/components`, `apps/frontend/src/pages`  
+**Priority:** Low  
+**Type:** Link Safety
 
----
+**Problem:** User-supplied or provider-derived game URLs must not be rendered as arbitrary schemes or unsafe external links.
 
-### Issue #64 — `CreateMatch.tsx` has no client-side validation for stake amount bounds
+**Acceptance criteria:** Validate platform host and URL scheme, use safe new-tab attributes where appropriate, and test rejection of javascript and lookalike hosts.
 
-**Area:** `apps/frontend/src/components/CreateMatch.tsx`
-**Priority:** Medium
-**Type:** UX / Input Validation
+### Issue #90 — Add first-run network and wallet setup without exposing unsupported actions
+**Area:** `apps/frontend/src/pages/Home.tsx`, `apps/frontend/src/providers/WalletProvider.tsx`  
+**Priority:** Medium  
+**Type:** Onboarding
 
-**Description:**
-The form accepts any numeric stake amount. Validation only happens on-chain, so users entering `0` or an out-of-range value receive no feedback until the transaction is rejected. Client-side validation of `MIN_STAKE` and `MAX_STAKE` provides immediate, clear feedback.
+**Problem:** A disconnected user needs a clear route to connect and select a supported network before encountering controls that cannot yet work.
 
-**Expected behaviour:** Validate `stake_amount` is between 1 stroop and 10_000_000_000_000 stroops before enabling submit, with an inline error message.
+**Acceptance criteria:** Provide a compact setup flow driven by actual deployment configuration; tests cover disconnected, unsupported network, and ready states.
 
----
-
-### Issue #65 — `MatchStatus.tsx` does not show dispute window countdown for `PendingResult` matches
-
-**Area:** `apps/frontend/src/components/MatchStatus.tsx`
-**Priority:** Medium
-**Type:** UX
-
-**Description:**
-When a match is in `PendingResult` state, there is no countdown showing how much time remains before `finalize_result` can be called. Players have no way to know when their payout will be available.
-
-**Expected behaviour:** Display a human-readable countdown (e.g. "Payout available in ~18 hours") computed from `pending_result_ledger + DISPUTE_WINDOW_LEDGERS - current_ledger × 5 seconds`.
-
----
-
-### Issue #66 — `DepositStake.tsx` does not check token allowance before showing the deposit button as enabled
-
-**Area:** `apps/frontend/src/components/DepositStake.tsx`
-**Priority:** Medium
-**Type:** UX
-
-**Description:**
-The deposit button is shown as enabled even when the user has not approved the escrow contract to spend their tokens. Clicking it results in an `InsufficientAllowance` on-chain error. An "Approve" step should precede the deposit.
-
-**Expected behaviour:** Check `token.allowance(player, escrow_contract)` before enabling the deposit button. If insufficient, show an "Approve Token" button first.
-
----
-
-### Issue #67 — Frontend does not detect external wallet disconnection events
-
-**Area:** `apps/frontend/src/hooks/useStellarWallet.ts`
-**Priority:** Medium
-**Type:** UX / Bug
-
-**Description:**
-If a user disconnects their Freighter wallet externally while the app is open, the frontend wallet state remains `connected`, causing all subsequent transactions to fail silently.
-
-**Expected behaviour:** Subscribe to Freighter wallet change events and transition to `disconnected` state immediately upon external disconnection.
-
----
-
-### Issue #68 — Transaction hash after success is not a clickable explorer link
-
-**Area:** `apps/frontend/src/components/claim-burn.tsx`
-**Priority:** Low
-**Type:** UX
-
-**Description:**
-After a successful claim or burn, the transaction hash is displayed as truncated plain text. Users cannot inspect the transaction without manually copying it.
-
-**Expected behaviour:** Wrap the hash in an anchor tag pointing to `https://stellar.expert/explorer/{network}/tx/{hash}`, opening in a new tab.
-
----
-
-### Issue #69 — No React `ErrorBoundary` — a component throw crashes the entire app
-
-**Area:** `apps/frontend/src/App.tsx`
-**Priority:** High
-**Type:** Reliability / UX
-
-**Description:**
-There is no `ErrorBoundary` wrapping the application. Any unhandled component render exception causes the entire tree to unmount, leaving the user on a blank screen with no recovery option.
-
-**Expected behaviour:** Wrap the app in an `ErrorBoundary` that catches render errors, logs them, and displays a user-friendly fallback UI with a "Reload" button.
-
----
-
-### Issue #70 — `NetworkBanner` has an unnecessary `typeof import.meta` guard for a Vite build
-
-**Area:** `apps/frontend/src/components/NetworkBanner.tsx`
-**Priority:** Low
-**Type:** Code Quality
-
-**Description:**
-The `typeof import.meta !== 'undefined'` guard is dead code in a Vite build where `import.meta.env` is statically replaced at compile time. It adds noise and misleads readers.
-
-**Expected behaviour:** Simplify to `const EXPECTED_NETWORK = import.meta.env.VITE_STELLAR_NETWORK ?? 'testnet'`.
-
----
-
-### Issue #71 — `CreateMatch.test.tsx` has no tests for invalid `game_id` inputs
-
-**Area:** `apps/frontend/tests/CreateMatch.test.tsx`
-**Priority:** Low
-**Type:** Testing Gap
-
-**Description:**
-No tests cover an empty `game_id`, a `game_id` over 64 characters, or a duplicate `game_id`, verifying that the correct inline error message is shown in each case.
-
----
-
-### Issue #72 — `onSwitchNetwork` callback is a no-op placeholder — network switching is unimplemented
-
-**Area:** `apps/frontend/src/hooks/useStellarWallet.ts`
-**Priority:** Medium
-**Type:** Feature Gap
-
-**Description:**
-When `walletState === 'wrongNetwork'`, the switch-network button calls `onSwitchNetwork`, but the callback is not implemented to actually call any Freighter API.
-
-**Expected behaviour:** Implement `onSwitchNetwork` to call the Freighter API to prompt the user to switch to the correct network.
-
----
-
-### Issue #73 — `MatchStatus.tsx` does not poll for state updates — requires manual page refresh
-
-**Area:** `apps/frontend/src/components/MatchStatus.tsx`
-**Priority:** Medium
-**Type:** UX
-
-**Description:**
-Match state is fetched once on mount. Players watching an active match must manually refresh to see oracle submissions or payout completions.
-
-**Expected behaviour:** Poll match state every 10 seconds, stopping when a terminal state (`Completed` or `Cancelled`) is reached.
-
----
-
-### Issue #74 — Frontend is served without Content Security Policy headers
-
-**Area:** Deployment configuration
-**Priority:** Medium
-**Type:** Security
-
-**Description:**
-No CSP headers are configured. For a financial application handling wallet interactions, CSP is essential to prevent XSS attacks from injecting scripts that could steal signed transactions.
-
-**Expected behaviour:** Configure CSP in deployment configuration restricting scripts to `'self'` and known CDN hashes, blocking inline scripts.
-
----
-
-### Issue #75 — Wallet connection preference is not persisted to `localStorage`
-
-**Area:** `apps/frontend/src/hooks/useWallet.ts`
-**Priority:** Low
-**Type:** UX
-
-**Description:**
-Reloading the page always starts in `disconnected` state, requiring users to reconnect manually every session. Most DeFi apps persist the connection preference and auto-reconnect on load.
-
-**Expected behaviour:** Store `wallet_connected: true` in `localStorage` and auto-reconnect on load using Freighter's `isConnected()` API.
-
----
-
-### Issue #76 — `DepositStake.test.tsx` missing test for disabled state during in-flight transaction
-
-**Area:** `apps/frontend/tests/DepositStake.test.tsx`
-**Priority:** Low
-**Type:** Testing Gap
-
-**Description:**
-No test verifies that the deposit button is disabled and shows a loading indicator while a deposit transaction is in flight, leaving a potential double-submit race condition undetected.
-
----
-
-### Issue #77 — `tailwind.config.ts` is an empty object — may cause incorrect CSS purging
-
-**Area:** `apps/frontend/tailwind.config.ts`
-**Priority:** Low
-**Type:** Build Configuration
-
-**Description:**
-`tailwind.config.ts` exports `{}` with no content paths. This may cause incorrect CSS purging behaviour or inclusion of unused utility classes depending on how Tailwind v4 handles an explicitly provided empty config.
-
-**Expected behaviour:** Either delete the file entirely (letting Tailwind v4 auto-detect) or configure it explicitly for the project structure.
-
----
-
-### Issue #78 — All frontend components are eagerly imported — no route-level code splitting
-
-**Area:** `apps/frontend/src/App.tsx`
-**Priority:** Low
-**Type:** Performance
-
-**Description:**
-All page and component imports in `App.tsx` are static, downloading the entire app bundle even for users visiting only the home page. Large wallet SDK dependencies significantly inflate initial load time.
-
-**Expected behaviour:** Use `React.lazy` and `Suspense` for route-level components.
-
----
-
-### Issue #79 — `Toast.tsx` auto-dismiss `setTimeout` is not cleaned up on component unmount
-
-**Area:** `apps/frontend/src/components/Toast.tsx`
-**Priority:** Low
-**Type:** Bug / Memory Leak
-
-**Description:**
-The auto-dismiss timeout set in `ToastProvider` is not cleared in a `useEffect` cleanup function. If the component unmounts before the timeout fires, calling `setState` on the unmounted component triggers a React warning and is a memory leak.
-
-**Expected behaviour:** Store timeout IDs and call `clearTimeout` in the `useEffect` return function.
-
----
-
-### Issue #80 — No loading skeleton while fetching match data from the Stellar RPC
-
-**Area:** `apps/frontend/src/components/MatchStatus.tsx`
-**Priority:** Low
-**Type:** UX
-
-**Description:**
-While match data is loading, the component renders nothing, causing a jarring layout shift when data arrives.
-
-**Expected behaviour:** Render an `animate-pulse` skeleton placeholder matching the loaded match card layout.
-
----
-
-### Issue #81 — `RegistrationForm.tsx` inputs are missing accessible `<label>` elements
-
-**Area:** `apps/frontend/src/components/forms/RegistrationForm.tsx`
-**Priority:** Medium
+### Issue #91 — Support keyboard operation of transaction dialogs and menus
+**Area:** `apps/frontend/src/components`, `apps/frontend/src/pages`  
+**Priority:** Medium  
 **Type:** Accessibility
 
-**Description:**
-Form inputs are rendered without `<label htmlFor="...">` elements linked by `id`. Screen readers cannot associate labels with controls, making the form inaccessible.
+**Problem:** Focus can become trapped or lost during wallet and transaction dialogs, preventing keyboard and assistive-technology users from completing a wager.
 
-**Expected behaviour:** Add a `<label htmlFor="field-id">` for every input with matching `id` on the input element.
+**Acceptance criteria:** Dialogs manage focus, expose names and status announcements, and restore focus on close; keyboard tests cover open, confirm, cancel, and error.
 
----
+### Issue #92 — Display provider and chain source timestamps on match results
+**Area:** `apps/frontend/src/components/MatchStatus.tsx`  
+**Priority:** Low  
+**Type:** Transparency
 
-### Issue #82 — All user-facing strings are hardcoded in English with no i18n infrastructure
+**Problem:** A displayed result without its verification and settlement timestamps leaves users unable to tell whether data is current or final.
 
-**Area:** `apps/frontend/src/`
-**Priority:** Low
-**Type:** Internationalisation
-
-**Description:**
-Chess is a global sport. All strings being hardcoded in English makes future translation a large, risky refactor.
-
-**Expected behaviour:** Introduce `react-i18next` and extract all user-facing strings to locale JSON files, even if only English is supported initially.
+**Acceptance criteria:** Show the provider verification time and confirmed ledger time when available, distinguish them visually, and omit them rather than fabricate values.
 
 ---
 
-### Issue #83 — No 404 catch-all route in the frontend router
+## Deployment and Runtime Operations
 
-**Area:** `apps/frontend/src/App.tsx`
-**Priority:** Low
-**Type:** UX
+### Issue #93 — Isolate shared testnet deployments by pull request
+**Area:** `.github/workflows`, `scripts/deploy_testnet.sh`
+**Priority:** Medium  
+**Type:** Environment Isolation
 
-**Description:**
-Navigating to an undefined route renders a blank page with no user feedback.
+**Problem:** Concurrent pull-request testing against one mutable testnet deployment can overwrite contract IDs and invalidate another run's results.
 
-**Expected behaviour:** Add a wildcard `*` route rendering a styled `NotFound` component with a link back to the home page.
+**Acceptance criteria:** Create a uniquely identified deployment namespace or serialize shared deployments; record ownership and clean up only resources created by the completed run.
 
----
-
-### Issue #84 — `History.tsx` fetches all matches at once with no pagination
-
-**Area:** `apps/frontend/src/pages/History.tsx`
-**Priority:** Medium
-**Type:** Performance / UX
-
-**Description:**
-Match history is fetched in a single call. As match count grows, this produces large payloads, long load times, and potential RPC timeouts.
-
-**Expected behaviour:** Implement cursor-based pagination using `list_matches(start, limit)`, with "Load more" or infinite-scroll controls.
-
-
----
-
-## Infrastructure & Deployment
-
-### Issue #85 — `deploy_testnet.sh` does not verify the deployer account has sufficient XLM before deploying
-
-**Area:** `scripts/deploy_testnet.sh`
-**Priority:** Medium
-**Type:** Operational Safety
-
-**Description:**
-The deploy script runs `stellar contract deploy` without first checking that the deployer account holds enough XLM to cover contract upload fees and minimum balance requirements. A failed deployment mid-script can leave the contract registry in a partially initialised state.
-
-**Expected behaviour:** Add a preflight balance check: query the deployer account balance via Horizon and fail fast with a clear error message if the balance is below a safe threshold (e.g. 10 XLM).
-
----
-
-### Issue #86 — Deployment scripts do not save deployed contract IDs to a versioned manifest file
-
+### Issue #94 — Verify the deployed signer can authorize the configured admin role
 **Area:** `scripts/deploy_testnet.sh`, `scripts/deploy_mainnet.sh`
-**Priority:** Medium
-**Type:** Operations / Reproducibility
+**Priority:** High  
+**Type:** Deployment Authorization
 
-**Description:**
-After deploying, the contract IDs are printed to stdout but not saved anywhere persistent. Re-running the deployment scripts or sharing addresses with team members requires either re-deploying or manually copying IDs from terminal history.
+**Problem:** A deployment can initialize an admin address that differs from the configured key, leaving operators unable to manage the live contracts.
 
-**Expected behaviour:** Write deployed contract addresses to a `deployments/{network}.json` manifest file after each successful deployment, committing the testnet manifest to the repository.
+**Acceptance criteria:** Compare the configured signer address with the initialized admin readback before publishing deployment metadata; fail with a redacted, actionable mismatch report.
 
----
+### Issue #95 — Publish a signed deployment manifest tied to the source revision
+**Area:** `scripts`, `.github/workflows/deploy.yml`  
+**Priority:** High  
+**Type:** Supply Chain / Operations
 
-### Issue #87 — `deploy_mainnet.sh` does not require explicit confirmation before executing
+**Problem:** Contract IDs need a tamper-evident association with the source commit, artifact hashes, network, and initialization parameters.
 
-**Area:** `scripts/deploy_mainnet.sh`
-**Priority:** High
-**Type:** Operational Safety
+**Acceptance criteria:** Generate a machine-readable manifest, sign or attest it in CI, and verify the attestation before the frontend consumes the deployment.
 
-**Description:**
-`deploy_mainnet.sh` deploys directly to the Stellar mainnet without any interactive confirmation prompt. A developer accidentally running the script could deploy unintended contract versions to production.
+### Issue #96 — Require a second approver for production token and oracle changes
+**Area:** `.github/workflows`, deployment configuration, `docs/runbook.md`
+**Priority:** High  
+**Type:** Change Governance
 
-**Expected behaviour:** Add a `read -p "Deploy to MAINNET? This is irreversible. Type 'yes' to continue: "` confirmation gate at the top of the script that aborts if the user does not type exactly `yes`.
+**Problem:** Changing the trusted token or oracle changes the asset and result trust boundary; a single operator should not be able to publish such a change without independent review.
 
----
+**Acceptance criteria:** Gate production changes behind an independent approval and record the reviewed values in the release evidence; test that deployment cannot proceed without approval.
 
-### Issue #88 — `environments.toml` does not include a `[standalone]` local development section
+### Issue #97 — Check Stellar CLI protocol compatibility before contract deployment
+**Area:** `scripts/build.sh`, `scripts/deploy_testnet.sh`, `scripts/deploy_mainnet.sh`
+**Priority:** Medium  
+**Type:** Tool Compatibility
 
-**Area:** `environments.toml`
-**Priority:** Low
-**Type:** Developer Experience
+**Problem:** A CLI version that cannot decode the contract's target protocol or spec can fail mid-deployment or invoke methods with incompatible encoding.
 
-**Description:**
-`environments.toml` has sections for `testnet`, `mainnet`, and `futurenet` but is missing a `[standalone]` section for local development using `stellar network start`. Developers running a local sandbox have to manually construct CLI flags or maintain local environment overrides.
+**Acceptance criteria:** Declare supported CLI and protocol versions, verify them before deployment starts, and test that unsupported versions fail before any network mutation.
 
-**Expected behaviour:** Add a `[standalone]` section with standard local network values (`network_passphrase = "Standalone Network ; February 2017"`, `rpc_url = "http://localhost:8000/soroban/rpc"`).
+### Issue #98 — Add a contract upgrade compatibility check before publishing new client IDs
+**Area:** `scripts`, `contracts`, `.github/workflows`  
+**Priority:** High  
+**Type:** Upgrade Safety
 
----
+**Problem:** A deployment that changes contract interface or stored-state layout can silently break an already released frontend or backend.
 
-### Issue #89 — CI `coverage` job installs `cargo-tarpaulin` from scratch on every run
+**Acceptance criteria:** Compare exported contract specifications and storage schema versions against the prior manifest; require an explicit compatibility report for breaking changes.
 
-**Area:** `.github/workflows/ci.yml` — `coverage` job
-**Priority:** Low
-**Type:** CI Performance
+### Issue #99 — Add a canary environment for frontend and backend releases
+**Area:** `.github/workflows`, `docs/deployment.md`  
+**Priority:** Medium  
+**Type:** Release Engineering
 
-**Description:**
-The `coverage` job runs `cargo install cargo-tarpaulin --locked` on every CI run, taking 2–5 minutes to compile. Using a GitHub Actions cache or a pre-built binary action would cut this to seconds.
+**Problem:** A testnet contract deployment alone does not validate the production frontend and oracle runtime configuration as a combined release.
 
-**Expected behaviour:** Use `taiki-e/install-action@cargo-tarpaulin` or cache the compiled binary between runs using `actions/cache` with a key based on the tarpaulin version.
+**Acceptance criteria:** Define a canary release target with isolated credentials and a smoke match; promotion requires observed health and a documented rollback window.
 
----
+### Issue #100 — Make deployment scripts safe to resume after partial failure
+**Area:** `scripts/deploy_testnet.sh`, `scripts/deploy_mainnet.sh`  
+**Priority:** High  
+**Type:** Deployment Reliability
 
-### Issue #90 — CI does not run the Python `validate_environments.py` tests on pull requests to non-master branches
+**Problem:** A failure after deploying one contract but before initialization can leave orphan deployments and an ambiguous rerun state.
 
-**Area:** `.github/workflows/ci.yml`
-**Priority:** Low
-**Type:** CI Coverage
+**Acceptance criteria:** Record each completed step in a run manifest, detect and report partial state on rerun, and avoid silently deploying duplicate instances.
 
-**Description:**
-The `validate-environments` CI job runs `python scripts/test_validate_environments.py`, but CI is only triggered on push/PR to `master`. Feature branches modifying `environments.toml` won't have their changes validated until they are merged, making CI feedback too late.
+### Issue #101 — Add a test for environment-variable isolation between frontend and backend
+**Area:** `apps/frontend`, `apps/backend`, `.env.example`  
+**Priority:** High  
+**Type:** Secret Handling
 
-**Expected behaviour:** Trigger CI on all branches (or at minimum all pull requests), not just `master`.
+**Problem:** Build-time frontend variables are public, but server-only signer and provider credentials must never be bundled into client assets.
 
----
+**Acceptance criteria:** Separate public and private configuration schemas and add a production bundle scan that fails if known server-only variable names or values appear.
 
-### Issue #91 — No Dependabot configuration for Rust (Cargo) dependencies
+### Issue #102 — Pin and attest all third-party action dependencies
+**Area:** `.github/workflows`  
+**Priority:** Medium  
+**Type:** Supply Chain Security
 
-**Area:** `.github/dependabot.yml`
-**Priority:** Low
-**Type:** Security / Maintenance
+**Problem:** Workflow actions referenced by mutable tags can change behavior without a reviewed repository change.
 
-**Description:**
-`dependabot.yml` configures automated updates for npm packages but not for Cargo dependencies. Soroban SDK and other Rust crates may receive security patches that would go unnoticed without automated dependency update PRs.
+**Acceptance criteria:** Pin external actions to immutable commit SHAs, document update cadence, and add a check that rejects unpinned action references.
 
-**Expected behaviour:** Add a Cargo ecosystem entry to `dependabot.yml`:
-```yaml
-- package-ecosystem: "cargo"
-  directory: "/"
-  schedule:
-    interval: "weekly"
-```
+### Issue #103 — Add an SBOM for release artifacts and contract dependencies
+**Area:** `.github/workflows`, `Cargo.lock`, `apps/backend/package-lock.json`  
+**Priority:** Medium  
+**Type:** Supply Chain Transparency
 
----
+**Problem:** Operators cannot quickly inventory the direct and transitive components included in a deployed backend or contract build.
 
-### Issue #92 — CI `fmt` job does not check Rust formatting for the `contract-registry` crate
+**Acceptance criteria:** Generate machine-readable CycloneDX or SPDX inventories for release artifacts and attach them to the corresponding build provenance.
 
-**Area:** `.github/workflows/ci.yml` — `fmt` job
-**Priority:** Low
-**Type:** CI Coverage
+### Issue #104 — Define tested recovery objectives for the oracle database
+**Area:** `docs/runbook.md`, `apps/backend/src/store`  
+**Priority:** Medium  
+**Type:** Disaster Recovery
 
-**Description:**
-`cargo fmt -- --check` runs across the workspace, which should include all crates. However if `contract-registry/src/lib.rs` has formatting issues they would be caught. The real gap is that there is no `rustfmt.toml` config file defining project-wide formatting rules, so developers using different editor settings produce inconsistently formatted PRs.
+**Problem:** Durable job data is only useful if backups, restore procedures, and expected recovery loss are defined and rehearsed.
 
-**Expected behaviour:** Add a `rustfmt.toml` at the workspace root with agreed settings (e.g. `edition = "2021"`, `max_width = 100`) and document it in `CONTRIBUTING.md`.
+**Acceptance criteria:** Document backup frequency, retention, recovery-point and recovery-time goals; automate a restore test that verifies pending settlements survive.
 
----
-
-### Issue #93 — No staging environment between testnet and mainnet
-
-**Area:** Infrastructure / Deployment
-**Priority:** Medium
+### Issue #105 — Add capacity limits and disk-pressure alarms for persistent storage
+**Area:** `apps/backend/src/store`, `docs/infrastructure.md`  
+**Priority:** Medium  
 **Type:** Operations
 
-**Description:**
-The project has testnet and mainnet environments but no dedicated staging environment. This means mainnet deployments are only validated against testnet, which may have different network conditions, ledger timing, and token contract behaviour.
+**Problem:** Persistent SQLite queues and match records can exhaust the runtime volume without warning, interrupting settlement processing.
 
-**Expected behaviour:** Define a staging environment in `environments.toml` using Stellar futurenet (or a separate testnet deployment) and update CI/CD to run integration tests against staging before any mainnet deployment gate.
+**Acceptance criteria:** Measure database size, configure a supported capacity threshold, alert before exhaustion, and verify cleanup never deletes pending work.
 
----
+### Issue #106 — Monitor settlement age from match activation to confirmed payout
+**Area:** `apps/backend/src/services`, `docs/infrastructure.md`  
+**Priority:** High  
+**Type:** Service-Level Observability
 
-### Issue #94 — `audit.yml` workflow does not fail on HIGH severity vulnerabilities
+**Problem:** A process can be healthy while active matches silently wait too long for verification or chain settlement.
 
-**Area:** `.github/workflows/audit.yml`
-**Priority:** Medium
-**Type:** Security
+**Acceptance criteria:** Record stage timestamps and publish age percentiles plus threshold alerts; tests verify metrics distinguish provider wait from chain submission delay.
 
-**Description:**
-The `audit.yml` workflow runs `cargo audit` but may not be configured to fail the build on HIGH or CRITICAL severity advisories. If the fail threshold is set too low (or not set at all), known vulnerabilities could be merged without blocking review.
+### Issue #107 — Add an alert for sustained disagreement between game providers and chain outcomes
+**Area:** `apps/backend/src/services`, `docs/runbook.md`  
+**Priority:** High  
+**Type:** Fraud and Incident Detection
 
-**Expected behaviour:** Ensure `cargo audit` is run with `--deny warnings` or equivalent to fail CI on any unfixed advisory at HIGH severity or above.
+**Problem:** Provider data anomalies or a compromised reporter may only become visible after repeated outcomes disagree with independent evidence.
 
----
+**Acceptance criteria:** Define a review signal using independently available evidence and thresholds; alerts must not automatically reverse or settle funds.
 
-### Issue #95 — No secret scanning configured for the repository
+### Issue #108 — Document and test database restore while the worker is running
+**Area:** `apps/backend/src/store`, `apps/backend/tests`  
+**Priority:** Medium  
+**Type:** Recovery Safety
 
-**Area:** `.github/` / Repository Settings
-**Priority:** High
-**Type:** Security
+**Problem:** Restoring a database under a live queue worker can replay or lose settlement work if the worker is not paused and reconciled.
 
-**Description:**
-There is no GitHub secret scanning or `gitleaks` pre-commit hook configured. A developer accidentally committing a Stellar secret key, Lichess API token, or Chess.com API key to the repository would not be caught before the commit is pushed.
+**Acceptance criteria:** Provide an operational command or procedure that quiesces workers, validates the restored schema, reconciles active jobs, and resumes safely.
 
-**Expected behaviour:** Enable GitHub's built-in secret scanning on the repository and add a `gitleaks` pre-commit hook (or `.gitleaks.toml` config) to catch secrets before they reach the remote.
+### Issue #109 — Make runtime shutdown drain or checkpoint active work before exit
+**Area:** `apps/backend/src/shutdown.ts`, `apps/backend/src/services/polling.ts`  
+**Priority:** Medium  
+**Type:** Process Lifecycle
 
----
+**Problem:** A graceful process exit should not leave a job marked in progress without a lease expiry or recoverable checkpoint.
 
-### Issue #96 — WASM artifacts are not reproducibly built — different machines may produce different hashes
-
-**Area:** `scripts/build.sh`, `.github/workflows/ci.yml`
-**Priority:** Medium
-**Type:** Build Reproducibility / Security
-
-**Description:**
-The WASM build is not pinned to a Docker image or specific toolchain environment. Rust WASM builds can differ between machines based on OS, LLVM version, and linker. Contract users who want to verify the deployed bytecode matches the source code cannot do so reliably.
-
-**Expected behaviour:** Use a pinned Docker image (e.g. `stellar/soroban-tools:22.x.y`) for all WASM builds and document the verification procedure in `docs/deployment.md`.
+**Acceptance criteria:** Stop new claims, finish or release active leases, close storage cleanly, and test shutdown at each worker lifecycle phase.
 
 ---
 
-### Issue #97 — `deny.toml` does not configure `[advisories]` section to deny unmaintained crates
+## Product, Governance, and Quality
 
-**Area:** `deny.toml`
-**Priority:** Low
-**Type:** Security / Maintenance
+### Issue #110 — Publish explicit eligibility rules for supported games
+**Area:** `docs`, `apps/backend/src/services/validate-game-service.ts`  
+**Priority:** High  
+**Type:** Product Policy
 
-**Description:**
-`deny.toml` exists but its `[advisories]` configuration is unknown. If it does not deny unmaintained crates (`unmaintained = "deny"`), dependencies that are no longer receiving security patches can accumulate silently.
+**Problem:** Players need to know before staking which time controls, variants, game visibility, and completion conditions the oracle can verify.
 
-**Expected behaviour:** Set `unmaintained = "deny"` and `unsound = "deny"` in the `[advisories]` section of `deny.toml`.
+**Acceptance criteria:** Define supported game rules in user-facing docs and encode every machine-checkable condition in validation tests with clear rejection reasons.
 
----
+### Issue #111 — Define the policy for provider outages during an active wager
+**Area:** `docs/runbook.md`, `apps/backend/src/services`  
+**Priority:** High  
+**Type:** Product Policy / Operations
 
-## Security
+**Problem:** A prolonged external platform outage can leave a wager unresolved, and the current user-facing remedy and deadline need to be explicit.
 
-### Issue #98 — `emergency_drain` can be called by the admin to steal all player funds while the contract is paused
+**Acceptance criteria:** Specify operator escalation, participant communication, and on-chain timeout interaction; test that backend outage handling never invents a game outcome.
 
-**Area:** `contracts/escrow/src/lib.rs` — `emergency_drain`
-**Priority:** High
-**Type:** Security / Trust Model
+### Issue #112 — Publish a fee and net-payout calculation before wallet approval
+**Area:** `apps/frontend/src`, `docs/api-reference.md`  
+**Priority:** Medium  
+**Type:** Financial Transparency
 
-**Description:**
-`emergency_drain` transfers the entire contract token balance to any address specified by the admin while the contract is paused. This means the admin is a single point of trust: a compromised or malicious admin can pause the contract and drain all player stakes. The threat model document does not explicitly call this out as a known risk with mitigations.
+**Problem:** Players need to understand stake, potential gross payout, network fee estimate, and any platform charge before authorizing a transaction.
 
-**Expected behaviour:** Document this risk clearly in `docs/security.md` and `docs/threat-model.md`. Consider requiring a multi-sig or time-lock mechanism for `emergency_drain`, or restricting the drain destination to a pre-registered safe address rather than an arbitrary `to` parameter.
+**Acceptance criteria:** Define which fees exist, calculate them from current configuration, and show gross versus net amounts without promising an estimated network fee as exact.
 
----
+### Issue #113 — Define a minimum-age and jurisdiction eligibility policy for wagering
+**Area:** `docs/security.md`, `docs/deployment.md`  
+**Priority:** High  
+**Type:** Compliance / Product Governance
 
-### Issue #99 — Oracle address is a single key — no multi-sig or threshold signing for result submission
+**Problem:** A real-money wagering interface needs an explicit policy for who may access the service and which jurisdictions are supported.
 
-**Area:** `contracts/escrow/src/lib.rs`, `contracts/oracle/src/lib.rs`
-**Priority:** High
-**Type:** Security / Trust Model
+**Acceptance criteria:** Record a reviewed policy and deployment enforcement responsibilities; ensure the frontend does not imply universal legal availability.
 
-**Description:**
-The oracle that submits match results is a single Stellar account. If the oracle's private key is compromised, an attacker can submit fraudulent results for all active matches, diverting all staked funds. There is no threshold signature or multi-party verification.
+### Issue #114 — Add a documented responsible-play and self-exclusion flow
+**Area:** `apps/frontend/src`, `docs`  
+**Priority:** Medium  
+**Type:** Player Protection
 
-**Expected behaviour:** Design a multi-oracle pattern where at least 2 of N independent oracle services must agree on a result before it is accepted on-chain, or use a Stellar multi-sig account for the oracle address requiring M-of-N signatures.
+**Problem:** Users need clear controls and support guidance for limiting or stopping their participation in wagering.
 
----
+**Acceptance criteria:** Define available self-exclusion or usage-limit controls, communicate their on-chain/off-chain scope, and test that excluded accounts cannot start the protected workflow where enforcement exists.
 
-### Issue #100 — No maximum number of concurrent active matches per player
+### Issue #115 — Establish a public status page for chain and oracle service incidents
+**Area:** `docs/infrastructure.md`, deployment configuration  
+**Priority:** Medium  
+**Type:** Service Communication
 
-**Area:** `contracts/escrow/src/lib.rs` — `create_match`
-**Priority:** Medium
-**Type:** Security / Anti-Abuse
+**Problem:** During RPC, provider, or oracle incidents, participants need one authoritative place to distinguish a service outage from a failed wager.
 
-**Description:**
-A single player can create an unlimited number of concurrent matches. An attacker could create thousands of matches with low stakes to DoS the oracle service (flooding it with games to monitor) or to exhaust the `MatchCount` counter faster than expected.
+**Acceptance criteria:** Publish component-level availability and incident updates without exposing signer details; define owner and update procedure in the runbook.
 
-**Expected behaviour:** Add a per-player active-match limit (e.g. 10 concurrent active/pending matches) enforced on-chain, tracked via a `PlayerMatchCount(Address)` storage key.
+### Issue #116 — Define support evidence requirements for disputed settlements
+**Area:** `docs/runbook.md`, `apps/backend/src`  
+**Priority:** Medium  
+**Type:** Support Operations
 
----
+**Problem:** Support cannot investigate a payout dispute consistently without a standard set of match, provider, transaction, and ledger references.
 
-### Issue #101 — `game_id` is accepted from `player1` without verifying the game exists on the platform before creating the match
+**Acceptance criteria:** Define a privacy-conscious evidence bundle and retrieval procedure; verify it contains no signing secrets or unnecessary identity data.
 
-**Area:** `contracts/escrow/src/lib.rs` — `create_match`
-**Priority:** Medium
-**Type:** Security / UX
+### Issue #117 — Add an API compatibility policy for backend consumers
+**Area:** `apps/backend/src/routes`, `docs/api-reference.md`  
+**Priority:** Medium  
+**Type:** API Governance
 
-**Description:**
-A player can create a match with any arbitrary `game_id` string, even one that does not correspond to a real game on Lichess or Chess.com. The oracle will later fail to find the game, the match will eventually time out, and funds will be locked for 7 days unnecessarily.
+**Problem:** Frontend and third-party consumers need notice when response fields, error codes, or endpoint semantics change.
 
-**Expected behaviour:** The oracle backend should validate the game exists and is in progress before the frontend allows `create_match` to be submitted. Add a `/validate-game` backend endpoint that checks the platform API before the frontend calls `create_match`.
+**Acceptance criteria:** Define versioning and deprecation rules, publish an OpenAPI contract, and add a compatibility check for breaking schema changes in CI.
 
----
+### Issue #118 — Specify a single source of truth for network and contract metadata
+**Area:** `environments.toml`, `.env.example`, `apps/frontend/src`, `apps/backend/src`  
+**Priority:** High  
+**Type:** Configuration Governance
 
-### Issue #102 — Stellar account minimum balance not accounted for in stake amounts
+**Problem:** Duplicated environment definitions can make frontend, backend, scripts, and docs target different RPC endpoints or contract IDs.
 
-**Area:** `contracts/escrow/src/lib.rs`
-**Priority:** Medium
-**Type:** Security / Correctness
+**Acceptance criteria:** Establish a canonical schema and generate or validate all consumer configuration against it; tests reject conflicting network identities.
 
-**Description:**
-On Stellar, every account must maintain a minimum balance (base reserve × entries). When calculating payouts, the contract transfers `stake_amount × 2` without checking whether the contract account balance would drop below the minimum reserve. If the contract holds exactly the expected stake amount with no buffer, the transfer could fail.
+### Issue #119 — Define ownership and review rules for production configuration changes
+**Area:** `.github/CODEOWNERS`, `docs/contributing.md`  
+**Priority:** Medium  
+**Type:** Change Governance
 
-**Expected behaviour:** Add a buffer on deployment (e.g. 1 XLM admin top-up) and document the minimum required contract balance, or use `token.balance()` pre-checks before transfers.
+**Problem:** Changes to RPC endpoints, contract IDs, token addresses, or deployment policies can alter production behavior without a domain-owner review.
 
----
+**Acceptance criteria:** Assign owners for sensitive paths and require the relevant review in branch protection; document emergency override and audit requirements.
 
-### Issue #103 — `transfer_admin` does not emit an event with the old admin address for audit trails
+### Issue #120 — Add a contract-interface compatibility fixture shared by clients
+**Area:** `contracts`, `apps/backend`, `apps/frontend`  
+**Priority:** High  
+**Type:** Cross-Repository Contract
 
-**Area:** `contracts/oracle/src/lib.rs` — `transfer_admin`
-**Priority:** Low
-**Type:** Security / Observability
+**Problem:** Independent client bindings can drift from the deployed contract ABI even when each package compiles successfully.
 
-**Description:**
-Oracle `transfer_admin` emits `(admin, new_admin)` — actually it does include the old admin in the event data. However, the escrow's `transfer_admin` emits `(current_admin, new_admin)`. Both are fine, but the escrow event uses `symbol_short!("transfer")` which is truncated to 7 characters, potentially colliding with other `transfer` events from token contracts in event log parsers.
+**Acceptance criteria:** Generate a versioned interface fixture from contract specs and test frontend and backend serializers against identical method and error definitions.
 
-**Expected behaviour:** Use a more specific event topic like `symbol_short!("adm_xfr")` on the escrow contract to avoid collisions with standard SEP-41 token `transfer` events.
+### Issue #121 — Add deterministic test fixtures for external chess-provider payloads
+**Area:** `apps/backend/tests`, `apps/backend/src/fetchers`  
+**Priority:** Medium  
+**Type:** Test Data Quality
 
----
+**Problem:** Provider behavior changes can break parsers without a stable, privacy-safe set of payload examples for known edge cases.
 
-### Issue #104 — No on-chain check that `player1` and `player2` are not contract addresses
+**Acceptance criteria:** Store sanitized fixtures for decisive, drawn, ongoing, malformed, and changed-schema responses; parser tests run without network access.
 
-**Area:** `contracts/escrow/src/lib.rs` — `create_match`
-**Priority:** Low
-**Type:** Security
+### Issue #122 — Add fault-injection tests for every settlement boundary
+**Area:** `apps/backend/tests`, `contracts/escrow/src/tests_e2e.rs`  
+**Priority:** High  
+**Type:** Failure Testing
 
-**Description:**
-`player1` and `player2` could be contract addresses. If a malicious contract is registered as a player, its `receive` function could execute arbitrary logic when the payout transfer is made, potentially causing a re-entrancy-style attack (though Soroban's execution model limits this risk).
+**Problem:** Happy-path tests do not establish recovery behavior when storage, provider lookup, signing, RPC submission, or confirmation fails between stages.
 
-**Expected behaviour:** Document in the security model why this is or is not a risk under Soroban's execution model, and consider adding a note that player addresses should be user (classic) accounts.
+**Acceptance criteria:** Inject failure at each documented boundary and assert the match remains recoverable, no duplicate payout occurs, and operator state is actionable.
 
----
+### Issue #123 — Propagate W3C trace context through asynchronous oracle jobs
+**Area:** `apps/backend/src`, `apps/frontend/src`, `docs/infrastructure.md`  
+**Priority:** Medium  
+**Type:** Observability
 
-## Documentation
+**Problem:** A trace started by an HTTP request cannot currently be continued reliably through durable queue processing and later provider or RPC calls.
 
-### Issue #105 — `README.md` state machine diagram is outdated — does not show `PendingResult` state
+**Acceptance criteria:** Persist trace context with queued work, resume it on worker execution and retries, and verify traces contain no wallet secrets or provider credentials.
 
-**Area:** `README.md`
-**Priority:** Medium
-**Type:** Documentation
+### Issue #124 — Add a supported-version matrix for Stellar protocol and SDK upgrades
+**Area:** `rust-toolchain.toml`, `Cargo.toml`, `apps/backend/package.json`, `docs`  
+**Priority:** Medium  
+**Type:** Compatibility Policy
 
-**Description:**
-The README's match state machine diagram shows `Active → Completed` directly via `submit_result()`. The actual implementation adds a `PendingResult` intermediate state with a dispute window, followed by `finalize_result()` triggering `Completed`. The diagram misleads developers and users about how payouts work.
+**Problem:** Pinning individual tool versions does not describe which Stellar protocol, Soroban SDK, and wallet combinations are supported together.
 
-**Expected behaviour:** Update the README state machine diagram to accurately reflect the current flow including `PendingResult`, `override_result()`, and `finalize_result()`.
+**Acceptance criteria:** Publish a tested compatibility matrix and add a scheduled compatibility build before planned protocol or SDK upgrades.
 
----
+### Issue #125 — Define measurable production readiness gates for wagering launch
+**Area:** `docs/deployment.md`, `docs/runbook.md`  
+**Priority:** High  
+**Type:** Release Governance
 
-### Issue #106 — `docs/oracle.md` does not document the off-chain oracle service polling interval or job scheduling
+**Problem:** A checklist of individual tasks does not define objective launch thresholds for settlement reliability, incident recovery, capacity, or user support.
 
-**Area:** `docs/oracle.md`
-**Priority:** Low
-**Type:** Documentation
+**Acceptance criteria:** Specify measurable go/no-go thresholds, evidence owners, and rollback authority; require the release review to record results for each gate.
 
-**Description:**
-`docs/oracle.md` describes the oracle architecture at a high level but does not explain how frequently the oracle polls for game results, what happens when a game takes longer than expected, or how the polling interval relates to the 7-day timeout.
-
-**Expected behaviour:** Document the polling interval (configurable, default suggested), the retry policy, and the relationship between polling frequency and the `TIMEOUT_LEDGERS` constant.
-
----
-
-### Issue #107 — `docs/deployment.md` does not include a step for verifying the deployed WASM hash against the source
-
-**Area:** `docs/deployment.md`
-**Priority:** Medium
-**Type:** Documentation / Security
-
-**Description:**
-`docs/deployment.md` describes deployment steps but does not include a verification step where the deployer confirms the on-chain WASM hash matches the locally compiled artifact. This is a critical step for a financial contract.
-
-**Expected behaviour:** Add a "Verify deployment" section with instructions to compare `stellar contract inspect --wasm-hash <hash>` output against the locally computed SHA-256 of the WASM artifact.
-
----
-
-### Issue #108 — No `SECURITY.md` policy for responsible disclosure of vulnerabilities
-
-**Area:** `SECURITY.md` / Repository
-**Priority:** High
-**Type:** Security / Documentation
-
-**Description:**
-There is a `SECURITY.md` file but it needs to include: a clear responsible disclosure contact (email or GitHub Security Advisory), a timeline commitment for response and patch, and guidance on what constitutes an in-scope vulnerability (smart contract bugs, oracle manipulation, frontend XSS).
-
-**Expected behaviour:** Review and update `SECURITY.md` to follow the standard responsible disclosure template with a contact address, response SLA, and scope definition.
-
----
-
-### Issue #109 — `docs/architecture.md` does not document the contract registry contract
-
-**Area:** `docs/architecture.md`
-**Priority:** Low
-**Type:** Documentation
-
-**Description:**
-`docs/architecture.md` covers the escrow and oracle contracts but does not mention the `contract-registry` contract. Its purpose, deployment relationship to the other contracts, and API are undocumented.
-
-**Expected behaviour:** Add a section to `docs/architecture.md` explaining the contract registry's role, its `register` / `get` / `list` API, and how it is used by the deployment scripts and frontend.
-
----
-
-### Issue #110 — `CONTRIBUTING.md` does not specify the required Rust toolchain version for local development
-
-**Area:** `CONTRIBUTING.md`
-**Priority:** Low
-**Type:** Documentation / Developer Experience
-
-**Description:**
-`CONTRIBUTING.md` mentions running `cargo test` but does not tell contributors which Rust version to install. `rust-toolchain.toml` pins to `1.88.0` with `wasm32-unknown-unknown`, but new contributors who have not read the toolchain file may compile with the wrong version and get confusing errors.
-
-**Expected behaviour:** Add an explicit "Prerequisites" section to `CONTRIBUTING.md` stating the required Rust version, the `wasm32-unknown-unknown` target, and how to install both using `rustup`.
-
----
-
-### Issue #111 — `docs/runbook.md` does not document the procedure for handling a compromised oracle key
-
-**Area:** `docs/runbook.md`
-**Priority:** High
-**Type:** Documentation / Incident Response
-
-**Description:**
-The runbook covers general operational procedures but does not include a step-by-step response plan for a compromised oracle signing key. Given that the oracle is a single point of trust (see Issue #99), the incident response for key compromise is the most critical procedure to document.
-
-**Expected behaviour:** Add an "Oracle key compromise" runbook entry: (1) pause the escrow contract immediately, (2) call `update_oracle` with a new safe address, (3) audit all `submit_result` events since the compromise date, (4) for any fraudulent results, call `override_result` during the dispute window, (5) unpause.
-
----
-
-### Issue #112 — No `CHANGELOG.md` entries for changes made after the initial commits
-
-**Area:** `CHANGELOG.md`
-**Priority:** Low
-**Type:** Documentation
-
-**Description:**
-`CHANGELOG.md` exists but may not reflect recent changes (e.g. the addition of `PendingResult` state, `claim_timeout`, `override_result`, `emergency_drain`, stake limits). Outdated changelogs mislead integrators about when breaking changes were introduced.
-
-**Expected behaviour:** Update `CHANGELOG.md` with an `[Unreleased]` section documenting all changes since the last tagged release, following [Keep a Changelog](https://keepachangelog.com) format.
-
----
-
-### Issue #113 — No inline code comments explaining why `NotFunded` check exists in `submit_result`
-
-**Area:** `contracts/escrow/src/lib.rs` — `submit_result`
-**Priority:** Low
-**Type:** Code Documentation
-
-**Description:**
-The `NotFunded` guard in `submit_result` is unreachable by design (a match can only be `Active` if both players deposited), but this is not explained in a comment. Future readers may remove it thinking it's dead code, or conversely waste time investigating whether it's reachable.
-
-**Expected behaviour:** Add a comment: `// Invariant: Active state implies both players have deposited. This check is a defensive guard.`
-
----
-
-### Issue #114 — `docs/api-reference.md` does not document the `list_matches` and `list_results` pagination parameters
-
-**Area:** `docs/api-reference.md`
-**Priority:** Low
-**Type:** Documentation
-
-**Description:**
-`list_matches` and `list_results` accept `start` and `limit` parameters for pagination, but the API reference does not document the cap (100), the behaviour when `start > match_count`, or how to detect the last page.
-
-**Expected behaviour:** Add pagination documentation for both functions including: the cap value, the meaning of an empty return value, and a code example showing iterative pagination.
-
----
-
-### Issue #115 — No architecture decision record (ADR) documenting the choice of `PendingResult` dispute window
-
-**Area:** `docs/`
-**Priority:** Low
-**Type:** Documentation
-
-**Description:**
-The 24-hour dispute window (`DISPUTE_WINDOW_LEDGERS = 17_280`) is a critical design decision that affects user experience and security. There is no document explaining why 24 hours was chosen, what alternatives were considered, and what the trade-offs are.
-
-**Expected behaviour:** Create `docs/adr/001-dispute-window.md` explaining the decision, alternatives considered, and the rationale for 24 hours vs shorter/longer windows.
-
----
-
-## Testing
-
-### Issue #116 — No fuzz testing for `create_match` input validation
-
-**Area:** `contracts/escrow/src/`
-**Priority:** Medium
-**Type:** Testing / Security
-
-**Description:**
-`create_match` validates several inputs (`stake_amount`, `game_id` length, player addresses). These validations are only tested with hand-picked values. Fuzz testing with random inputs would reveal edge cases in the validation logic that unit tests miss.
-
-**Expected behaviour:** Add a `#[cfg(fuzzing)]` fuzz target using `cargo-fuzz` or `afl` that generates random `stake_amount`, `game_id`, and address inputs and asserts the contract either succeeds or returns a known-valid error code (not a panic).
-
----
-
-### Issue #117 — Test coverage for `contract-registry` is minimal — only 4 tests
-
-**Area:** `contracts/contract-registry/src/test.rs`
-**Priority:** Medium
-**Type:** Testing Gap
-
-**Description:**
-The contract registry has only 4 tests covering basic auth and error cases. There are no tests for: registering the maximum number of entries, querying a non-existent contract by name, listing all registered contracts, or pausing the registry.
-
-**Expected behaviour:** Expand `test.rs` to cover all public functions with both happy-path and error-path cases, targeting at least 80% branch coverage.
-
----
-
-### Issue #118 — No property-based tests for the escrow state machine transitions
-
-**Area:** `contracts/escrow/src/tests.rs`
-**Priority:** Medium
-**Type:** Testing
-
-**Description:**
-The state machine has strict transition rules. Unit tests cover specific paths but not exhaustive combinations. A property-based test that generates random sequences of contract calls and asserts that invalid transitions always return `Error::InvalidState` (and valid ones succeed) would provide stronger correctness guarantees.
-
-**Expected behaviour:** Use `proptest` or a similar library to generate random call sequences and verify the state machine invariants hold in all cases.
-
----
-
-### Issue #119 — E2E tests in `tests_e2e.rs` do not test the `override_result` → `finalize_result` path
-
-**Area:** `contracts/escrow/src/tests_e2e.rs`
-**Priority:** Medium
-**Type:** Testing Gap
-
-**Description:**
-`tests_e2e.rs` covers the main flow including `submit_result` and `finalize_result`. There are no end-to-end tests that exercise `override_result` changing the winner, followed by `finalize_result`, verifying the overridden winner receives the payout.
-
-**Expected behaviour:** Add an E2E test: submit Player1 wins → admin overrides to Player2 wins → wait for dispute window → finalize → assert Player2 received funds.
-
----
-
-### Issue #120 — No test for concurrent deposits from both players in the same transaction (impossible but worth documenting)
-
-**Area:** `contracts/escrow/src/tests.rs`
-**Priority:** Low
-**Type:** Testing / Documentation
-
-**Description:**
-Soroban processes transactions atomically and sequentially, so true concurrent deposits are impossible. However, the scenario where both players submit deposits in quick succession and one succeeds while the other is replayed should be tested to confirm idempotency — the second deposit for the same player should return `AlreadyFunded`.
-
-**Expected behaviour:** Add a test verifying that calling `deposit` twice for the same player on the same match in sequence returns `Err(Error::AlreadyFunded)` on the second call.
-
----
-
-### Issue #121 — Frontend test for `MatchStatus.test.tsx` does not cover the `Cancelled` terminal state UI
-
-**Area:** `apps/frontend/tests/MatchStatus.test.tsx`
-**Priority:** Low
-**Type:** Testing Gap
-
-**Description:**
-`MatchStatus.test.tsx` covers `Pending`, `Active`, `PendingResult`, and `Completed` states but there is no test for the `Cancelled` state UI, including the cancellation reason (cancelled by player vs timed out) and the refund display.
-
-**Expected behaviour:** Add tests for `MatchStatus` rendering with `state: 'Cancelled'` covering both cancellation paths.
-
----
-
-### Issue #122 — No snapshot tests for key UI components
-
-**Area:** `apps/frontend/tests/`
-**Priority:** Low
-**Type:** Testing
-
-**Description:**
-There are no snapshot tests for components like `MatchStatus`, `CreateMatch`, or `ClaimBurn`. Snapshot tests catch unintended UI regressions when refactoring styles or JSX structure that behavioural tests would not catch.
-
-**Expected behaviour:** Add Vitest snapshot tests for the primary rendered states of each major component using `expect(container).toMatchSnapshot()`.
-
----
-
-### Issue #123 — `scripts/test.sh` does not run frontend and backend tests — only Rust tests
-
-**Area:** `scripts/test.sh`
-**Priority:** Medium
-**Type:** Developer Experience
-
-**Description:**
-`scripts/test.sh` runs only `cargo test`. Developers running the test script locally get no indication of whether frontend or backend tests pass, giving a false sense of completeness before pushing.
-
-**Expected behaviour:** Update `scripts/test.sh` to also run `npm test` in both `apps/frontend` and `apps/backend`, and exit with a non-zero code if any suite fails.
-
----
-
-### Issue #124 — No test for `list_matches` returning an empty slice when `start >= match_count`
-
-**Area:** `contracts/escrow/src/tests.rs`
-**Priority:** Low
-**Type:** Testing Gap
-
-**Description:**
-`list_matches` should return an empty slice when `start` is at or beyond the total match count. There is no test confirming this boundary condition, which is the standard "end of pagination" signal for callers.
-
-**Expected behaviour:** Add a test: call `list_matches(0, 5)` on a contract with 3 matches, verify 3 IDs returned; call `list_matches(3, 5)`, verify empty slice returned.
-
----
-
-### Issue #125 — CI does not enforce a minimum test coverage threshold on the frontend
-
-**Area:** `.github/workflows/ci.yml` — `frontend` job
-**Priority:** Medium
-**Type:** CI / Testing
-
-**Description:**
-The CI `coverage` job enforces 80% test coverage for Rust code via `cargo-tarpaulin --fail-under 80`. There is no equivalent coverage threshold for the frontend TypeScript code. The frontend job runs `vitest run` but does not generate a coverage report or enforce a minimum threshold, allowing coverage to silently regress.
-
-**Expected behaviour:** Add `--coverage` to the frontend `vitest run` command and configure `coverageThreshold` in `vite.config.ts` (e.g. 70% lines) to fail CI when frontend coverage drops below the threshold.

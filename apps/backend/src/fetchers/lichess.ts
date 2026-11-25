@@ -8,9 +8,9 @@ import { RateLimitError } from '../errors/RateLimitError.js';
 import {
   ProviderFetchError,
   ProviderSchemaError,
+  checkHttpStatus,
   providerGet,
 } from './provider-validation.js';
-import { logProviderRequest } from '../logging/provider-request-logger.js';
 
 /** Maps to the on-chain MatchResult enum. */
 export type MatchResult = 'Player1Wins' | 'Player2Wins' | 'Draw';
@@ -44,12 +44,6 @@ const TERMINAL_STATUSES = new Set([
 
 /** Used when a 429 response has no Retry-After header at all. */
 const DEFAULT_RETRY_AFTER_MS = 5_000;
-
-/** Base delay for exponential backoff on timeouts / transient failures. */
-const BASE_BACKOFF_MS = 500;
-
-/** Cap for exponential backoff so a single fetch never stalls too long. */
-const MAX_BACKOFF_MS = 8_000;
 
 /**
  * Maximum number of 429 retries within a single `fetchLichessResult` call
@@ -88,87 +82,6 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Computes an exponential backoff delay with full jitter for the given
- * zero-based attempt number, capped at MAX_BACKOFF_MS.
- */
-function backoffMs(attempt: number): number {
-  const ceiling = Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** attempt);
-  return Math.floor(Math.random() * ceiling);
-}
-
-/** Returns true when the error looks like a network timeout. */
-function isTimeoutError(err: unknown): boolean {
-  if (!err || typeof err !== 'object') return false;
-  const e = err as { code?: string; name?: string; message?: string };
-  return (
-    e.code === 'ECONNABORTED' ||
-    e.code === 'ETIMEDOUT' ||
-    e.name === 'TimeoutError' ||
-    (typeof e.message === 'string' && /timeout/i.test(e.message))
-  );
-}
-
-/** Returns true when the error looks like a transient network failure. */
-function isNetworkError(err: unknown): boolean {
-  if (!err || typeof err !== 'object') return false;
-  const e = err as { code?: string; name?: string };
-  return (
-    e.code === 'ECONNRESET' ||
-    e.code === 'ENOTFOUND' ||
-    e.code === 'EAI_AGAIN' ||
-    e.code === 'ECONNREFUSED' ||
-    e.name === 'NetworkError'
-  );
-}
-
-interface LichessGamePayload {
-  id: string;
-  lastMoveAt?: number;
-  status: string;
-  winner?: 'white' | 'black';
-  players: {
-    white: { user?: { name: string } };
-    black: { user?: { name: string } };
-  };
-}
-
-/**
- * Validates the raw Lichess payload against the expected schema. Throws
- * ProviderSchemaError when required fields are missing or of the wrong type,
- * so API drift surfaces as a distinct, actionable error rather than a
- * downstream crash.
- */
-function validateLichessPayload(
-  data: unknown,
-  gameId: string,
-): LichessGamePayload {
-  const fail = (reason: string): never => {
-    throw new ProviderSchemaError('lichess', reason, { gameId });
-  };
-
-  if (!data || typeof data !== 'object') {
-    return fail('response body is not an object');
-  }
-  const d = data as Record<string, unknown>;
-  if (typeof d.id !== 'string') fail('missing or invalid "id"');
-  if (typeof d.status !== 'string') fail('missing or invalid "status"');
-  if (!d.players || typeof d.players !== 'object') {
-    fail('missing or invalid "players"');
-  }
-  const players = d.players as Record<string, unknown>;
-  if (!players.white || typeof players.white !== 'object') {
-    fail('missing or invalid "players.white"');
-  }
-  if (!players.black || typeof players.black !== 'object') {
-    fail('missing or invalid "players.black"');
-  }
-  if (d.winner !== undefined && d.winner !== 'white' && d.winner !== 'black') {
-    fail('invalid "winner"');
-  }
-  return data as LichessGamePayload;
-}
-
-/**
  * Fetches a Lichess game result and returns a normalised GameResult.
  *
  * - Throws GameNotFoundError on HTTP 404.
@@ -183,79 +96,24 @@ function validateLichessPayload(
 export async function fetchLichessResult(gameId: string): Promise<NormalizedGameResult> {
   const token = process.env.LICHESS_API_TOKEN;
   const url = `https://lichess.org/game/export/${encodeURIComponent(gameId)}`;
-  const traceId = `lichess:${gameId}`;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const requestOptions = {
+    const response = await providerGet(url, {
       headers: {
         Accept: 'application/json',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
       timeout: 10_000,
-      validateStatus: (s: number) => s < 500,
-    };
-
-    const startedAt = Date.now();
-    let response: Awaited<ReturnType<typeof providerGet>>;
-    try {
-      response = await providerGet(url, requestOptions);
-    } catch (err) {
-      logProviderRequest({
-        provider: 'lichess',
-        method: 'GET',
-        url,
-        requestHeaders: requestOptions.headers,
-        requestParams: { gameId, attempt },
-        durationMs: Date.now() - startedAt,
-        error: err,
-      });
-      throw err;
-    }
-
-    logProviderRequest({
-      provider: 'lichess',
-      method: 'GET',
-      url,
-      requestHeaders: requestOptions.headers,
-      requestParams: { gameId, attempt },
-      status: response.status,
-      responseHeaders: response.headers,
-      responseBody: response.data,
-      durationMs: Date.now() - startedAt,
+      validateStatus: (s) => s < 500,
     });
 
     if (response.status === 429) {
-      const retryAfterMs = parseRetryAfterMs(response.headers?.['retry-after']);
       if (attempt === MAX_RETRIES) {
-        logger.error(
-          {
-            provider: 'lichess',
-            url,
-            gameId,
-            attempt,
-            traceId,
-            status: response.status,
-            retryAfterMs,
-          },
-          'Lichess API rate limit exceeded after retries',
-        );
         throw new RateLimitError(
           `Lichess API rate limit exceeded (429) after ${MAX_RETRIES} retries`,
-          retryAfterMs,
         );
       }
-      logger.warn(
-        {
-          provider: 'lichess',
-          url,
-          gameId,
-          attempt,
-          traceId,
-          status: response.status,
-          retryAfterMs,
-        },
-        'Lichess API rate limited; backing off',
-      );
+      const retryAfterMs = parseRetryAfterMs(response.headers?.['retry-after']);
       await sleep(retryAfterMs);
       continue;
     }
@@ -264,43 +122,44 @@ export async function fetchLichessResult(gameId: string): Promise<NormalizedGame
       throw new GameNotFoundError(gameId);
     }
 
-    if (response.status !== 200) {
-      if (response.status >= 500) {
-        logger.error(
-          {
-            provider: 'lichess',
-            url,
-            gameId,
-            attempt,
-            traceId,
-            status: response.status,
-          },
-          'Lichess API server error',
-        );
-        throw new ProviderFetchError(
-          'unavailable',
-          `Lichess API error: ${response.status}`,
-        );
-      }
-      logger.error(
-        {
-          provider: 'lichess',
-          url,
-          gameId,
-          attempt,
-          traceId,
-          status: response.status,
-        },
-        'Lichess API unexpected status',
-      );
-      throw new Error(`Lichess API error: ${response.status}`);
-    }
+    // Shared status handling so Lichess and Chess.com fail identically.
+    checkHttpStatus(response.status, 'Lichess');
 
-    const data = validateLichessPayload(response.data, gameId);
+    const data = response.data as {
+      id: string;
+      lastMoveAt?: number;
+      status: string;
+      winner?: 'white' | 'black';
+      players: {
+        white: { user?: { name: string } };
+        black: { user?: { name: string } };
+      };
+    };
 
     const evidence = evidenceFor('lichess', url, data);
-    if (!data || data.id !== gameId)
+    if (!data || typeof data !== 'object')
+      throw new ProviderSchemaError('Lichess payload is not an object', evidence);
+    if (typeof data.id !== 'string' || data.id !== gameId)
       throw new AmbiguousEvidenceError('Mismatched game identity', evidence);
+    if (typeof data.status !== 'string')
+      throw new ProviderSchemaError('Lichess payload missing status', evidence);
+    if (
+      data.winner !== undefined &&
+      data.winner !== 'white' &&
+      data.winner !== 'black'
+    )
+      throw new ProviderSchemaError(
+        `Unrecognized Lichess winner code: ${String(data.winner)}`,
+        evidence,
+      );
+    if (
+      data.lastMoveAt !== undefined &&
+      typeof data.lastMoveAt !== 'number'
+    )
+      throw new ProviderSchemaError(
+        'Lichess payload has non-numeric lastMoveAt',
+        evidence,
+      );
     const isTerminal = TERMINAL_STATUSES.has(data.status);
     const active = data.status === 'started' || data.status === 'created';
     let result: MatchResult | null = null;
@@ -332,6 +191,16 @@ export async function fetchLichessResult(gameId: string): Promise<NormalizedGame
         evidence,
       );
     }
+    if (
+      !data.players ||
+      typeof data.players !== 'object' ||
+      !data.players.white ||
+      !data.players.black
+    )
+      throw new ProviderSchemaError(
+        'Lichess payload missing player information',
+        evidence,
+      );
     return normalizeResult(
       data.id,
       data.players?.white?.user?.name,
@@ -344,8 +213,8 @@ export async function fetchLichessResult(gameId: string): Promise<NormalizedGame
   }
 
   // Unreachable: the loop above always returns or throws.
-  throw new RateLimitError(
-    'Lichess API rate limit exceeded (429)',
-    DEFAULT_RETRY_AFTER_MS,
-  );
+  throw new RateLimitError('Lichess API rate limit exceeded (429)');
 }
+
+/** Re-exported so callers can catch provider errors uniformly. */
+export { ProviderFetchError, ProviderSchemaError };

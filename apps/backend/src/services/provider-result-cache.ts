@@ -3,6 +3,7 @@ import { ProviderFetchError } from "../fetchers/provider-validation.js";
 import logger from "../logger.js";
 
 const DEFAULT_STALE_TOLERANCE_MS = 5 * 60_000;
+const DEFAULT_TTL_MS = 60 * 60_000;
 const DEFAULT_MAX_ENTRIES = 1_000;
 const BACKGROUND_RETRY_DELAY_MS = 5_000;
 
@@ -17,27 +18,47 @@ interface CacheEntry<T> {
 
 interface ProviderResultCacheOptions {
   staleToleranceMs?: number;
+  ttlMs?: number;
   maxEntries?: number;
   backgroundRetryDelayMs?: number;
   now?: () => number;
   scheduleBackground?: (task: () => Promise<void>) => void;
 }
 
+export interface ProviderResultCacheStats {
+  hits: number;
+  misses: number;
+  staleHits: number;
+  size: number;
+}
+
 export function providerCacheConfigFromEnv(
   env: NodeJS.ProcessEnv = process.env,
-): Pick<ProviderResultCacheOptions, "staleToleranceMs"> {
-  const raw = env.PROVIDER_CACHE_STALE_TOLERANCE_MS;
-  if (raw === undefined || raw.trim() === "") {
-    return { staleToleranceMs: DEFAULT_STALE_TOLERANCE_MS };
+): Pick<ProviderResultCacheOptions, "staleToleranceMs" | "ttlMs"> {
+  const rawStale = env.PROVIDER_CACHE_STALE_TOLERANCE_MS;
+  let staleToleranceMs = DEFAULT_STALE_TOLERANCE_MS;
+  if (rawStale !== undefined && rawStale.trim() !== "") {
+    staleToleranceMs = Number(rawStale);
+    if (!Number.isSafeInteger(staleToleranceMs) || staleToleranceMs < 0) {
+      throw new Error(
+        "PROVIDER_CACHE_STALE_TOLERANCE_MS must be a non-negative integer",
+      );
+    }
   }
 
-  const staleToleranceMs = Number(raw);
-  if (!Number.isSafeInteger(staleToleranceMs) || staleToleranceMs < 0) {
-    throw new Error(
-      "PROVIDER_CACHE_STALE_TOLERANCE_MS must be a non-negative integer",
-    );
+  const rawTtl = env.PROVIDER_RESULT_CACHE_TTL_SECONDS;
+  let ttlMs = DEFAULT_TTL_MS;
+  if (rawTtl !== undefined && rawTtl.trim() !== "") {
+    const ttlSeconds = Number(rawTtl);
+    if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds < 0) {
+      throw new Error(
+        "PROVIDER_RESULT_CACHE_TTL_SECONDS must be a non-negative integer",
+      );
+    }
+    ttlMs = ttlSeconds * 1_000;
   }
-  return { staleToleranceMs };
+
+  return { staleToleranceMs, ttlMs };
 }
 
 function isProviderUnavailable(error: unknown): boolean {
@@ -52,15 +73,20 @@ export class ProviderResultCache<T> {
   private readonly refreshes = new Set<string>();
   private readonly retryAfter = new Map<string, number>();
   private readonly staleToleranceMs: number;
+  private readonly ttlMs: number;
   private readonly maxEntries: number;
   private readonly backgroundRetryDelayMs: number;
   private readonly now: () => number;
   private readonly scheduleBackground: (task: () => Promise<void>) => void;
+  private hits = 0;
+  private misses = 0;
+  private staleHits = 0;
   private generation = 0;
 
   constructor(options: ProviderResultCacheOptions = {}) {
     this.staleToleranceMs =
       options.staleToleranceMs ?? DEFAULT_STALE_TOLERANCE_MS;
+    this.ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
     this.maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES;
     this.backgroundRetryDelayMs =
       options.backgroundRetryDelayMs ?? BACKGROUND_RETRY_DELAY_MS;
@@ -76,6 +102,9 @@ export class ProviderResultCache<T> {
       this.staleToleranceMs < 0
     ) {
       throw new Error("Stale tolerance must be a non-negative integer");
+    }
+    if (!Number.isSafeInteger(this.ttlMs) || this.ttlMs < 0) {
+      throw new Error("TTL must be a non-negative integer");
     }
     if (!Number.isSafeInteger(this.maxEntries) || this.maxEntries < 1) {
       throw new Error(
@@ -98,12 +127,21 @@ export class ProviderResultCache<T> {
     const cached = this.read(key);
     const ageMs = cached ? this.age(cached) : 0;
 
+    // Fresh entries within TTL are served directly.
+    if (cached && this.ttlMs > 0 && ageMs <= this.ttlMs) {
+      this.hits += 1;
+      return { value: cached.value, stale: false };
+    }
+
+    // Stale entries within tolerance are revalidated against the provider
+    // before being returned; if the provider is unavailable, serve stale.
     if (
       cached &&
       this.staleToleranceMs > 0 &&
       ageMs <= this.staleToleranceMs &&
       (this.refreshes.has(key) || this.now() < (this.retryAfter.get(key) ?? 0))
     ) {
+      this.staleHits += 1;
       return { value: cached.value, stale: true, cacheAgeMs: ageMs };
     }
 
@@ -111,6 +149,11 @@ export class ProviderResultCache<T> {
       const value = await load();
       this.write(key, value);
       this.retryAfter.delete(key);
+      if (cached) {
+        this.staleHits += 1;
+      } else {
+        this.misses += 1;
+      }
       return { value, stale: false };
     } catch (error) {
       const currentAgeMs = cached ? this.age(cached) : 0;
@@ -120,9 +163,11 @@ export class ProviderResultCache<T> {
         currentAgeMs > this.staleToleranceMs ||
         !isProviderUnavailable(error)
       ) {
+        if (!cached) this.misses += 1;
         throw error;
       }
 
+      this.staleHits += 1;
       this.scheduleRefresh(key, provider, load);
       return {
         value: cached.value,
@@ -132,11 +177,23 @@ export class ProviderResultCache<T> {
     }
   }
 
+  getStats(): ProviderResultCacheStats {
+    return {
+      hits: this.hits,
+      misses: this.misses,
+      staleHits: this.staleHits,
+      size: this.entries.size,
+    };
+  }
+
   clear(): void {
     this.generation += 1;
     this.entries.clear();
     this.refreshes.clear();
     this.retryAfter.clear();
+    this.hits = 0;
+    this.misses = 0;
+    this.staleHits = 0;
   }
 
   private read(key: string): CacheEntry<T> | undefined {

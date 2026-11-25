@@ -44,32 +44,32 @@ const DEFAULT_ARCHIVE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 /** Default maximum number of pooled SQLite connections. */
 const DEFAULT_SQLITE_POOL_SIZE = 5;
 
-/**
- * Default allowlist of hosts oracle provider endpoints may point at (#2121).
- * Empty means no host is allowed until explicitly configured.
- */
-const DEFAULT_ORACLE_ENDPOINT_ALLOWLIST: readonly string[] = [];
-
-/** Default set of Stellar addresses permitted to update oracle config (#2121). */
-const DEFAULT_ORACLE_ADMIN_ADDRESSES: readonly string[] = [];
-
 /** Default idle timeout for pooled SQLite connections (30 seconds). */
 const DEFAULT_SQLITE_POOL_IDLE_TIMEOUT_MS = 30 * 1000;
 
+/** Default TTL (seconds) for cached provider results (#2109). */
+const DEFAULT_PROVIDER_RESULT_CACHE_TTL_SECONDS = 300;
+
+/** Default provider fallback chain, in query order (#2111). */
+const DEFAULT_PROVIDER_FALLBACK_CHAIN = 'lichess,chessdotcom';
+
+/** Default rolling window (ms) for provider health metrics (#2110). */
+const DEFAULT_PROVIDER_HEALTH_WINDOW_MS = 300_000;
+
+/** Default error-rate threshold that flags provider degradation (#2110). */
+const DEFAULT_PROVIDER_HEALTH_ERROR_RATE_THRESHOLD = 0.2;
+
+/** Default latency threshold (ms) that flags provider degradation (#2110). */
+const DEFAULT_PROVIDER_HEALTH_LATENCY_MS_THRESHOLD = 5000;
+
+/** Provider identifiers accepted in PROVIDER_FALLBACK_CHAIN (#2111). */
+const VALID_PROVIDERS = ['lichess', 'chessdotcom'] as const;
+
+/** A provider identifier accepted in the fallback chain. */
+export type ProviderName = (typeof VALID_PROVIDERS)[number];
+
 /** Default session lifetime (1 hour) before a session expires (#2129). */
 const DEFAULT_SESSION_TTL_MS = 60 * 60 * 1000;
-
-/**
- * Default grace period (seconds) during which old API credentials remain
- * valid after a rotation (#2112). Defaults to 24 hours.
- */
-const DEFAULT_CREDENTIAL_ROTATION_GRACE_SECONDS = 86_400;
-
-/**
- * Default dispute window (seconds) after result submission during which a
- * result may be disputed (#2115). Defaults to 1 hour.
- */
-const DEFAULT_DISPUTE_WINDOW_SECONDS = 3_600;
 
 /**
  * Reads an optional string environment variable, falling back to a default.
@@ -105,7 +105,23 @@ function parseString(name: string, defaultValue: string): string {
  * @throws {Error} when the value is non-numeric, zero, or negative.
  */
 function parsePositiveNumber(name: string, defaultValue: number): number {
-  return raw;
+  const raw = process.env[name];
+
+  if (raw === undefined || raw === '') {
+    return defaultValue;
+  }
+
+  const parsed = Number(raw);
+
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`${name} must be a positive number, got: "${raw}"`);
+  }
+
+  if (parsed <= 0) {
+    throw new Error(`${name} must be greater than zero, got: ${parsed}`);
+  }
+
+  return parsed;
 }
 
 /**
@@ -125,10 +141,6 @@ function parsePositiveInt(name: string, defaultValue: number): number {
     return defaultValue;
   }
 
-  const parsed = Number(raw);
-
-  if (!Number.isFinite(parsed)) {
-    throw new Error(`${name} must be a positive number, got: "${raw}"`);
   const parsed = parseInt(raw, 10);
 
   if (isNaN(parsed) || !Number.isInteger(parsed)) {
@@ -143,126 +155,50 @@ function parsePositiveInt(name: string, defaultValue: number): number {
 }
 
 /**
- * Parses a comma-separated list environment variable into a trimmed,
- * de-duplicated array of non-empty entries.
+ * Parses PROVIDER_FALLBACK_CHAIN into an ordered list of provider names.
  *
  * Rules:
- *  - If the variable is absent or empty, `defaultValue` is used.
- *  - Entries are trimmed; empty entries are dropped.
- *  - Duplicate entries (case-insensitive) are collapsed, keeping the first.
+ *  - If the variable is absent or empty, the default chain is used.
+ *  - Entries are comma-separated, trimmed and lower-cased.
+ *  - Every entry must be a known provider; duplicates are rejected.
+ *
+ * @throws {Error} when the chain is empty or contains an unknown/duplicate entry.
  */
-function parseStringList(
-  name: string,
-  defaultValue: readonly string[]
-): string[] {
-  const raw = process.env[name];
+function parseProviderFallbackChain(): ProviderName[] {
+  const raw = process.env.PROVIDER_FALLBACK_CHAIN;
 
-  if (raw === undefined || raw.trim() === '') {
-    return [...defaultValue];
+  const entries = (raw === undefined || raw === ''
+    ? DEFAULT_PROVIDER_FALLBACK_CHAIN
+    : raw
+  )
+    .split(',')
+    .map((entry) => entry.trim().toLowerCase())
+    .filter((entry) => entry !== '');
+
+  if (entries.length === 0) {
+    throw new Error('PROVIDER_FALLBACK_CHAIN must contain at least one provider');
   }
 
   const seen = new Set<string>();
-  const result: string[] = [];
 
-  for (const entry of raw.split(',')) {
-    const trimmed = entry.trim();
-
-    if (trimmed === '') {
-      continue;
-    }
-
-    const key = trimmed.toLowerCase();
-
-    if (seen.has(key)) {
-      continue;
-    }
-
-    seen.add(key);
-    result.push(trimmed);
-  }
-
-  return result;
-}
-
-/**
- * Parses ORACLE_ENDPOINT_ALLOWLIST into a list of normalised hostnames (#2121).
- *
- * Each entry may be a bare host ("api.lichess.org") or a full URL
- * ("https://api.lichess.org"); only the hostname is retained. Entries must be
- * valid hostnames — anything else fails startup.
- *
- * @throws {Error} when an entry is not a valid hostname.
- */
-function parseOracleEndpointAllowlist(): string[] {
-  const entries = parseStringList(
-    'ORACLE_ENDPOINT_ALLOWLIST',
-    DEFAULT_ORACLE_ENDPOINT_ALLOWLIST
-  );
-
-  return entries.map((entry) => {
-    let hostname = entry;
-
-    if (entry.includes('://')) {
-      try {
-        hostname = new URL(entry).hostname;
-      } catch {
-        throw new Error(
-          `ORACLE_ENDPOINT_ALLOWLIST contains an invalid URL: "${entry}"`
-        );
-      }
-    }
-
-    if (!isValidHostname(hostname)) {
+  for (const entry of entries) {
+    if (!(VALID_PROVIDERS as readonly string[]).includes(entry)) {
       throw new Error(
-        `ORACLE_ENDPOINT_ALLOWLIST contains an invalid hostname: "${entry}"`
+        `PROVIDER_FALLBACK_CHAIN contains unknown provider "${entry}"; ` +
+          `expected one of: ${VALID_PROVIDERS.join(', ')}`
       );
     }
 
-    return hostname.toLowerCase();
-  });
-}
-
-/**
- * Parses ORACLE_ADMIN_ADDRESSES into a list of Stellar addresses (#2121).
- *
- * Each entry must be a 56-character Stellar public key starting with "G".
- *
- * @throws {Error} when an entry is not a valid Stellar address.
- */
-function parseOracleAdminAddresses(): string[] {
-  const entries = parseStringList(
-    'ORACLE_ADMIN_ADDRESSES',
-    DEFAULT_ORACLE_ADMIN_ADDRESSES
-  );
-
-  for (const address of entries) {
-    if (!/^G[A-Z2-7]{55}$/.test(address)) {
+    if (seen.has(entry)) {
       throw new Error(
-        `ORACLE_ADMIN_ADDRESSES contains an invalid Stellar address: "${address}"`
+        `PROVIDER_FALLBACK_CHAIN contains duplicate provider "${entry}"`
       );
     }
+
+    seen.add(entry);
   }
 
-  return entries;
-}
-
-/**
- * Returns true when `hostname` is a syntactically valid DNS hostname or IPv4
- * literal. Rejects empty labels, illegal characters and over-long labels.
- */
-function isValidHostname(hostname: string): boolean {
-  if (hostname === '' || hostname.length > 253) {
-    return false;
-  }
-
-  const labels = hostname.split('.');
-
-  return labels.every(
-    (label) =>
-      label.length > 0 &&
-      label.length <= 63 &&
-      /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$/.test(label)
-  );
+  return entries as ProviderName[];
 }
 
 /**
@@ -511,24 +447,48 @@ export interface Env {
   sqlitePoolIdleTimeoutMs: number;
 
   /**
-   * Hostnames oracle provider endpoints are allowed to point at (#2121).
-   * Sourced from ORACLE_ENDPOINT_ALLOWLIST (comma-separated). Endpoint updates
-   * are rejected unless their host appears here.
+   * TTL in seconds for cached, verified provider results (#2109).
+   *
+   * Sourced from PROVIDER_RESULT_CACHE_TTL_SECONDS. Defaults to 300 when unset.
+   * Must be a positive integer.
    */
-  oracleEndpointAllowlist: string[];
+  providerResultCacheTtlSeconds: number;
 
   /**
-   * Key used to encrypt stored provider credentials at rest (#2121).
-   * Empty when unset; config updates must refuse to persist credentials
-   * without it.
+   * Ordered provider fallback chain used when the primary provider returns
+   * invalid data (#2111).
+   *
+   * Sourced from PROVIDER_FALLBACK_CHAIN. Defaults to
+   * "lichess,chessdotcom" when unset. Each entry must be a known provider.
    */
-  oracleConfigEncryptionKey: string;
+  providerFallbackChain: ProviderName[];
 
   /**
-   * Stellar addresses permitted to update oracle configuration (#2121).
-   * Sourced from ORACLE_ADMIN_ADDRESSES (comma-separated).
+   * Rolling window in milliseconds over which provider health metrics are
+   * aggregated (#2110).
+   *
+   * Sourced from PROVIDER_HEALTH_WINDOW_MS. Defaults to 300000 when unset.
+   * Must be a positive integer.
    */
-  oracleAdminAddresses: string[];
+  providerHealthWindowMs: number;
+
+  /**
+   * Error-rate threshold (0..1) above which a provider is considered degraded
+   * and an alert is triggered (#2110).
+   *
+   * Sourced from PROVIDER_HEALTH_ERROR_RATE_THRESHOLD. Defaults to 0.2.
+   * Must be a positive number.
+   */
+  providerHealthErrorRateThreshold: number;
+
+  /**
+   * Latency threshold in milliseconds above which a provider is considered
+   * degraded and an alert is triggered (#2110).
+   *
+   * Sourced from PROVIDER_HEALTH_LATENCY_MS_THRESHOLD. Defaults to 5000.
+   * Must be a positive integer.
+   */
+  providerHealthLatencyMsThreshold: number;
 
   /**
    * Whitelisted frontend origins allowed to make browser (CORS) requests
@@ -625,12 +585,23 @@ function loadEnv(): Env {
       'SQLITE_POOL_IDLE_TIMEOUT_MS',
       DEFAULT_SQLITE_POOL_IDLE_TIMEOUT_MS
     ),
-    oracleEndpointAllowlist: parseOracleEndpointAllowlist(),
-    oracleConfigEncryptionKey: parseString(
-      'ORACLE_CONFIG_ENCRYPTION_KEY',
-      ''
+    providerResultCacheTtlSeconds: parsePositiveInt(
+      'PROVIDER_RESULT_CACHE_TTL_SECONDS',
+      DEFAULT_PROVIDER_RESULT_CACHE_TTL_SECONDS
     ),
-    oracleAdminAddresses: parseOracleAdminAddresses(),
+    providerFallbackChain: parseProviderFallbackChain(),
+    providerHealthWindowMs: parsePositiveInt(
+      'PROVIDER_HEALTH_WINDOW_MS',
+      DEFAULT_PROVIDER_HEALTH_WINDOW_MS
+    ),
+    providerHealthErrorRateThreshold: parsePositiveNumber(
+      'PROVIDER_HEALTH_ERROR_RATE_THRESHOLD',
+      DEFAULT_PROVIDER_HEALTH_ERROR_RATE_THRESHOLD
+    ),
+    providerHealthLatencyMsThreshold: parsePositiveInt(
+      'PROVIDER_HEALTH_LATENCY_MS_THRESHOLD',
+      DEFAULT_PROVIDER_HEALTH_LATENCY_MS_THRESHOLD
+    ),
     corsAllowedOrigins: parseString(
       'CORS_ALLOWED_ORIGINS',
       parseString('ALLOWED_ORIGINS', '')

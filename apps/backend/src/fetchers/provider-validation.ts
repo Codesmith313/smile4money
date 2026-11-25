@@ -121,6 +121,71 @@ export function checkHttpStatus(provider: string, status: number): void {
   }
 }
 
+/**
+ * Comparable outcome from Player 1's perspective. `null` means the game has no
+ * decisive result (ongoing, aborted, or unknown) and cannot be compared.
+ */
+export type MatchResult = 'win' | 'loss' | 'draw' | null;
+
+export interface NormalizedGameResult {
+  /** Result from Player 1's perspective, as reported by the provider. */
+  result: MatchResult;
+  /** Provider-specific game identifier, used for cross-provider matching. */
+  gameId?: string;
+  /** Whether the game is finished and has a comparable outcome. */
+  finished?: boolean;
+}
+
+export interface Provider {
+  readonly name: string;
+  fetchResult(gameId: string): Promise<NormalizedGameResult>;
+  healthCheck(): Promise<boolean>;
+}
+
+/**
+ * Maps a provider result to a comparable MatchResult from Player 1's
+ * perspective. When the provider reports from Player 2's perspective, the
+ * outcome is flipped so results from different providers can be compared.
+ */
+export function normalizeOutcome(
+  result: NormalizedGameResult,
+  perspective: 'player1' | 'player2' = 'player1',
+): MatchResult {
+  if (perspective === 'player1') {
+    return result.result;
+  }
+  switch (result.result) {
+    case 'win':
+      return 'loss';
+    case 'loss':
+      return 'win';
+    case 'draw':
+      return 'draw';
+    default:
+      return null;
+  }
+}
+
+export type ProviderComparison = 'agree' | 'conflict' | 'incomplete';
+
+/**
+ * Compares results from two providers. Returns 'agree' when both report the
+ * same comparable outcome, 'conflict' when they disagree, and 'incomplete'
+ * when either result is missing or non-comparable (so the caller can retry or
+ * fall back rather than flag a false conflict).
+ */
+export function compareProviderResults(
+  primary: NormalizedGameResult | null | undefined,
+  alternate: NormalizedGameResult | null | undefined,
+): ProviderComparison {
+  const a = primary ? normalizeOutcome(primary) : null;
+  const b = alternate ? normalizeOutcome(alternate) : null;
+  if (a === null || b === null) {
+    return 'incomplete';
+  }
+  return a === b ? 'agree' : 'conflict';
+}
+
 export const CLOCK_SKEW_MS = 60_000;
 export const MAX_LIVE_DURATION_MS = 24 * 60 * 60 * 1_000;
 // Correspondence games can span years. This is a conservative evidence ceiling,

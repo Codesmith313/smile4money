@@ -19,6 +19,7 @@ router.get('/', async (req, res) => {
     includeSettlement: process.env.HEALTH_INCLUDE_SETTLEMENT === 'true',
     includeQueue: process.env.HEALTH_INCLUDE_QUEUE === 'true',
     includeDatabase: process.env.HEALTH_INCLUDE_DATABASE === 'true',
+    includeProviders: process.env.HEALTH_INCLUDE_PROVIDERS === 'true',
     uptimeSeconds,
     version,
   });

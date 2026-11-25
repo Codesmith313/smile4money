@@ -1,13 +1,72 @@
 import { Router } from "express";
 import { httpMetrics, type HttpMetrics } from "../services/http-metrics.js";
 import type { DlqEntry } from "../store/persistent-queue-store.js";
-import {
-  oracleMetrics,
-  type OracleMetricsSnapshot,
-  type OracleOperationMetrics,
-} from "../services/oracle-metrics.js";
 
 const RETRY_ATTEMPT_BUCKETS = [0, 1, 2, 3, 5, 10, 25, 50, 100];
+const RESPONSE_TIME_BUCKETS_MS = [50, 100, 250, 500, 1000, 2500, 5000, 10000];
+
+export interface ProviderHealthSnapshot {
+  provider: string;
+  uptimeRatio: number;
+  responseTimeCount: number;
+  responseTimeSumMs: number;
+  responseTimeBuckets: Record<string, number>;
+  errorsTotal: number;
+  cacheHitsTotal: number;
+  cacheMissesTotal: number;
+  cacheStaleTotal: number;
+}
+
+function escapeLabelValue(value: string): string {
+  return value
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n");
+}
+
+export function renderProviderMetrics(
+  snapshots: readonly ProviderHealthSnapshot[],
+): string {
+  const lines = [
+    "# HELP oracle_provider_uptime_ratio Fraction of successful health checks per provider.",
+    "# TYPE oracle_provider_uptime_ratio gauge",
+    "# HELP oracle_provider_response_time_ms Provider response time in milliseconds.",
+    "# TYPE oracle_provider_response_time_ms histogram",
+    "# HELP oracle_provider_errors_total Total provider errors observed.",
+    "# TYPE oracle_provider_errors_total counter",
+    "# HELP oracle_provider_cache_hits_total Total provider cache hits.",
+    "# TYPE oracle_provider_cache_hits_total counter",
+    "# HELP oracle_provider_cache_misses_total Total provider cache misses.",
+    "# TYPE oracle_provider_cache_misses_total counter",
+    "# HELP oracle_provider_cache_stale_total Total stale provider cache entries revalidated.",
+    "# TYPE oracle_provider_cache_stale_total counter",
+  ];
+
+  for (const snapshot of snapshots) {
+    const provider = escapeLabelValue(snapshot.provider);
+    lines.push(
+      `oracle_provider_uptime_ratio{provider="${provider}"} ${snapshot.uptimeRatio}`,
+    );
+
+    for (const bucket of RESPONSE_TIME_BUCKETS_MS) {
+      const count = snapshot.responseTimeBuckets[String(bucket)] ?? 0;
+      lines.push(
+        `oracle_provider_response_time_ms_bucket{provider="${provider}",le="${bucket}"} ${count}`,
+      );
+    }
+    lines.push(
+      `oracle_provider_response_time_ms_bucket{provider="${provider}",le="+Inf"} ${snapshot.responseTimeCount}`,
+      `oracle_provider_response_time_ms_sum{provider="${provider}"} ${snapshot.responseTimeSumMs}`,
+      `oracle_provider_response_time_ms_count{provider="${provider}"} ${snapshot.responseTimeCount}`,
+      `oracle_provider_errors_total{provider="${provider}"} ${snapshot.errorsTotal}`,
+      `oracle_provider_cache_hits_total{provider="${provider}"} ${snapshot.cacheHitsTotal}`,
+      `oracle_provider_cache_misses_total{provider="${provider}"} ${snapshot.cacheMissesTotal}`,
+      `oracle_provider_cache_stale_total{provider="${provider}"} ${snapshot.cacheStaleTotal}`,
+    );
+  }
+
+  return `${lines.join("\n")}\n`;
+}
 
 export interface DlqRetryHistogramBucket {
   le: number | "+Inf";
@@ -103,109 +162,32 @@ export function renderDlqMetrics(
   return `${lines.join("\n")}\n`;
 }
 
-export function renderOracleMetrics(snapshot: OracleMetricsSnapshot): string {
-  const lines: string[] = [];
-
-  lines.push(
-    "# HELP oracle_operation_submissions_total Total result submissions per operation type.",
-    "# TYPE oracle_operation_submissions_total counter",
-  );
-  for (const op of snapshot.operations) {
-    lines.push(
-      `oracle_operation_submissions_total{operation="${op.operation}"} ${op.submissions}`,
-    );
-  }
-
-  lines.push(
-    "# HELP oracle_operation_successes_total Total successful result submissions per operation type.",
-    "# TYPE oracle_operation_successes_total counter",
-  );
-  for (const op of snapshot.operations) {
-    lines.push(
-      `oracle_operation_successes_total{operation="${op.operation}"} ${op.successes}`,
-    );
-  }
-
-  lines.push(
-    "# HELP oracle_operation_failures_total Total failed result submissions per operation type.",
-    "# TYPE oracle_operation_failures_total counter",
-  );
-  for (const op of snapshot.operations) {
-    lines.push(
-      `oracle_operation_failures_total{operation="${op.operation}"} ${op.failures}`,
-    );
-  }
-
-  lines.push(
-    "# HELP oracle_operation_success_rate Ratio of successful submissions per operation type.",
-    "# TYPE oracle_operation_success_rate gauge",
-  );
-  for (const op of snapshot.operations) {
-    lines.push(
-      `oracle_operation_success_rate{operation="${op.operation}"} ${op.successRate}`,
-    );
-  }
-
-  lines.push(
-    "# HELP oracle_operation_submissions_per_hour Submissions per hour per operation type.",
-    "# TYPE oracle_operation_submissions_per_hour gauge",
-  );
-  for (const op of snapshot.operations) {
-    lines.push(
-      `oracle_operation_submissions_per_hour{operation="${op.operation}"} ${op.submissionsPerHour}`,
-    );
-  }
-
-  const quantiles: Array<[string, (op: OracleOperationMetrics) => number]> = [
-    ["p50", (op) => op.latency.p50],
-    ["p95", (op) => op.latency.p95],
-    ["p99", (op) => op.latency.p99],
-  ];
-  lines.push(
-    "# HELP oracle_operation_latency_ms Result submission latency in milliseconds per operation type.",
-    "# TYPE oracle_operation_latency_ms gauge",
-  );
-  for (const op of snapshot.operations) {
-    for (const [quantile, getValue] of quantiles) {
-      lines.push(
-        `oracle_operation_latency_ms{operation="${op.operation}",quantile="${quantile}"} ${getValue(op)}`,
-      );
-    }
-  }
-
-  lines.push(
-    "# HELP oracle_operation_latency_samples Number of latency samples recorded per operation type.",
-    "# TYPE oracle_operation_latency_samples gauge",
-  );
-  for (const op of snapshot.operations) {
-    lines.push(
-      `oracle_operation_latency_samples{operation="${op.operation}"} ${op.latency.samples}`,
-    );
-  }
-
-  return `${lines.join("\n")}\n`;
-}
-
 export function createMetricsRouter(
   loadEntries: () => Promise<DlqEntry[]> = async () => {
     const { listDlqEntries } = await import("../queue.js");
     return listDlqEntries();
   },
   metrics: HttpMetrics = httpMetrics,
-  loadOracleSnapshot: () => OracleMetricsSnapshot = () =>
-    oracleMetrics.snapshot(),
+  loadProviderHealth: () => Promise<ProviderHealthSnapshot[]> = async () => {
+    const { getProviderHealthSnapshots } = await import(
+      "../services/provider-health.js"
+    );
+    return getProviderHealthSnapshots();
+  },
 ) {
   const router = Router();
 
   router.get("/", async (_req, res, next) => {
     try {
-      const entries = await loadEntries();
-      const oracleSnapshot = loadOracleSnapshot();
+      const [entries, providerHealth] = await Promise.all([
+        loadEntries(),
+        loadProviderHealth(),
+      ]);
       res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
       return res
         .status(200)
         .send(
-          `${metrics.render()}${renderDlqMetrics(entries)}${renderOracleMetrics(oracleSnapshot)}`,
+          `${metrics.render()}${renderDlqMetrics(entries)}${renderProviderMetrics(providerHealth)}`,
         );
     } catch (error) {
       return next(error);
