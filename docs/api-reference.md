@@ -1675,9 +1675,13 @@ so a later retry cannot overwrite an earlier decision. Provider response
 bodies, PGNs, IP addresses, and unrelated account data are not retained. The
 backend deletes evidence older than 30 days at startup and every 24 hours; this matches the
 repository's 30-day match retention policy. The database file is owner-readable
-only on POSIX systems, and no HTTP route exposes evidence records. Operators
-must restrict host and backup access to the backend service account and apply
-the same 30-day deletion period to database backups.
+only on POSIX systems. Restrict host and backup access to the backend service
+account and apply the same 30-day deletion period to database backups.
+Operators can review a match's dispute evidence through
+`GET /api/oracle/evidence?game_id=<gameId>`. This route requires an authenticated
+address listed in `ORACLE_ADMIN_ADDRESSES`; it returns the allow-listed evidence
+bundle, including provider lookup and ledger references. The CLI remains
+available for offline exports.
 
 ## Wallet identity link proof
 

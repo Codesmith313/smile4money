@@ -95,6 +95,13 @@ export class EvidenceError extends Error {
   }
 }
 
+export class EvidenceNotFoundError extends EvidenceError {
+  constructor(gameId: string) {
+    super(`no match recorded for gameId ${gameId}`);
+    this.name = "EvidenceNotFoundError";
+  }
+}
+
 const SECRET_PATTERNS: Array<[string, RegExp]> = [
   ["Stellar secret seed", /\bS[A-Z2-7]{55}\b/],
   ["JWT", /eyJ[\w-]{10,}\.[\w-]{10,}\.[\w-]{10,}/],
@@ -189,7 +196,7 @@ export async function buildEvidenceBundle(
   matchId?: number,
 ): Promise<EvidenceBundle> {
   const match = await deps.findMatch(gameId);
-  if (!match) throw new EvidenceError(`no match recorded for gameId ${gameId}`);
+  if (!match) throw new EvidenceNotFoundError(gameId);
   if (matchId !== undefined && match.matchId !== matchId) {
     throw new EvidenceError(
       `gameId ${gameId} belongs to match ${match.matchId}, not ${matchId}`,

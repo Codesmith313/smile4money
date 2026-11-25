@@ -8,8 +8,8 @@ sources, and nothing more. This page defines that **evidence bundle** and how to
 
 ## What the bundle contains
 
-`npm run evidence` (in `apps/backend`) produces one JSON document per match
-(`bundleVersion: 1`, built by `apps/backend/src/services/dispute-evidence.ts`):
+`npm run evidence` (in `apps/backend`) and the operator-only evidence API produce one JSON
+document per match (`bundleVersion: 1`, built by `apps/backend/src/services/dispute-evidence.ts`):
 
 | Section | Fields | Why support needs it |
 |---|---|---|
@@ -41,24 +41,34 @@ appear, and a seed in a failure reason blocks the export.
 
 ## Retrieval procedure
 
-Only operators with shell access to the backend host (or a shell with its env and data volume) can
-produce a bundle. There is deliberately **no HTTP endpoint**: the API authenticates wallets, not
-staff, so an endpoint would let any player's token fetch another match's evidence.
+Evidence is available through the operator-only API and the CLI. The API requires a valid
+authenticated wallet token whose address is included in `ORACLE_ADMIN_ADDRESSES`; player tokens
+cannot retrieve another match's evidence.
 
-1. **Get the references from the ticket:** the `gameId` (from the game link) and, if the player
-   has it, the `matchId`. Never ask the player for a secret key or seed phrase. They are never
-   needed.
-2. **Export the bundle:**
+1. **Get the game ID from the ticket.** Never ask the player for a secret key or seed phrase.
+   They are never needed.
+2. **Fetch the bundle from the API** using an operator token:
+
+   ```http
+   GET /api/oracle/evidence?game_id=<gameId>
+   Authorization: Bearer <operator-token>
+   ```
+
+   The endpoint refreshes provider data and returns the evidence bundle. It returns `403` for
+   authenticated addresses not listed in `ORACLE_ADMIN_ADDRESSES`, `401` without valid
+   authentication, and `404` when no match is recorded for the game ID.
+
+   Or export from a shell with access to the backend environment and data volume:
 
    ```bash
    cd apps/backend
-   npm run --silent evidence -- --game-id <gameId> --match-id <matchId> > evidence-<matchId>.json
+   npm run --silent evidence -- --game-id <gameId> [--match-id <n>] > evidence-<gameId>.json
    ```
 
-   - Add `--offline` to skip the live provider lookup, for example while a provider is down.
-   - The command exits 1 with `evidence: …` on stderr when the game is unknown, when the two
-     references point at different matches, or when the bundle would contain a secret. **Do not**
-     work around a secret refusal: report it as a security incident ([runbook §3](runbook.md#3-oracle-key-compromise-response)).
+   Add `--offline` to skip the live provider lookup, for example while a provider is down. The
+   command exits 1 with `evidence: …` on stderr when the game is unknown, the optional match ID
+   does not match the game, or the bundle would contain a secret. **Do not** work around a secret
+   refusal: report it as a security incident ([runbook §3](runbook.md#3-oracle-key-compromise-response)).
 3. **Verify on-chain.** Open the `ledger.explorerUrls` and confirm what the escrow and oracle
    contracts actually recorded for `matchId`. The chain is the authority. The bundle is the index
    into it.
