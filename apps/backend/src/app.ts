@@ -5,6 +5,7 @@ import validateGameRouter from './routes/validate-game.js';
 import reviewRouter from './routes/oracle-review.js';
 import oracleRouter from './routes/oracle.js';
 import historyRouter from './routes/oracle-history.js';
+import evidenceRouter from './routes/oracle-evidence.js';
 import playerIdentityRouter from './routes/player-identity.js';
 import metricsRouter from './routes/metrics.js';
 import statusRouter from './routes/status.js';
@@ -45,13 +46,13 @@ app.use('/api-keys', apiKeysRouter);
 // routes are all served by matchRouter under /api/matches. The router must
 // register its specific paths (e.g. GET /statistics) before any parameterized
 // routes (e.g. GET /:id) so they are not shadowed; no extra wiring is needed here.
-// #2126 — per-user rate limiting applied after authentication on protected routers
-app.use('/api/matches', rateLimit(), matchRouter);
-app.use('/api/validate-game', rateLimit(), validateGameRouter);
-app.use('/api/oracle/reviews', rateLimit(), reviewRouter);
-app.use('/api/oracle/history', rateLimit(), historyRouter);
-app.use('/api/oracle', rateLimit(), oracleRouter);
-app.use('/api/player-identity', rateLimit(), playerIdentityRouter);
+app.use('/api/matches', matchRouter);
+app.use('/api/validate-game', validateGameRouter);
+app.use('/api/oracle/reviews', reviewRouter);
+app.use('/api/oracle/history', historyRouter);
+app.use('/api/oracle/evidence', evidenceRouter);
+app.use('/api/oracle', oracleRouter);
+app.use('/api/player-identity', playerIdentityRouter);
 app.use('/status', statusRouter);
 
 // #2129 — session termination: revokes the current session and returns 204
