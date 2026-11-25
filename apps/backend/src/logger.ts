@@ -34,6 +34,13 @@ const NUMERIC_FIELDS = new Set([
   'migration_version',
   'query_duration_ms',
   'slow_query_threshold_ms',
+  'latency_ms',
+  'p50_ms',
+  'p95_ms',
+  'p99_ms',
+  'success_rate',
+  'submissions_per_hour',
+  'sample_count',
 ]);
 const ENUM_FIELDS: Record<string, readonly string[]> = {
   method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
@@ -45,6 +52,9 @@ const ENUM_FIELDS: Record<string, readonly string[]> = {
   replay_result: ['success', 'failed'],
   stall_state: ['stalled', 'progressing'],
   integrity_status: ['ok', 'failed'],
+  operation: ['submit_result', 'has_result', 'fetch_result'],
+  config_field: ['endpoint', 'credential'],
+  alert: ['degraded', 'ok'],
   auth_failure_reason: [
     'missing_header',
     'invalid_payload',
@@ -107,6 +117,187 @@ function safeLogValue(key: string, value: unknown): unknown {
     return value;
   }
   return '[REDACTED]';
+}
+
+const REDACTED = '[REDACTED]';
+const MAX_LOGGED_BODY_LENGTH = 4_096;
+
+const SENSITIVE_KEY_PATTERN =
+  /(?:api[_-]?key|apikey|secret|token|password|passwd|pwd|signature|sig|authorization|auth|credential|private[_-]?key|access[_-]?key|refresh[_-]?token|session[_-]?id|cookie)/i;
+
+const EMAIL_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
+const BEARER_PATTERN = /\bBearer\s+\S+/gi;
+const LICHESS_TOKEN_PATTERN = /\blip_[A-Za-z0-9]{20,}\b/g;
+const CHESSCOM_API_KEY_PATTERN = /\b[GS][A-Z2-7]{55}\b/g;
+const WALLET_ADDRESS_PATTERN = /\b0x[a-fA-F0-9]{40}\b/g;
+const SOLANA_ADDRESS_PATTERN = /\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/g;
+const QUERY_SECRET_PATTERN =
+  /([?&](?:access_token|api[_-]?key|apikey|password|secret|token|signature|sig|auth)=)[^&\s)]+/gi;
+
+/**
+ * Redacts sensitive substrings (tokens, keys, emails, wallet addresses,
+ * authorization headers) from an arbitrary string.
+ */
+export function redactSensitiveString(value: string): string {
+  return value
+    .replace(BEARER_PATTERN, `Bearer ${REDACTED}`)
+    .replace(LICHESS_TOKEN_PATTERN, REDACTED)
+    .replace(CHESSCOM_API_KEY_PATTERN, REDACTED)
+    .replace(WALLET_ADDRESS_PATTERN, REDACTED)
+    .replace(SOLANA_ADDRESS_PATTERN, REDACTED)
+    .replace(EMAIL_PATTERN, REDACTED)
+    .replace(QUERY_SECRET_PATTERN, `$1${REDACTED}`);
+}
+
+/**
+ * Recursively sanitizes a provider payload (request params or response body)
+ * for logging: sensitive keys are masked, strings are scrubbed of tokens,
+ * emails and wallet addresses, and depth/size are bounded.
+ */
+export function sanitizeProviderPayload(
+  value: unknown,
+  depth = 0,
+): unknown {
+  if (value === null || value === undefined) return value;
+  if (depth > 6) return '[TRUNCATED]';
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  if (typeof value === 'bigint') return value.toString();
+  if (typeof value === 'string') {
+    const redacted = redactSensitiveString(value);
+    return redacted.length > MAX_LOGGED_BODY_LENGTH
+      ? `${redacted.slice(0, MAX_LOGGED_BODY_LENGTH)}[TRUNCATED]`
+      : redacted;
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 100).map((item) => sanitizeProviderPayload(item, depth + 1));
+  }
+  if (value instanceof Error) {
+    return { type: value.name, message: redactSensitiveString(value.message) };
+  }
+  if (typeof value === 'object') {
+    const result: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      result[key] = SENSITIVE_KEY_PATTERN.test(key)
+        ? REDACTED
+        : sanitizeProviderPayload(entry, depth + 1);
+    }
+    return result;
+  }
+  return REDACTED;
+}
+
+/** Sanitizes a URL for logging, redacting credentials and secret query params. */
+export function sanitizeProviderUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.username = '';
+    parsed.password = '';
+    for (const key of Array.from(parsed.searchParams.keys())) {
+      if (SENSITIVE_KEY_PATTERN.test(key)) {
+        parsed.searchParams.set(key, REDACTED);
+      }
+    }
+    return redactSensitiveString(parsed.toString());
+  } catch {
+    return redactSensitiveString(url);
+  }
+}
+
+export interface ProviderRequestLogInput {
+  provider: string;
+  method: string;
+  url: string;
+  params?: unknown;
+  headers?: unknown;
+  body?: unknown;
+}
+
+export interface ProviderResponseLogInput {
+  status: number;
+  body?: unknown;
+  headers?: unknown;
+  durationMs: number;
+  error?: unknown;
+}
+
+/**
+ * Logs an outbound provider API request with timestamp, method, sanitized URL,
+ * params and headers. Returns a function to log the matching response.
+ */
+export function logProviderRequest(
+  input: ProviderRequestLogInput,
+  logger: { info: (context: object, message: string) => void } = defaultLoggerRef,
+): (response: ProviderResponseLogInput) => void {
+  const startedAt = Date.now();
+  logger.info(
+    {
+      provider: input.provider,
+      method: input.method.toUpperCase(),
+      url: sanitizeProviderUrl(input.url),
+      request_params: sanitizeProviderPayload(input.params),
+      request_headers: sanitizeProviderPayload(input.headers),
+      request_body: sanitizeProviderPayload(input.body),
+      timestamp: new Date(startedAt).toISOString(),
+    },
+    'provider_request',
+  );
+
+  return (response: ProviderResponseLogInput) => {
+    const durationMs =
+      typeof response.durationMs === 'number'
+        ? response.durationMs
+        : Date.now() - startedAt;
+    logger.info(
+      {
+        provider: input.provider,
+        method: input.method.toUpperCase(),
+        url: sanitizeProviderUrl(input.url),
+        status: response.status,
+        duration_ms: durationMs,
+        response_body: sanitizeProviderPayload(response.body),
+        response_headers: sanitizeProviderPayload(response.headers),
+        ...(response.error === undefined
+          ? {}
+          : { error: sanitizeProviderPayload(response.error) }),
+        timestamp: new Date().toISOString(),
+      },
+      'provider_response',
+    );
+  };
+}
+
+/**
+ * Wraps a provider HTTP call, logging the request and its response (or error)
+ * with sanitized payloads. Re-throws any error after logging.
+ */
+export async function withProviderRequestLogging<T>(
+  input: ProviderRequestLogInput,
+  call: () => Promise<T>,
+  extractResponse: (result: T) => { status: number; body?: unknown; headers?: unknown } = (
+    result,
+  ) => ({ status: 200, body: result }),
+  logger: { info: (context: object, message: string) => void } = defaultLoggerRef,
+): Promise<T> {
+  const finish = logProviderRequest(input, logger);
+  const startedAt = Date.now();
+  try {
+    const result = await call();
+    const extracted = extractResponse(result);
+    finish({
+      status: extracted.status,
+      body: extracted.body,
+      headers: extracted.headers,
+      durationMs: Date.now() - startedAt,
+    });
+    return result;
+  } catch (error) {
+    finish({
+      status: 0,
+      error,
+      durationMs: Date.now() - startedAt,
+    });
+    throw error;
+  }
 }
 
 export function safeLogContext(
@@ -346,8 +537,6 @@ class Logger {
     } else {
       this.errorWithDeduplication(context, message || '');
     }
-    this.log('error', { ...ctx, severity }, msg);
-    this.maybeAlert(severity, ctx, msg);
   }
 
   critical(context: LogContext | string, message?: string): void {
@@ -359,4 +548,6 @@ class Logger {
   }
 }
 
-export default new Logger();
+const defaultLoggerRef = new Logger();
+
+export default defaultLoggerRef;

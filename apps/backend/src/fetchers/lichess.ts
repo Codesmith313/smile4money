@@ -10,7 +10,7 @@ import {
   ProviderSchemaError,
   providerGet,
 } from './provider-validation.js';
-import { logger } from '../logger.js';
+import { logProviderRequest } from '../logging/provider-request-logger.js';
 
 /** Maps to the on-chain MatchResult enum. */
 export type MatchResult = 'Player1Wins' | 'Player2Wins' | 'Draw';
@@ -186,56 +186,43 @@ export async function fetchLichessResult(gameId: string): Promise<NormalizedGame
   const traceId = `lichess:${gameId}`;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const requestOptions = {
+      headers: {
+        Accept: 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      timeout: 10_000,
+      validateStatus: (s: number) => s < 500,
+    };
+
+    const startedAt = Date.now();
     let response: Awaited<ReturnType<typeof providerGet>>;
     try {
-      response = await providerGet(url, {
-        headers: {
-          Accept: 'application/json',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        timeout: 10_000,
-        validateStatus: (s) => s < 500,
-      });
+      response = await providerGet(url, requestOptions);
     } catch (err) {
-      const timeout = isTimeoutError(err);
-      const network = isNetworkError(err);
-      if ((timeout || network) && attempt < MAX_RETRIES) {
-        const delay = backoffMs(attempt);
-        logger.warn(
-          {
-            provider: 'lichess',
-            url,
-            gameId,
-            attempt,
-            traceId,
-            timeout,
-            network,
-            delayMs: delay,
-            err,
-          },
-          'Lichess request failed; retrying with exponential backoff',
-        );
-        await sleep(delay);
-        continue;
-      }
-      logger.error(
-        {
-          provider: 'lichess',
-          url,
-          gameId,
-          attempt,
-          traceId,
-          timeout,
-          network,
-          err,
-        },
-        'Lichess request failed',
-      );
-      throw new ProviderFetchError(
-        'unavailable',
-        `Lichess request failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      logProviderRequest({
+        provider: 'lichess',
+        method: 'GET',
+        url,
+        requestHeaders: requestOptions.headers,
+        requestParams: { gameId, attempt },
+        durationMs: Date.now() - startedAt,
+        error: err,
+      });
+      throw err;
     }
+
+    logProviderRequest({
+      provider: 'lichess',
+      method: 'GET',
+      url,
+      requestHeaders: requestOptions.headers,
+      requestParams: { gameId, attempt },
+      status: response.status,
+      responseHeaders: response.headers,
+      responseBody: response.data,
+      durationMs: Date.now() - startedAt,
+    });
 
     if (response.status === 429) {
       const retryAfterMs = parseRetryAfterMs(response.headers?.['retry-after']);

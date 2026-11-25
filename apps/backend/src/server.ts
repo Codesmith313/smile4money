@@ -18,6 +18,10 @@ import { createShutdownHandler } from './shutdown.js';
 import { resolveNetworkConfig } from './config/network.js';
 import { startMatchStateSync } from './services/match-state-sync.js';
 import { startWebhookRetryWorker } from './services/webhooks.js';
+import {
+  initializeCredentialStore,
+  closeCredentialStore,
+} from './services/credential-store.js';
 import logger from './logger.js';
 
 const port = Number(process.env.PORT || 4000);
@@ -78,6 +82,12 @@ async function main() {
       { network: network.network, rpc_url_overridden: network.rpcUrlOverridden },
       'stellar_network_resolved',
     );
+
+    // #2112 — initialize the credential store (and apply its migrations)
+    // before any store or the HTTP listener starts, so credential rotation
+    // state is durable and no request is ever served with stale credentials.
+    await initializeCredentialStore();
+    logger.info('Credential store initialized');
 
     // Initialize the persistent queue store
     await initializeQueue();
@@ -219,6 +229,7 @@ async function main() {
       closeQueue,
       closeMatchStore,
       closeCircuitBreakerStore,
+      closeCredentialStore,
       logger,
       shutdownTimeoutMs: Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 30_000),
     });

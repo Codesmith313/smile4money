@@ -33,8 +33,26 @@ export const createDlqEntriesMigration: SqliteMigration = {
   ],
 };
 
+/** Adds the SHA-256 evidence hash column to oracle_decisions so stored
+ * evidence can be verified for tampering on retrieval. */
+export const addOracleDecisionEvidenceHashMigration: SqliteMigration = {
+  version: 2,
+  name: 'add_oracle_decision_evidence_hash',
+  statements: [
+    'ALTER TABLE oracle_decisions ADD COLUMN hash TEXT',
+    'CREATE INDEX IF NOT EXISTS idx_oracle_decisions_hash ON oracle_decisions(hash)',
+  ],
+  down: [
+    'DROP INDEX IF EXISTS idx_oracle_decisions_hash',
+    'ALTER TABLE oracle_decisions DROP COLUMN hash',
+  ],
+};
+
 /** Ordered list of all known migrations, applied in version order. */
-export const sqliteMigrations: SqliteMigration[] = [createDlqEntriesMigration];
+export const sqliteMigrations: SqliteMigration[] = [
+  createDlqEntriesMigration,
+  addOracleDecisionEvidenceHashMigration,
+];
 
 function run(db: sqlite3.Database, sql: string): Promise<void> {
   return new Promise((resolve, reject) =>

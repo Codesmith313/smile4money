@@ -44,8 +44,16 @@ pub use smile4money_common::SharedError;
 /// | 25   | StakeTooHigh          |         | stake_amount exceeds the maximum allowed stake       |
 /// | 26   | InsufficientReserve   |         | contract balance too low to cover payout + Stellar minimum reserve |
 /// | 27   | InvalidAddress        |         | a player address is invalid (zero address / burn address) |
-/// | 28   | DisputeWindowExpired  |         | override_result called after the dispute window expired |
-/// | 35   | BalanceDiscrepancy    |         | reconcile_balance found contract balance != sum of escrows |
+/// | 28   | TokenNotAllowlisted   |         | the token is not on the admin-managed allowlist      |
+/// | 29   | TokenAlreadyListed    |         | add_token called for a token already allowlisted     |
+/// | 30   | TokenNotListed        |         | remove_token called for a token not allowlisted      |
+/// | 31   | CannotRemoveDefault   |         | remove_token called for the contract's default token |
+/// | 32   | InvalidStakeAmount    |         | stake_amount is exactly zero                         |
+/// | 33   | ActiveMatchExists     |         | emergency_drain called while a match is Active       |
+/// | 34   | DisputeWindowExpired  |         | override_result called after the dispute window expired |
+/// | 35   | InvalidTokenDecimals  |         | token decimals outside the accepted range            |
+/// | 36   | AmountNotRepresentable|         | amount cannot be normalized to the base unit without loss |
+/// | 37   | TokenDisabled         |         | whitelisted token is currently disabled              |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -182,15 +190,27 @@ pub enum Error {
     /// [E034] `override_result` was called after the dispute window expired.
     DisputeWindowExpired = 34,
 
-    /// [E035] `reconcile_balance` detected that the contract's token balance
-    /// does not equal the sum of all recorded match escrows.
+    /// [E035] The token reports a decimals value outside the accepted range.
     ///
-    /// Returned by `reconcile_balance` when the total holdings of the contract
-    /// diverge from the sum of the stakes recorded across all matches. A
-    /// discrepancy indicates funds were added or removed outside the normal
-    /// escrow flow (e.g. a direct transfer, a failed payout, or a bug) and
-    /// should be investigated before further operations.
-    BalanceDiscrepancy = 35,
+    /// Returned when a token's `decimals()` result cannot be used for
+    /// normalization — for example a value greater than the maximum supported
+    /// precision. Such a token must not be allowlisted, since amounts could not
+    /// be converted to the common base unit without overflow.
+    InvalidTokenDecimals = 35,
+
+    /// [E036] The amount cannot be normalized to the common base unit without loss.
+    ///
+    /// Returned when converting a token-denominated amount to (or from) the
+    /// base unit would require rounding away a non-zero remainder. Callers must
+    /// supply amounts that are exactly representable in the base unit.
+    AmountNotRepresentable = 36,
+
+    /// [E037] The token is allowlisted but is currently disabled.
+    ///
+    /// A disabled token remains on the allowlist (so its metadata and balances
+    /// are retained) but cannot be used for new matches until re-enabled by the
+    /// admin.
+    TokenDisabled = 37,
 }
 
 /// Convert a [`SharedError`] into an escrow [`Error`].

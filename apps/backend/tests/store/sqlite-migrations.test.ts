@@ -125,6 +125,78 @@ describe("SQLite schema migrations", () => {
     }
   });
 
+  it("applies and rolls back the credential store migration set", async () => {
+    db = new sqlite3.Database(":memory:");
+    const migrations = SQLITE_SCHEMA_MIGRATIONS["api-credentials"];
+
+    const applied = await applySqliteMigrations(db, migrations);
+    expect(applied.currentVersion).toBe(migrations.length);
+    expect(applied.appliedMigrations).toHaveLength(migrations.length);
+
+    const table = await new Promise<{ name: string } | undefined>(
+      (resolve, reject) =>
+        db!.get(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'api_credentials'",
+          (error, row: { name: string } | undefined) =>
+            error ? reject(error) : resolve(row),
+        ),
+    );
+    expect(table?.name).toBe("api_credentials");
+
+    const rolledBack = await rollbackSqliteMigrations(db, migrations, 0);
+    expect(rolledBack.currentVersion).toBe(0);
+    expect(rolledBack.rolledBackMigrations).toHaveLength(migrations.length);
+
+    const droppedTable = await new Promise<{ name: string } | undefined>(
+      (resolve, reject) =>
+        db!.get(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'api_credentials'",
+          (error, row: { name: string } | undefined) =>
+            error ? reject(error) : resolve(row),
+        ),
+    );
+    expect(droppedTable).toBeUndefined();
+  });
+
+  it("adds and rolls back the dispute window columns on matches", async () => {
+    db = new sqlite3.Database(":memory:");
+    const migrations = SQLITE_SCHEMA_MIGRATIONS["match-store"];
+    await applySqliteMigrations(db, migrations);
+
+    const columns = await new Promise<Array<{ name: string }>>(
+      (resolve, reject) =>
+        db!.all(
+          "PRAGMA table_info(matches)",
+          (error, rows: Array<{ name: string }>) =>
+            error ? reject(error) : resolve(rows),
+        ),
+    );
+    const columnNames = columns.map((column) => column.name);
+    expect(columnNames).toContain("resultSubmittedAt");
+    expect(columnNames).toContain("disputeWindowEndsAt");
+
+    const rolledBack = await rollbackSqliteMigrations(
+      db,
+      migrations,
+      migrations.length - 1,
+    );
+    expect(rolledBack.currentVersion).toBe(migrations.length - 1);
+
+    const columnsAfterRollback = await new Promise<Array<{ name: string }>>(
+      (resolve, reject) =>
+        db!.all(
+          "PRAGMA table_info(matches)",
+          (error, rows: Array<{ name: string }>) =>
+            error ? reject(error) : resolve(rows),
+        ),
+    );
+    const rolledBackColumnNames = columnsAfterRollback.map(
+      (column) => column.name,
+    );
+    expect(rolledBackColumnNames).not.toContain("resultSubmittedAt");
+    expect(rolledBackColumnNames).not.toContain("disputeWindowEndsAt");
+  });
+
   it("applies and rolls back the cancellation reason migration", async () => {
     db = new sqlite3.Database(":memory:");
     const migrations = SQLITE_SCHEMA_MIGRATIONS["match-cancellation-reason"];

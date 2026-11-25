@@ -15,7 +15,195 @@ import type { MatchStorePort } from '../store/match-store.js';
 import type { EvidenceStore } from '../store/evidence-store.js';
 import { withGameLock } from '../store/evidence-store.js';
 import logger from '../logger.js';
+import { logProviderInteraction } from '../lib/provider-request-logger.js';
 import { errorToHttpStatus, ValidationError, NotFoundError } from '../errors/errorToHttpStatus.js';
+
+// ---------------------------------------------------------------------------
+// #2121 — Oracle configuration management
+// ---------------------------------------------------------------------------
+
+export interface OracleProviderConfig {
+  /** Base endpoint URL used to fetch results for this provider. */
+  endpoint: string;
+  /**
+   * Opaque reference to the provider credential held in the secure config
+   * store. The plaintext secret is never stored on this object or logged.
+   */
+  credentialRef?: string;
+}
+
+export interface OracleConfig {
+  lichess: OracleProviderConfig;
+  chessdotcom: OracleProviderConfig;
+  /** ISO timestamp of the last successful update. */
+  updatedAt: string;
+  /** Actor that performed the last successful update. */
+  updatedBy: string;
+}
+
+export interface OracleConfigPatch {
+  lichess?: Partial<OracleProviderConfig>;
+  chessdotcom?: Partial<OracleProviderConfig>;
+}
+
+export interface OracleConfigUpdateResult {
+  ok: boolean;
+  config?: OracleConfig;
+  error?: string;
+}
+
+/**
+ * Minimal port for persisting oracle configuration. Implementations are
+ * expected to store credentials securely (e.g. an encrypted/secrets store);
+ * only credential *references* are ever passed through this interface.
+ */
+export interface OracleConfigStorePort {
+  load(): Promise<OracleConfig | null>;
+  save(config: OracleConfig): Promise<void>;
+}
+
+const DEFAULT_ORACLE_CONFIG: OracleConfig = {
+  lichess: { endpoint: 'https://lichess.org' },
+  chessdotcom: { endpoint: 'https://api.chess.com' },
+  updatedAt: new Date(0).toISOString(),
+  updatedBy: 'system',
+};
+
+let currentOracleConfig: OracleConfig = { ...DEFAULT_ORACLE_CONFIG };
+let oracleConfigStore: OracleConfigStorePort | null = null;
+
+/** Return the current (in-memory) oracle configuration. */
+export function getOracleConfig(): OracleConfig {
+  return currentOracleConfig;
+}
+
+/** Register the secure config store used to persist oracle configuration. */
+export function setOracleConfigStore(store: OracleConfigStorePort | null): void {
+  oracleConfigStore = store;
+}
+
+function allowedOracleHosts(): string[] {
+  return (process.env.ORACLE_ALLOWED_HOSTS ?? '')
+    .split(',')
+    .map((host) => host.trim().toLowerCase())
+    .filter((host) => host.length > 0);
+}
+
+function isLocalhost(hostname: string): boolean {
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+}
+
+/**
+ * Validate an oracle endpoint URL.
+ *
+ * Rules:
+ *  - must parse as a URL
+ *  - must use https (http is only permitted for localhost in non-production)
+ *  - must not embed credentials in the URL
+ *  - host must be present in the ORACLE_ALLOWED_HOSTS allowlist (when set)
+ *
+ * Returns an error string on failure, or null when valid.
+ */
+export function validateEndpoint(url: string): string | null {
+  if (typeof url !== 'string' || url.trim().length === 0) {
+    return 'endpoint must be a non-empty string';
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return 'endpoint must be a valid URL';
+  }
+  if (parsed.username || parsed.password) {
+    return 'endpoint must not contain embedded credentials';
+  }
+  const isDev = process.env.NODE_ENV !== 'production';
+  if (parsed.protocol === 'https:') {
+    // ok
+  } else if (parsed.protocol === 'http:' && isDev && isLocalhost(parsed.hostname)) {
+    // http permitted only for localhost in development
+  } else {
+    return 'endpoint must use https (http is only allowed for localhost in development)';
+  }
+  const allowlist = allowedOracleHosts();
+  if (allowlist.length > 0 && !allowlist.includes(parsed.hostname.toLowerCase())) {
+    return `endpoint host '${parsed.hostname}' is not in the allowed hosts list`;
+  }
+  return null;
+}
+
+/**
+ * Update the oracle configuration.
+ *
+ * Validates the patch, atomically swaps the in-memory config, persists it via
+ * the secure config store, and emits an audit log event. Credentials are never
+ * logged or returned in plaintext — only credential references are handled.
+ */
+export async function updateOracleConfig(
+  patch: OracleConfigPatch,
+  actor: string,
+): Promise<OracleConfigUpdateResult> {
+  const next: OracleConfig = {
+    lichess: { ...currentOracleConfig.lichess },
+    chessdotcom: { ...currentOracleConfig.chessdotcom },
+    updatedAt: currentOracleConfig.updatedAt,
+    updatedBy: currentOracleConfig.updatedBy,
+  };
+
+  const providers: Array<'lichess' | 'chessdotcom'> = ['lichess', 'chessdotcom'];
+  for (const provider of providers) {
+    const providerPatch = patch[provider];
+    if (!providerPatch) continue;
+    if (providerPatch.endpoint !== undefined) {
+      const endpointError = validateEndpoint(providerPatch.endpoint);
+      if (endpointError) {
+        logger.warn(
+          { actor, provider, reason: endpointError },
+          'oracle_config_update_rejected',
+        );
+        return { ok: false, error: `${provider}: ${endpointError}` };
+      }
+      next[provider].endpoint = providerPatch.endpoint;
+    }
+    if (providerPatch.credentialRef !== undefined) {
+      next[provider].credentialRef = providerPatch.credentialRef;
+    }
+  }
+
+  next.updatedAt = new Date().toISOString();
+  next.updatedBy = actor;
+
+  // Persist first so a failed write leaves the in-memory config untouched.
+  if (oracleConfigStore) {
+    try {
+      await oracleConfigStore.save(next);
+    } catch (error) {
+      logger.error(
+        { actor, err: error instanceof Error ? error.message : String(error) },
+        'oracle_config_update_rejected',
+      );
+      return { ok: false, error: 'failed to persist oracle configuration' };
+    }
+  }
+
+  // Atomic swap.
+  currentOracleConfig = next;
+
+  logger.info(
+    {
+      actor,
+      updatedAt: next.updatedAt,
+      lichess: { endpoint: next.lichess.endpoint, credentialRef: next.lichess.credentialRef },
+      chessdotcom: {
+        endpoint: next.chessdotcom.endpoint,
+        credentialRef: next.chessdotcom.credentialRef,
+      },
+    },
+    'oracle_config_updated',
+  );
+
+  return { ok: true, config: next };
+}
 
 export interface SubmitResultInput {
   matchId: number;
@@ -368,9 +556,25 @@ async function verifyGameResultCore(
   let apiResult;
   try {
     if (match.platform === 'lichess') {
-      apiResult = await fetchLichessResult(gameId);
+      apiResult = await logProviderInteraction(
+        {
+          provider: 'lichess',
+          operation: 'fetch_result',
+          request: { gameId },
+          context: { matchId: match.matchId, gameId },
+        },
+        () => fetchLichessResult(gameId),
+      );
     } else if (match.platform === 'chessdotcom') {
-      apiResult = await fetchChessDotComResult(username as string, gameId);
+      apiResult = await logProviderInteraction(
+        {
+          provider: 'chessdotcom',
+          operation: 'fetch_result',
+          request: { gameId, username },
+          context: { matchId: match.matchId, gameId },
+        },
+        () => fetchChessDotComResult(username as string, gameId),
+      );
     } else {
       return {
         ok: false,

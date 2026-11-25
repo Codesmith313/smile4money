@@ -44,11 +44,32 @@ const DEFAULT_ARCHIVE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 /** Default maximum number of pooled SQLite connections. */
 const DEFAULT_SQLITE_POOL_SIZE = 5;
 
+/**
+ * Default allowlist of hosts oracle provider endpoints may point at (#2121).
+ * Empty means no host is allowed until explicitly configured.
+ */
+const DEFAULT_ORACLE_ENDPOINT_ALLOWLIST: readonly string[] = [];
+
+/** Default set of Stellar addresses permitted to update oracle config (#2121). */
+const DEFAULT_ORACLE_ADMIN_ADDRESSES: readonly string[] = [];
+
 /** Default idle timeout for pooled SQLite connections (30 seconds). */
 const DEFAULT_SQLITE_POOL_IDLE_TIMEOUT_MS = 30 * 1000;
 
 /** Default session lifetime (1 hour) before a session expires (#2129). */
 const DEFAULT_SESSION_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * Default grace period (seconds) during which old API credentials remain
+ * valid after a rotation (#2112). Defaults to 24 hours.
+ */
+const DEFAULT_CREDENTIAL_ROTATION_GRACE_SECONDS = 86_400;
+
+/**
+ * Default dispute window (seconds) after result submission during which a
+ * result may be disputed (#2115). Defaults to 1 hour.
+ */
+const DEFAULT_DISPUTE_WINDOW_SECONDS = 3_600;
 
 /**
  * Reads an optional string environment variable, falling back to a default.
@@ -119,6 +140,129 @@ function parsePositiveInt(name: string, defaultValue: number): number {
   }
 
   return parsed;
+}
+
+/**
+ * Parses a comma-separated list environment variable into a trimmed,
+ * de-duplicated array of non-empty entries.
+ *
+ * Rules:
+ *  - If the variable is absent or empty, `defaultValue` is used.
+ *  - Entries are trimmed; empty entries are dropped.
+ *  - Duplicate entries (case-insensitive) are collapsed, keeping the first.
+ */
+function parseStringList(
+  name: string,
+  defaultValue: readonly string[]
+): string[] {
+  const raw = process.env[name];
+
+  if (raw === undefined || raw.trim() === '') {
+    return [...defaultValue];
+  }
+
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  for (const entry of raw.split(',')) {
+    const trimmed = entry.trim();
+
+    if (trimmed === '') {
+      continue;
+    }
+
+    const key = trimmed.toLowerCase();
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    result.push(trimmed);
+  }
+
+  return result;
+}
+
+/**
+ * Parses ORACLE_ENDPOINT_ALLOWLIST into a list of normalised hostnames (#2121).
+ *
+ * Each entry may be a bare host ("api.lichess.org") or a full URL
+ * ("https://api.lichess.org"); only the hostname is retained. Entries must be
+ * valid hostnames — anything else fails startup.
+ *
+ * @throws {Error} when an entry is not a valid hostname.
+ */
+function parseOracleEndpointAllowlist(): string[] {
+  const entries = parseStringList(
+    'ORACLE_ENDPOINT_ALLOWLIST',
+    DEFAULT_ORACLE_ENDPOINT_ALLOWLIST
+  );
+
+  return entries.map((entry) => {
+    let hostname = entry;
+
+    if (entry.includes('://')) {
+      try {
+        hostname = new URL(entry).hostname;
+      } catch {
+        throw new Error(
+          `ORACLE_ENDPOINT_ALLOWLIST contains an invalid URL: "${entry}"`
+        );
+      }
+    }
+
+    if (!isValidHostname(hostname)) {
+      throw new Error(
+        `ORACLE_ENDPOINT_ALLOWLIST contains an invalid hostname: "${entry}"`
+      );
+    }
+
+    return hostname.toLowerCase();
+  });
+}
+
+/**
+ * Parses ORACLE_ADMIN_ADDRESSES into a list of Stellar addresses (#2121).
+ *
+ * Each entry must be a 56-character Stellar public key starting with "G".
+ *
+ * @throws {Error} when an entry is not a valid Stellar address.
+ */
+function parseOracleAdminAddresses(): string[] {
+  const entries = parseStringList(
+    'ORACLE_ADMIN_ADDRESSES',
+    DEFAULT_ORACLE_ADMIN_ADDRESSES
+  );
+
+  for (const address of entries) {
+    if (!/^G[A-Z2-7]{55}$/.test(address)) {
+      throw new Error(
+        `ORACLE_ADMIN_ADDRESSES contains an invalid Stellar address: "${address}"`
+      );
+    }
+  }
+
+  return entries;
+}
+
+/**
+ * Returns true when `hostname` is a syntactically valid DNS hostname or IPv4
+ * literal. Rejects empty labels, illegal characters and over-long labels.
+ */
+function isValidHostname(hostname: string): boolean {
+  if (hostname === '' || hostname.length > 253) {
+    return false;
+  }
+
+  const labels = hostname.split('.');
+
+  return labels.every(
+    (label) =>
+      label.length > 0 &&
+      label.length <= 63 &&
+      /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$/.test(label)
+  );
 }
 
 /**
@@ -367,6 +511,26 @@ export interface Env {
   sqlitePoolIdleTimeoutMs: number;
 
   /**
+   * Hostnames oracle provider endpoints are allowed to point at (#2121).
+   * Sourced from ORACLE_ENDPOINT_ALLOWLIST (comma-separated). Endpoint updates
+   * are rejected unless their host appears here.
+   */
+  oracleEndpointAllowlist: string[];
+
+  /**
+   * Key used to encrypt stored provider credentials at rest (#2121).
+   * Empty when unset; config updates must refuse to persist credentials
+   * without it.
+   */
+  oracleConfigEncryptionKey: string;
+
+  /**
+   * Stellar addresses permitted to update oracle configuration (#2121).
+   * Sourced from ORACLE_ADMIN_ADDRESSES (comma-separated).
+   */
+  oracleAdminAddresses: string[];
+
+  /**
    * Whitelisted frontend origins allowed to make browser (CORS) requests
    * (#2130).
    *
@@ -461,6 +625,12 @@ function loadEnv(): Env {
       'SQLITE_POOL_IDLE_TIMEOUT_MS',
       DEFAULT_SQLITE_POOL_IDLE_TIMEOUT_MS
     ),
+    oracleEndpointAllowlist: parseOracleEndpointAllowlist(),
+    oracleConfigEncryptionKey: parseString(
+      'ORACLE_CONFIG_ENCRYPTION_KEY',
+      ''
+    ),
+    oracleAdminAddresses: parseOracleAdminAddresses(),
     corsAllowedOrigins: parseString(
       'CORS_ALLOWED_ORIGINS',
       parseString('ALLOWED_ORIGINS', '')

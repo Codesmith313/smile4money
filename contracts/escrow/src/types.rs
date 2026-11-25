@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, String};
+use soroban_sdk::{contracttype, Address, Map, String};
 
 /// Represents the lifecycle state of a chess match held in escrow.
 ///
@@ -292,53 +292,66 @@ pub struct Match {
     pub completed_ledger: Option<u32>,
 }
 
-/// The outcome of a balance reconciliation check.
+/// Per-token configuration for a whitelisted SEP-41 token.
 ///
-/// Produced by the contract's reconciliation function, which compares the
-/// contract's actual token holdings against the sum of all outstanding match
-/// escrows. A non-zero [`discrepancy`](ReconciliationResult::discrepancy)
-/// indicates that the contract holds more or less than it should, which may
-/// point to a bug, an unexpected transfer, or a token with non-standard
-/// behaviour (e.g. rebasing or fee-on-transfer).
+/// Stored under [`DataKey::TokenWhitelist`] for every token the admin has
+/// approved for matches. The record carries both the token's decimal
+/// configuration — needed to normalize amounts to a common base unit — and the
+/// enabled flag that gates whether new matches may use the token.
 ///
-/// # Fields
+/// # Decimals and rounding
 ///
-/// | Field             | Meaning                                                        |
-/// |-------------------|----------------------------------------------------------------|
-/// | `expected_total`  | Sum of all escrowed stakes across every non-terminal match     |
-/// | `actual_balance`  | The contract's real token balance as reported by the token     |
-/// | `discrepancy`     | `actual_balance - expected_total` (positive = surplus)         |
-/// | `matched`         | `true` iff `discrepancy == 0`                                  |
+/// `decimals` is the number of decimal places the token contract reports
+/// (e.g. 7 for XLM, 6 for USDC, 8 for some custom tokens). Amounts are
+/// normalized to a common base unit of [`NORMALIZED_DECIMALS`](crate::NORMALIZED_DECIMALS)
+/// by scaling up when the token has fewer decimals and scaling down — with
+/// truncation towards zero — when it has more. Rounding therefore always
+/// favours the escrow contract, never the caller.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReconciliationResult {
-    /// The total amount of tokens the contract *should* be holding, computed
-    /// as the sum of every outstanding escrow.
+pub struct TokenConfig {
+    /// Number of decimal places the token contract uses for its amounts.
     ///
-    /// Only matches that currently hold funds are counted — i.e. matches in
-    /// [`MatchState::Active`] and [`MatchState::PendingResult`], plus
-    /// [`MatchState::Pending`] matches where at least one player has already
-    /// deposited. Terminal states ([`MatchState::Completed`] and
-    /// [`MatchState::Cancelled`]) hold no funds and are excluded.
-    pub expected_total: i128,
+    /// Read from the token contract when the token is whitelisted. Used to
+    /// normalize amounts to a common base unit before arithmetic.
+    pub decimals: u32,
 
-    /// The contract's actual token balance, as reported by the token contract
-    /// at reconciliation time.
-    pub actual_balance: i128,
-
-    /// The signed difference `actual_balance - expected_total`.
+    /// Whether the token is currently enabled for new matches.
     ///
-    /// - `0` — the books balance.
-    /// - `> 0` — the contract holds more than it owes (surplus).
-    /// - `< 0` — the contract holds less than it owes (shortfall).
-    pub discrepancy: i128,
+    /// A token can be disabled without being removed so that its configuration
+    /// (and any outstanding balances) survive. Disabled tokens are rejected by
+    /// [`create_match`](crate::EscrowContract::create_match) but existing
+    /// matches that already use them can still be settled.
+    pub enabled: bool,
+}
 
-    /// Whether the reconciliation succeeded, i.e. `discrepancy == 0`.
+/// Aggregated escrow balances for a single match, broken down by token.
+///
+/// Returned by the multi-token escrow balance query. Each entry in
+/// [`balances`](TokenBalances::balances) is the amount currently held in escrow
+/// for that token, and [`total`](TokenBalances::total) is the sum across all
+/// tokens after normalization to the common base unit.
+///
+/// # Cross-token safety
+///
+/// Balances are tracked in independent ledger entries keyed by
+/// `(match_id, token)` — see [`DataKey::EscrowBalance`] — so funds of one token
+/// can never be counted towards another. `total` is a reporting convenience
+/// only; it is never used to authorize a payout.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenBalances {
+    /// Escrowed balance per token, keyed by token contract address.
     ///
-    /// Provided as a convenience so callers do not have to compare
-    /// [`discrepancy`](ReconciliationResult::discrepancy) against zero
-    /// themselves.
-    pub matched: bool,
+    /// Only tokens with a non-zero balance are included.
+    pub balances: Map<Address, i128>,
+
+    /// Sum of all per-token balances, normalized to the common base unit.
+    ///
+    /// Computed by summing each entry of [`balances`](TokenBalances::balances)
+    /// after normalization. Because different tokens have different decimals,
+    /// this figure is meaningful for reporting and monitoring only.
+    pub total: i128,
 }
 
 /// Storage keys used by the escrow contract.
@@ -433,6 +446,36 @@ pub enum DataKey {
     /// [`remove_token`](crate::EscrowContract::remove_token).
     /// Stored in **persistent** storage, bumped alongside the match entries.
     TokenAllowlisted(Address),
+
+    /// Per-token configuration for a whitelisted SEP-41 token.
+    ///
+    /// Maps a token address to its [`TokenConfig`] (decimals and enabled flag).
+    /// Written by [`add_token`](crate::EscrowContract::add_token) and updated by
+    /// [`remove_token`](crate::EscrowContract::remove_token), which disables the
+    /// token rather than deleting the record so its decimals remain available
+    /// for settling existing matches.
+    ///
+    /// Kept in sync with [`TokenAllowlisted`](DataKey::TokenAllowlisted): a token
+    /// is accepted for matches only when both entries exist and the config is
+    /// enabled.
+    /// Stored in **persistent** storage with the same TTL as the match entries.
+    TokenWhitelist(Address),
+
+    /// Escrowed balance for a single `(match_id, token)` pair.
+    ///
+    /// Each supported token has its own independent ledger entry, so balances
+    /// of different tokens can never contaminate one another. Written on
+    /// deposit and decremented on payout or refund.
+    /// Stored in **persistent** storage, bumped alongside the match entry so the
+    /// ledger outlives the match it belongs to.
+    EscrowBalance(u64, Address),
+
+    /// Platform reserve balance held for a single token.
+    ///
+    /// Tracks fees and other funds retained by the platform, kept separately
+    /// per token so reserves of one token are never mixed with another.
+    /// Stored in **persistent** storage with the same TTL as the match entries.
+    PlatformReserve(Address),
 
     /// The pre-registered destination address for [`emergency_drain`](crate::EscrowContract::emergency_drain).
     ///

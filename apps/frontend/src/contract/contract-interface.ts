@@ -14,7 +14,7 @@ import { nativeToScVal } from '@stellar/stellar-sdk';
 import type { xdr } from '@stellar/stellar-sdk';
 
 /** `specHash` of the fixture this module was last reviewed against. */
-export const CONTRACT_INTERFACE_SPEC_HASH = '40b1543545c2d06c';
+export const CONTRACT_INTERFACE_SPEC_HASH = '7c1e9a4b8d2f5e03';
 
 /**
  * Escrow contract error codes (`contracts/escrow/src/errors.rs`). Must match
@@ -59,6 +59,10 @@ export const ESCROW_ERRORS = {
   InvalidStakeAmount: 32,
   ActiveMatchExists: 33,
   DisputeWindowExpired: 28,
+  TokenWhitelistEmpty: 34,
+  TokenAlreadyWhitelisted: 35,
+  TokenNotWhitelisted: 36,
+  BalanceOverflow: 37,
 } as const;
 
 /** Leaderboard contract error codes (`contracts/leaderboard/src/types.rs`). */
@@ -99,6 +103,10 @@ export function leaderboardErrorName(code: number): LeaderboardErrorName | undef
 export const FRONTEND_METHODS = {
   escrow: {
     get_match: ['match_id'],
+    add_token: ['admin', 'token'],
+    remove_token: ['admin', 'token'],
+    get_escrow_balance: ['match_id'],
+    get_escrow_balance_by_token: ['match_id', 'token'],
   },
   leaderboard: {
     get_leaderboard: ['limit', 'offset'],
@@ -110,7 +118,64 @@ export function serializeGetMatchArgs(matchId: number | bigint): xdr.ScVal[] {
   return [nativeToScVal(BigInt(matchId), { type: 'u64' })];
 }
 
+/** Arguments for escrow `add_token(admin: Address, token: Address)`. */
+export function serializeAddTokenArgs(admin: string, token: string): xdr.ScVal[] {
+  return [
+    nativeToScVal(admin, { type: 'address' }),
+    nativeToScVal(token, { type: 'address' }),
+  ];
+}
+
+/** Arguments for escrow `remove_token(admin: Address, token: Address)`. */
+export function serializeRemoveTokenArgs(admin: string, token: string): xdr.ScVal[] {
+  return [
+    nativeToScVal(admin, { type: 'address' }),
+    nativeToScVal(token, { type: 'address' }),
+  ];
+}
+
+/** Arguments for escrow `get_escrow_balance(match_id: u64)`. */
+export function serializeGetEscrowBalanceArgs(matchId: number | bigint): xdr.ScVal[] {
+  return [nativeToScVal(BigInt(matchId), { type: 'u64' })];
+}
+
+/** Arguments for escrow `get_escrow_balance_by_token(match_id: u64, token: Address)`. */
+export function serializeGetEscrowBalanceByTokenArgs(
+  matchId: number | bigint,
+  token: string,
+): xdr.ScVal[] {
+  return [
+    nativeToScVal(BigInt(matchId), { type: 'u64' }),
+    nativeToScVal(token, { type: 'address' }),
+  ];
+}
+
 /** Arguments for leaderboard `get_leaderboard(limit: u32, offset: u32)`. */
 export function serializeGetLeaderboardArgs(limit: number, offset: number): xdr.ScVal[] {
   return [nativeToScVal(limit, { type: 'u32' }), nativeToScVal(offset, { type: 'u32' })];
+}
+
+/**
+ * Per-token escrow balances keyed by token contract address, as returned by
+ * `get_escrow_balance(match_id)`. `total` is the sum across all tokens.
+ */
+export interface TokenBalances {
+  /** Balance per token address (i128 amounts as bigint). */
+  balances: Record<string, bigint>;
+  /** Sum of all per-token balances. */
+  total: bigint;
+}
+
+/**
+ * Decode the `Map<Address, i128>` returned by `get_escrow_balance` into
+ * {@link TokenBalances}, computing the aggregate total across tokens.
+ */
+export function decodeTokenBalances(entries: Iterable<[string, bigint]>): TokenBalances {
+  const balances: Record<string, bigint> = {};
+  let total = 0n;
+  for (const [token, amount] of entries) {
+    balances[token] = amount;
+    total += amount;
+  }
+  return { balances, total };
 }

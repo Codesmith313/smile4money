@@ -12,6 +12,7 @@ import { ErrorCode, errorEnvelope, statusToErrorCode } from '../errors/errorResp
 import logger from '../logger.js';
 
 const VALID_RESULTS = new Set(['Player1Wins', 'Player2Wins', 'Draw']);
+const DEFAULT_DISPUTE_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 function isMatchResult(value: unknown): value is Exclude<MatchResult, null> {
   return typeof value === 'string' && VALID_RESULTS.has(value);
@@ -20,6 +21,29 @@ function isMatchResult(value: unknown): value is Exclude<MatchResult, null> {
 function isAwaitingReview(state: string): boolean {
   return state === 'review_required' || state === 'retry_requested';
 }
+
+function getDisputeWindowMs(): number {
+  const raw = process.env.DISPUTE_WINDOW_MS;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_DISPUTE_WINDOW_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_DISPUTE_WINDOW_MS;
+}
+
+function resolveDisputeDeadline(match: {
+  disputeDeadline?: string | null;
+  resultSubmittedAt?: string | null;
+}): number | null {
+  if (match.disputeDeadline) {
+    const parsed = Date.parse(match.disputeDeadline);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  if (match.resultSubmittedAt) {
+    const submitted = Date.parse(match.resultSubmittedAt);
+    if (Number.isFinite(submitted)) return submitted + getDisputeWindowMs();
+  }
+  return null;
+}
+=======
 
 export function createReviewRouter(ledger?: EvidenceStore, matches?: MatchStorePort) {
   const router = Router();
@@ -118,7 +142,38 @@ export function createReviewRouter(ledger?: EvidenceStore, matches?: MatchStoreP
           .json(errorEnvelope(ErrorCode.NOT_FOUND, 'Match could not be found.'));
       }
 
+      const disputeDeadline = resolveDisputeDeadline(match);
+      if (disputeDeadline !== null && Date.now() > disputeDeadline) {
+        logger.warn(
+          {
+            game_id: gameId,
+            match_id: match.matchId,
+            dispute_deadline: new Date(disputeDeadline).toISOString(),
+            operator: req.address,
+          },
+          'dispute_window_expired',
+        );
+        logger.warn(
+          {
+            game_id: gameId,
+            match_id: match.matchId,
+            dispute_deadline: new Date(disputeDeadline).toISOString(),
+            operator: req.address,
+          },
+          'dispute_rejected_outside_window',
+        );
+        return res
+          .status(409)
+          .json(
+            errorEnvelope(
+              ErrorCode.CONFLICT,
+              'The dispute window for this match has expired.',
+            ),
+          );
+      }
+
       const rollback = await withGameLock(gameId, async () => {
+=======
         const history = await evidenceStore.history(gameId);
         const previous = history[history.length - 1];
         const decisionId = await evidenceStore.append({
@@ -204,6 +259,40 @@ export function createReviewRouter(ledger?: EvidenceStore, matches?: MatchStoreP
     }
 
     try {
+      const matchStore = await getMatchStore();
+      const match = await matchStore.findByGameId(req.params.gameId);
+      if (match) {
+        const disputeDeadline = resolveDisputeDeadline(match);
+        if (disputeDeadline !== null && Date.now() > disputeDeadline) {
+          logger.warn(
+            {
+              game_id: req.params.gameId,
+              match_id: match.matchId,
+              dispute_deadline: new Date(disputeDeadline).toISOString(),
+              operator: req.address,
+            },
+            'dispute_window_expired',
+          );
+          logger.warn(
+            {
+              game_id: req.params.gameId,
+              match_id: match.matchId,
+              dispute_deadline: new Date(disputeDeadline).toISOString(),
+              operator: req.address,
+            },
+            'dispute_rejected_outside_window',
+          );
+          return res
+            .status(409)
+            .json(
+              errorEnvelope(
+                ErrorCode.CONFLICT,
+                'The dispute window for this match has expired.',
+              ),
+            );
+        }
+      }
+
       const decisionId = await withGameLock(req.params.gameId, async () => {
         const evidenceStore = await getLedger();
         const history = await evidenceStore.history(req.params.gameId);
@@ -264,6 +353,40 @@ export function createReviewRouter(ledger?: EvidenceStore, matches?: MatchStoreP
         );
     }
     try {
+      const matchStore = await getMatchStore();
+      const match = await matchStore.findByGameId(req.params.gameId);
+      if (match) {
+        const disputeDeadline = resolveDisputeDeadline(match);
+        if (disputeDeadline !== null && Date.now() > disputeDeadline) {
+          logger.warn(
+            {
+              game_id: req.params.gameId,
+              match_id: match.matchId,
+              dispute_deadline: new Date(disputeDeadline).toISOString(),
+              operator: req.address,
+            },
+            'dispute_window_expired',
+          );
+          logger.warn(
+            {
+              game_id: req.params.gameId,
+              match_id: match.matchId,
+              dispute_deadline: new Date(disputeDeadline).toISOString(),
+              operator: req.address,
+            },
+            'dispute_rejected_outside_window',
+          );
+          return res
+            .status(409)
+            .json(
+              errorEnvelope(
+                ErrorCode.CONFLICT,
+                'The dispute window for this match has expired.',
+              ),
+            );
+        }
+      }
+
       const decisionId = await withGameLock(req.params.gameId, async () => {
         const evidenceStore = await getLedger();
         const history = await evidenceStore.history(req.params.gameId);

@@ -4,10 +4,13 @@ import matchRouter from './routes/matches.js';
 import validateGameRouter from './routes/validate-game.js';
 import reviewRouter from './routes/oracle-review.js';
 import oracleRouter from './routes/oracle.js';
+import oracleConfigRouter from './routes/oracle-config.js';
+import oracleDashboardRouter from './routes/oracle-dashboard.js';
 import historyRouter from './routes/oracle-history.js';
 import playerIdentityRouter from './routes/player-identity.js';
 import metricsRouter from './routes/metrics.js';
 import statusRouter from './routes/status.js';
+import adminCredentialsRouter from './routes/admin-credentials.js';
 import {
   ErrorCode,
   errorEnvelope,
@@ -42,9 +45,12 @@ app.use('/api/matches', matchRouter);
 app.use('/api/validate-game', validateGameRouter);
 app.use('/api/oracle/reviews', reviewRouter);
 app.use('/api/oracle/history', historyRouter);
+app.use('/api/oracle/config', oracleConfigRouter);
+app.use('/api/oracle/dashboard', oracleDashboardRouter);
 app.use('/api/oracle', oracleRouter);
 app.use('/api/player-identity', playerIdentityRouter);
 app.use('/status', statusRouter);
+app.use('/api/admin/credentials', adminCredentialsRouter);
 
 // #2129 — session termination: revokes the current session and returns 204
 app.post('/auth/logout', authenticate, (req, res) => {

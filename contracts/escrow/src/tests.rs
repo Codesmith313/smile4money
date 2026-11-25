@@ -313,7 +313,7 @@ fn test_deposit_and_activate() {
     assert!(!client.is_funded(&id));
     client.deposit(&id, &player2);
     assert!(client.is_funded(&id));
-    assert_eq!(client.get_escrow_balance(&id), 200);
+    assert_eq!(client.get_escrow_balance(&id).total, 200);
     assert_eq!(client.get_match(&id).state, MatchState::Active);
     assert_eq!(token_client.balance(&player1), 900);
     assert_eq!(token_client.balance(&player2), 900);
@@ -345,7 +345,7 @@ fn test_payout_winner() {
     assert_eq!(token_client.balance(&player1), 1100);
     assert_eq!(token_client.balance(&player2), 900);
     assert_eq!(client.get_match(&id).state, MatchState::Completed);
-    assert_eq!(client.get_escrow_balance(&id), 0);
+    assert_eq!(client.get_escrow_balance(&id).total, 0);
 }
 
 #[test]
@@ -374,7 +374,7 @@ fn test_payout_winner_player2() {
     assert_eq!(token_client.balance(&player1), 900);
     assert_eq!(token_client.balance(&player2), 1100);
     assert_eq!(client.get_match(&id).state, MatchState::Completed);
-    assert_eq!(client.get_escrow_balance(&id), 0);
+    assert_eq!(client.get_escrow_balance(&id).total, 0);
 }
 
 #[test]
@@ -2434,10 +2434,10 @@ fn test_escrow_balance_zero_after_cancel() {
         &Platform::Lichess,
     );
     client.deposit(&id, &player1);
-    assert_eq!(client.get_escrow_balance(&id), 100);
+    assert_eq!(client.get_escrow_balance(&id).total, 100);
 
     client.cancel_match(&id, &player1);
-    assert_eq!(client.get_escrow_balance(&id), 0);
+    assert_eq!(client.get_escrow_balance(&id).total, 0);
     assert_eq!(token_client.balance(&player1), 1000); // fully refunded
 }
 
@@ -2459,7 +2459,7 @@ fn test_escrow_balance_full_pot_while_pending_result() {
 
     client.deposit(&id, &player1);
     client.deposit(&id, &player2);
-    assert_eq!(client.get_escrow_balance(&id), stake * 2);
+    assert_eq!(client.get_escrow_balance(&id).total, stake * 2);
 
     client.submit_result(
         &id,
@@ -2469,7 +2469,7 @@ fn test_escrow_balance_full_pot_while_pending_result() {
     );
 
     assert_eq!(client.get_match(&id).state, MatchState::PendingResult);
-    assert_eq!(client.get_escrow_balance(&id), stake * 2);
+    assert_eq!(client.get_escrow_balance(&id).total, stake * 2);
 }
 
 // Issue #180: Once both players have deposited the match transitions to Active.
@@ -2502,7 +2502,7 @@ fn test_cancel_with_both_deposits_requires_auth() {
     // Both players are fully refunded
     assert_eq!(token_client.balance(&player1), 1000);
     assert_eq!(token_client.balance(&player2), 1000);
-    assert_eq!(client.get_escrow_balance(&id), 0);
+    assert_eq!(client.get_escrow_balance(&id).total, 0);
 }
 
 // Issue #100: Test that submit_result on a cancelled match returns InvalidState (no deposit)
@@ -2583,7 +2583,7 @@ fn test_player2_win_payout_full_pot() {
     client.deposit(&id, &player1);
     client.deposit(&id, &player2);
     assert!(client.is_funded(&id));
-    assert_eq!(client.get_escrow_balance(&id), stake * 2);
+    assert_eq!(client.get_escrow_balance(&id).total, stake * 2);
 
     client.submit_result(
         &id,
@@ -2597,7 +2597,7 @@ fn test_player2_win_payout_full_pot() {
     assert_eq!(token_client.balance(&player2), p2_before + stake);
     assert_eq!(token_client.balance(&player1), p1_before - stake); // net loss = stake
     assert_eq!(client.get_match(&id).state, MatchState::Completed);
-    assert_eq!(client.get_escrow_balance(&id), 0);
+    assert_eq!(client.get_escrow_balance(&id).total, 0);
 }
 
 // Issue #222: cancel_match refunds only player1 when only player1 has deposited;
@@ -2621,7 +2621,7 @@ fn test_cancel_match_refunds_only_player1_when_only_player1_deposited() {
     client.deposit(&id, &player1);
     assert_eq!(token_client.balance(&player1), 900);
     assert_eq!(token_client.balance(&player2), 1000); // player2 untouched
-    assert_eq!(client.get_escrow_balance(&id), 100);
+    assert_eq!(client.get_escrow_balance(&id).total, 100);
 
     // Cancel â€” player2 triggers the cancellation
     client.cancel_match(&id, &player2);
@@ -2631,7 +2631,7 @@ fn test_cancel_match_refunds_only_player1_when_only_player1_deposited() {
     // player2 balance must be unchanged (never deposited, must not receive anything)
     assert_eq!(token_client.balance(&player2), 1000);
     // Escrow must be empty
-    assert_eq!(client.get_escrow_balance(&id), 0);
+    assert_eq!(client.get_escrow_balance(&id).total, 0);
     // Match must be in Cancelled state
     assert_eq!(client.get_match(&id).state, MatchState::Cancelled);
 }
@@ -2684,7 +2684,7 @@ fn test_reentrancy_deposit_checks_effects_interactions() {
     let m = client.get_match(&id);
     assert!(m.player1_deposited);
     assert_eq!(token_client.balance(&player1), 900);
-    assert_eq!(client.get_escrow_balance(&id), 100);
+    assert_eq!(client.get_escrow_balance(&id).total, 100);
 }
 
 #[test]
@@ -2723,7 +2723,7 @@ fn test_reentrancy_submit_result_checks_effects_interactions() {
     assert_eq!(client.get_match(&id).state, MatchState::Completed);
     assert_eq!(token_client.balance(&player1), 1100);
     assert_eq!(token_client.balance(&player2), 900);
-    assert_eq!(client.get_escrow_balance(&id), 0);
+    assert_eq!(client.get_escrow_balance(&id).total, 0);
 }
 
 // Issue: deposit returns InsufficientAllowance when player has not approved the contract
@@ -2786,7 +2786,7 @@ fn test_deposit_succeeds_with_exact_allowance() {
 
     client.deposit(&id, &player1);
     assert_eq!(token_client.balance(&player1), 900);
-    assert_eq!(client.get_escrow_balance(&id), 100);
+    assert_eq!(client.get_escrow_balance(&id).total, 100);
 }
 
 // Issue #1102: emergency_drain â€” success, unpaused guard, non-admin guard
@@ -4912,112 +4912,271 @@ fn result_correction_keeps_original_submission_in_audit_events() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Issue #2098 — balance reconciliation
+// Issue #2086 — token whitelist: admin-only access, happy paths, events,
+// and rejection of non-whitelisted tokens.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn test_reconcile_balance_matched() {
-    let (env, contract_id, _oracle, player1, player2, token, _admin, _safe_address) = setup();
+fn test_add_token_emits_whitelist_event() {
+    let (env, contract_id, _oracle, player1, player2, _token, admin, _safe) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
-    let token_client = TokenClient::new(&env, &token);
+    let usdc = setup_second_token(&env, &contract_id, &player1, &player2);
 
-    // Two funded matches: escrow total = 200 + 200 = 400.
-    let id1 = client.create_match(
-        &player1,
-        &player2,
-        &100,
-        &Some(token.clone()),
-        &String::from_str(&env, "reconcile_ok_1"),
-        &Platform::Lichess,
-    );
-    client.deposit(&id1, &player1);
-    client.deposit(&id1, &player2);
+    client.add_token(&usdc, &admin);
 
-    let id2 = client.create_match(
-        &player1,
-        &player2,
-        &100,
-        &Some(token.clone()),
-        &String::from_str(&env, "reconcile_ok_2"),
-        &Platform::Lichess,
-    );
-    client.deposit(&id2, &player1);
-    client.deposit(&id2, &player2);
-
-    // The reserve buffer minted in setup() is not part of any escrow, so the
-    // contract balance is expected to exceed the escrow sum by exactly that.
-    let contract_balance = token_client.balance(&contract_id);
-    assert_eq!(contract_balance, crate::ESCROW_RESERVE_BUFFER_STROOPS + 400);
-
-    let (matched, total_balance, total_escrows, discrepancy) = client.reconcile_balance();
-    assert!(matched, "balance should reconcile when no discrepancy exists");
-    assert_eq!(total_balance, contract_balance);
-    assert_eq!(total_escrows, 400);
-    assert_eq!(discrepancy, 0);
-
-    // The reconciliation event must be emitted.
     let events = env.events().all();
-    let reconcile_topics = vec![
+    let topics = vec![
         &env,
         Symbol::new(&env, "admin").into_val(&env),
-        symbol_short!("reconcil").into_val(&env),
+        symbol_short!("addtoken").into_val(&env),
     ];
-    let event = events
+    let ev = events
         .iter()
-        .find(|(_, topics, _)| *topics == reconcile_topics)
-        .expect("reconciliation event emitted");
-    let (ev_matched, ev_balance, ev_escrows, ev_discrepancy): (bool, i128, i128, i128) =
-        TryFromVal::try_from_val(&env, &event.2).unwrap();
-    assert!(ev_matched);
-    assert_eq!(ev_balance, contract_balance);
-    assert_eq!(ev_escrows, 400);
-    assert_eq!(ev_discrepancy, 0);
+        .find(|(_, t, _)| *t == topics)
+        .expect("add_token must emit a whitelist event");
+    let (logged_token, listed): (Address, bool) =
+        TryFromVal::try_from_val(&env, &ev.2).unwrap();
+    assert_eq!(logged_token, usdc);
+    assert!(listed);
 }
 
 #[test]
-fn test_reconcile_balance_detects_discrepancy() {
-    let (env, contract_id, _oracle, player1, player2, token, _admin, _safe_address) = setup();
+fn test_remove_token_emits_whitelist_event() {
+    let (env, contract_id, _oracle, player1, player2, _token, admin, _safe) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
-    let token_client = TokenClient::new(&env, &token);
+    let usdc = setup_second_token(&env, &contract_id, &player1, &player2);
+    client.add_token(&usdc, &admin);
+
+    client.remove_token(&usdc, &admin);
+
+    let events = env.events().all();
+    let topics = vec![
+        &env,
+        Symbol::new(&env, "admin").into_val(&env),
+        symbol_short!("rmtoken").into_val(&env),
+    ];
+    let ev = events
+        .iter()
+        .find(|(_, t, _)| *t == topics)
+        .expect("remove_token must emit a whitelist event");
+    let (logged_token, listed): (Address, bool) =
+        TryFromVal::try_from_val(&env, &ev.2).unwrap();
+    assert_eq!(logged_token, usdc);
+    assert!(!listed);
+}
+
+#[test]
+fn test_create_match_rejects_non_whitelisted_token() {
+    let (env, contract_id, _oracle, player1, player2, _token, _admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let rogue = setup_second_token(&env, &contract_id, &player1, &player2);
+
+    assert_eq!(
+        client.try_create_match(
+            &player1,
+            &player2,
+            &100,
+            &Some(rogue),
+            &String::from_str(&env, "rogue_token"),
+            &Platform::Lichess,
+        ),
+        Err(Ok(Error::TokenNotAllowlisted))
+    );
+}
+
+#[test]
+fn test_deposit_rejects_non_whitelisted_token() {
+    let (env, contract_id, _oracle, player1, player2, _token, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let usdc = setup_second_token(&env, &contract_id, &player1, &player2);
+    client.add_token(&usdc, &admin);
 
     let id = client.create_match(
         &player1,
         &player2,
         &100,
-        &Some(token.clone()),
-        &String::from_str(&env, "reconcile_bad"),
+        &Some(usdc.clone()),
+        &String::from_str(&env, "deposit_delisted"),
         &Platform::Lichess,
     );
-    client.deposit(&id, &player1);
-    client.deposit(&id, &player2);
 
-    let expected_balance = token_client.balance(&contract_id);
+    // Delisting after creation must block further deposits into that match.
+    client.remove_token(&usdc, &admin);
+    assert_eq!(
+        client.try_deposit(&id, &player1),
+        Err(Ok(Error::TokenNotAllowlisted))
+    );
+}
 
-    // Artificially inflate the contract balance by minting directly to it.
-    let asset_client = StellarAssetClient::new(&env, &token);
-    asset_client.mint(&contract_id, &500);
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #2087 / #2089 — per-token ledgers, no cross-token contamination,
+// aggregate totals, and get_escrow_balance_by_token.
+// ─────────────────────────────────────────────────────────────────────────────
 
-    let (matched, total_balance, total_escrows, discrepancy) = client.reconcile_balance();
-    assert!(!matched, "balance should not reconcile after an artificial mint");
-    assert_eq!(total_balance, expected_balance + 500);
-    assert_eq!(total_escrows, 200);
-    assert_eq!(discrepancy, 500);
+#[test]
+fn test_escrow_balance_map_tracks_tokens_independently() {
+    let (env, contract_id, _oracle, player1, player2, xlm, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let usdc = setup_second_token(&env, &contract_id, &player1, &player2);
+    client.add_token(&usdc, &admin);
 
-    // The discrepancy must be reported in the emitted event.
-    let events = env.events().all();
-    let reconcile_topics = vec![
-        &env,
-        Symbol::new(&env, "admin").into_val(&env),
-        symbol_short!("reconcil").into_val(&env),
-    ];
-    let event = events
-        .iter()
-        .find(|(_, topics, _)| *topics == reconcile_topics)
-        .expect("reconciliation event emitted");
-    let (ev_matched, ev_balance, ev_escrows, ev_discrepancy): (bool, i128, i128, i128) =
-        TryFromVal::try_from_val(&env, &event.2).unwrap();
-    assert!(!ev_matched);
-    assert_eq!(ev_balance, expected_balance + 500);
-    assert_eq!(ev_escrows, 200);
-    assert_eq!(ev_discrepancy, 500);
+    let xlm_id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &Some(xlm.clone()),
+        &String::from_str(&env, "ledger-xlm"),
+        &Platform::Lichess,
+    );
+    let usdc_id = client.create_match(
+        &player1,
+        &player2,
+        &250,
+        &Some(usdc.clone()),
+        &String::from_str(&env, "ledger-usdc"),
+        &Platform::Lichess,
+    );
+
+    client.deposit(&xlm_id, &player1);
+    client.deposit(&usdc_id, &player1);
+    client.deposit(&usdc_id, &player2);
+
+    // Per-match map: only the match's own token has a non-zero entry.
+    let xlm_bal = client.get_escrow_balance(&xlm_id);
+    assert_eq!(xlm_bal.total, 100);
+    assert_eq!(xlm_bal.balances.get(xlm.clone()), Some(100));
+    assert_eq!(xlm_bal.balances.get(usdc.clone()), None);
+
+    let usdc_bal = client.get_escrow_balance(&usdc_id);
+    assert_eq!(usdc_bal.total, 500);
+    assert_eq!(usdc_bal.balances.get(usdc.clone()), Some(500));
+    assert_eq!(usdc_bal.balances.get(xlm.clone()), None);
+
+    // Query by token agrees with the ledger entries.
+    assert_eq!(client.get_escrow_balance_by_token(&xlm_id, &xlm), 100);
+    assert_eq!(client.get_escrow_balance_by_token(&usdc_id, &usdc), 500);
+    assert_eq!(client.get_escrow_balance_by_token(&xlm_id, &usdc), 0);
+    assert_eq!(client.get_escrow_balance_by_token(&usdc_id, &xlm), 0);
+}
+
+#[test]
+fn test_platform_reserves_tracked_per_token() {
+    let (env, contract_id, _oracle, player1, player2, xlm, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let usdc = setup_second_token(&env, &contract_id, &player1, &player2);
+    client.add_token(&usdc, &admin);
+
+    let xlm_id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &Some(xlm.clone()),
+        &String::from_str(&env, "reserve-xlm"),
+        &Platform::Lichess,
+    );
+    let usdc_id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &Some(usdc.clone()),
+        &String::from_str(&env, "reserve-usdc"),
+        &Platform::Lichess,
+    );
+    client.deposit(&xlm_id, &player1);
+    client.deposit(&xlm_id, &player2);
+    client.deposit(&usdc_id, &player1);
+    client.deposit(&usdc_id, &player2);
+
+    // Settling the XLM match must not touch the USDC ledger.
+    client.submit_result(
+        &xlm_id,
+        &String::from_str(&env, "reserve-xlm"),
+        &Winner::Player1,
+        &oracle,
+    );
+    env.ledger().set_sequence_number(env.ledger().sequence() + 17_281);
+    client.finalize_result(&xlm_id, &player1);
+
+    assert_eq!(client.get_escrow_balance(&xlm_id).total, 0);
+    assert_eq!(client.get_escrow_balance(&usdc_id).total, 200);
+    assert_eq!(client.get_escrow_balance_by_token(&usdc_id, &usdc), 200);
+}
+
+#[test]
+fn test_total_balance_sums_across_enabled_tokens() {
+    let (env, contract_id, _oracle, player1, player2, xlm, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let usdc = setup_second_token(&env, &contract_id, &player1, &player2);
+    client.add_token(&usdc, &admin);
+
+    let xlm_id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &Some(xlm.clone()),
+        &String::from_str(&env, "total-xlm"),
+        &Platform::Lichess,
+    );
+    let usdc_id = client.create_match(
+        &player1,
+        &player2,
+        &300,
+        &Some(usdc.clone()),
+        &String::from_str(&env, "total-usdc"),
+        &Platform::Lichess,
+    );
+    client.deposit(&xlm_id, &player1);
+    client.deposit(&usdc_id, &player1);
+    client.deposit(&usdc_id, &player2);
+
+    let total = client.get_total_escrow_balance();
+    assert_eq!(total.balances.get(xlm.clone()), Some(100));
+    assert_eq!(total.balances.get(usdc.clone()), Some(600));
+    assert_eq!(total.total, 700);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #2088 — decimals normalization: 6-, 7-, and 8-decimal tokens,
+// boundary values and round-down behaviour.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_normalize_amount_six_decimals() {
+    let (env, contract_id, ..) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    // 1 unit at 6 decimals == 1_000_000 base units.
+    assert_eq!(client.normalize_amount(&1_000_000, &6), 1_000_000);
+    assert_eq!(client.normalize_amount(&0, &6), 0);
+}
+
+#[test]
+fn test_normalize_amount_seven_decimals_rounds_down() {
+    let (env, contract_id, ..) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    // 1 unit at 7 decimals == 10_000_000 base units; converting to the 6-decimal
+    // common base unit drops the extra digit (round down, never up).
+    assert_eq!(client.normalize_amount(&10_000_000, &7), 1_000_000);
+    assert_eq!(client.normalize_amount(&19_999_999, &7), 1_000_000);
+    assert_eq!(client.normalize_amount(&9, &7), 0);
+}
+
+#[test]
+fn test_normalize_amount_eight_decimals_rounds_down() {
+    let (env, contract_id, ..) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    assert_eq!(client.normalize_amount(&100_000_000, &8), 1_000_000);
+    assert_eq!(client.normalize_amount(&199_999_999, &8), 1_000_000);
+    assert_eq!(client.normalize_amount(&99, &8), 0);
+}
+
+#[test]
+fn test_normalize_amount_boundary_values() {
+    let (env, contract_id, ..) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    // Zero and the smallest representable amounts must not panic or wrap.
+    assert_eq!(client.normalize_amount(&0, &8), 0);
+    assert_eq!(client.normalize_amount(&1, &8), 0);
+    assert_eq!(client.normalize_amount(&1, &6), 1);
+    // i128::MAX at 6 decimals is already the base unit and stays unchanged.
+    assert_eq!(client.normalize_amount(&i128::MAX, &6), i128::MAX);
 }

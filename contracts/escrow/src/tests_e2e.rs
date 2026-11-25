@@ -98,7 +98,9 @@ fn test_e2e_lifecycle_player1_wins() {
     assert!(!m.player1_deposited);
     assert!(!m.player2_deposited);
     assert!(!client.is_funded(&match_id));
-    assert_eq!(client.get_escrow_balance(&match_id), 0u128);
+    let (balances, total) = client.get_escrow_balance(&match_id);
+    assert_eq!(total, 0u128);
+    assert_eq!(balances.get(token.clone()), Some(0u128));
 
     // Balances unchanged after creation
     assert_eq!(token_client.balance(&player1), 1_000);

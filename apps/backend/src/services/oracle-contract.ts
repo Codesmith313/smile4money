@@ -11,6 +11,7 @@ import {
   xdr,
 } from "@stellar/stellar-sdk";
 import type { OracleSubmission } from "./oracle-submit.js";
+import { oracleMetrics, type OracleOperation } from "./oracle-metrics.js";
 
 /** Cryptographic proof accompanying a result submission. */
 export interface OracleResultProof {
@@ -30,94 +31,91 @@ export class OracleContractTransport {
       new Promise<void>((resolve) => setTimeout(resolve, ms)),
   ) {}
 
-  async hasResult(matchId: number): Promise<boolean> {
-    // Read-only simulation needs no funded source account and no private key.
-    const source = new Account(Keypair.random().publicKey(), "0");
-    const transaction = new TransactionBuilder(source, {
-      fee: BASE_FEE,
-      networkPassphrase: this.networkPassphrase,
-    })
-      .addOperation(
-        new Contract(this.contractId).call(
-          "has_result",
-          nativeToScVal(BigInt(matchId), { type: "u64" }),
-        ),
-      )
-      .setTimeout(30)
-      .build();
-    const simulation = await this.server.simulateTransaction(transaction);
-    if (!rpc.Api.isSimulationSuccess(simulation) || !simulation.result) {
-      throw new Error("Oracle result lookup failed");
+  /**
+   * Runs `fn`, timing it and recording the outcome (success or failure) into
+   * the shared oracle metrics aggregator under the given operation type.
+   */
+  private async track<T>(
+    operation: OracleOperation,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const startedAt = Date.now();
+    try {
+      const result = await fn();
+      oracleMetrics.record(operation, Date.now() - startedAt, true);
+      return result;
+    } catch (error) {
+      oracleMetrics.record(operation, Date.now() - startedAt, false);
+      throw error;
     }
-    const exists = scValToNative(simulation.result.retval);
-    if (typeof exists !== "boolean")
-      throw new Error("Oracle result lookup returned an invalid value");
-    return exists;
   }
 
-  async submit(
-    submission: OracleSubmission,
-    signer: Keypair,
-    proof?: OracleResultProof,
-  ): Promise<void> {
-    if (
-      !Number.isSafeInteger(submission.matchId) ||
-      submission.matchId <= 0 ||
-      !["Player1Wins", "Player2Wins", "Draw"].includes(submission.result) ||
-      !/^[A-Za-z0-9_-]{1,64}$/.test(submission.gameId)
-    ) {
-      throw new Error("Invalid oracle submission");
-    }
-    if (proof) {
-      if (
-        !/^[0-9a-fA-F]+$/.test(proof.signature) ||
-        !/^[0-9a-fA-F]+$/.test(proof.hash)
-      ) {
-        throw new Error("Invalid oracle result proof");
+  async hasResult(matchId: number): Promise<boolean> {
+    return this.track("hasResult", async () => {
+      // Read-only simulation needs no funded source account and no private key.
+      const source = new Account(Keypair.random().publicKey(), "0");
+      const transaction = new TransactionBuilder(source, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          new Contract(this.contractId).call(
+            "has_result",
+            nativeToScVal(BigInt(matchId), { type: "u64" }),
+          ),
+        )
+        .setTimeout(30)
+        .build();
+      const simulation = await this.server.simulateTransaction(transaction);
+      if (!rpc.Api.isSimulationSuccess(simulation) || !simulation.result) {
+        throw new Error("Oracle result lookup failed");
       }
-    }
-    const source = await this.server.getAccount(signer.publicKey());
-    const args = [
-      nativeToScVal(BigInt(submission.matchId), { type: "u64" }),
-      nativeToScVal(submission.gameId, { type: "string" }),
-      xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(submission.result)]),
-    ];
-    if (proof) {
-      args.push(
-        xdr.ScVal.scvMap([
-          new xdr.ScMapEntry({
-            key: xdr.ScVal.scvSymbol("signature"),
-            val: nativeToScVal(proof.signature, { type: "string" }),
-          }),
-          new xdr.ScMapEntry({
-            key: xdr.ScVal.scvSymbol("hash"),
-            val: nativeToScVal(proof.hash, { type: "string" }),
-          }),
-        ]),
-      );
-    }
-    const transaction = new TransactionBuilder(source, {
-      fee: BASE_FEE,
-      networkPassphrase: this.networkPassphrase,
-    })
-      .addOperation(
-        new Contract(this.contractId).call("submit_result", ...args),
-      )
-      .setTimeout(60)
-      .build();
-    const prepared = await this.server.prepareTransaction(transaction);
-    prepared.sign(signer);
-    const sent = await this.server.sendTransaction(prepared);
-    if (!["PENDING", "DUPLICATE"].includes(sent.status))
-      throw new Error("Oracle RPC rejected submission");
-    for (let attempt = 0; attempt < 10; attempt++) {
-      const result = await this.server.getTransaction(sent.hash);
-      if (result.status === rpc.Api.GetTransactionStatus.SUCCESS) return;
-      if (result.status === rpc.Api.GetTransactionStatus.FAILED)
-        throw new Error("Oracle transaction failed");
-      await this.wait(1000);
-    }
-    throw new Error("Oracle transaction confirmation pending");
+      const exists = scValToNative(simulation.result.retval);
+      if (typeof exists !== "boolean")
+        throw new Error("Oracle result lookup returned an invalid value");
+      return exists;
+    });
+  }
+
+  async submit(submission: OracleSubmission, signer: Keypair): Promise<void> {
+    return this.track("submit", async () => {
+      if (
+        !Number.isSafeInteger(submission.matchId) ||
+        submission.matchId <= 0 ||
+        !["Player1Wins", "Player2Wins", "Draw"].includes(submission.result) ||
+        !/^[A-Za-z0-9_-]{1,64}$/.test(submission.gameId)
+      ) {
+        throw new Error("Invalid oracle submission");
+      }
+      const source = await this.server.getAccount(signer.publicKey());
+      const transaction = new TransactionBuilder(source, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          new Contract(this.contractId).call(
+            "submit_result",
+            nativeToScVal(BigInt(submission.matchId), { type: "u64" }),
+            nativeToScVal(submission.gameId, { type: "string" }),
+            xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(submission.result)]),
+          ),
+        )
+        .setTimeout(60)
+        .build();
+      const prepared = await this.server.prepareTransaction(transaction);
+      prepared.sign(signer);
+      const sent = await this.server.sendTransaction(prepared);
+      if (!["PENDING", "DUPLICATE"].includes(sent.status))
+        throw new Error("Oracle RPC rejected submission");
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const result = await this.server.getTransaction(sent.hash);
+        if (result.status === rpc.Api.GetTransactionStatus.SUCCESS) return;
+        if (result.status === rpc.Api.GetTransactionStatus.FAILED)
+          throw new Error("Oracle transaction failed");
+        await this.wait(1000);
+      }
+      throw new Error("Oracle transaction confirmation pending");
+    });
   }
 }
 
