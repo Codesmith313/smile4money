@@ -292,6 +292,118 @@ pub struct Match {
     pub completed_ledger: Option<u32>,
 }
 
+/// Administrative roles recognised by the contract.
+///
+/// Access control is role-based: each role is granted a fixed set of
+/// [`Permission`]s, and privileged entry points check that the caller holds
+/// the role required for the operation. Role assignments are stored under
+/// [`DataKey::RoleAssignment`] and are managed exclusively by the
+/// [`Primary`](Role::Primary) admin.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Role {
+    /// The primary administrator.
+    ///
+    /// Holds every permission, including [`Permission::RoleManagement`], and
+    /// is the only role allowed to assign or revoke other roles. There is
+    /// exactly one primary admin, set during
+    /// [`initialize`](crate::EscrowContract::initialize).
+    Primary,
+
+    /// A secondary administrator.
+    ///
+    /// Intended for day-to-day operational tasks. Holds the routine
+    /// permissions (pause/unpause, oracle rotation, token management) but
+    /// cannot manage roles and cannot initiate or confirm an emergency drain.
+    Secondary,
+
+    /// An emergency administrator.
+    ///
+    /// Deliberately minimal: it may only initiate an emergency drain, and even
+    /// then the drain must be confirmed by a second authorised address (see
+    /// [`PendingDrain`]). It cannot pause, rotate the oracle, manage tokens or
+    /// assign roles.
+    Emergency,
+}
+
+/// A single privileged action that can be performed on the contract.
+///
+/// Permissions are scoped to [`Role`]s rather than to individual addresses so
+/// that the policy is auditable in one place. The mapping is:
+///
+/// | Permission        | Primary | Secondary | Emergency |
+/// |-------------------|---------|-----------|-----------|
+/// | `Pause`           | yes     | yes       | no        |
+/// | `Unpause`         | yes     | yes       | no        |
+/// | `DrainInitiate`   | yes     | no        | yes       |
+/// | `DrainConfirm`    | yes     | no        | yes       |
+/// | `OracleRotation`  | yes     | yes       | no        |
+/// | `TokenManagement` | yes     | yes       | no        |
+/// | `RoleManagement`  | yes     | no        | no        |
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Permission {
+    /// Pause the contract, blocking state-changing entry points.
+    Pause,
+
+    /// Resume normal operation after a pause.
+    Unpause,
+
+    /// Start the two-phase emergency drain by recording a [`PendingDrain`].
+    ///
+    /// The drain does not move funds; it only arms the operation. A second
+    /// authorised address must call the confirm step before any transfer
+    /// happens.
+    DrainInitiate,
+
+    /// Confirm a previously initiated emergency drain and execute it.
+    ///
+    /// Must be authorised by a different address from the initiator.
+    DrainConfirm,
+
+    /// Rotate the trusted oracle address.
+    OracleRotation,
+
+    /// Add or remove tokens from the accepted-token allowlist.
+    TokenManagement,
+
+    /// Assign or revoke [`Role`]s. Reserved for the
+    /// [`Primary`](Role::Primary) admin.
+    RoleManagement,
+}
+
+/// A two-phase emergency drain awaiting its second signature.
+///
+/// The first authorised signer calls the initiate step, which stores this
+/// record. A second authorised signer must then call the confirm step before
+/// `expiry_ledger`; the confirm step executes the transfer to the
+/// pre-registered [`DataKey::SafeAddress`] and clears the record. If the
+/// record expires, the drain is discarded and must be re-initiated.
+///
+/// This dual-signature requirement prevents a single compromised key from
+/// draining the contract.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingDrain {
+    /// The address that initiated the drain.
+    ///
+    /// The confirming address must differ from this one, otherwise a single
+    /// key could satisfy both phases.
+    pub initiator: Address,
+
+    /// The amount to drain, in the smallest unit of the token being drained.
+    ///
+    /// Recorded at initiation time so the confirming signer approves an exact
+    /// amount rather than whatever balance happens to be present later.
+    pub amount: i128,
+
+    /// The ledger sequence number after which this pending drain is invalid.
+    ///
+    /// Once `env.ledger().sequence()` exceeds this value the record can no
+    /// longer be confirmed and must be re-initiated.
+    pub expiry_ledger: u32,
+}
+
 /// Storage keys used by the escrow contract.
 ///
 /// All contract state is accessed through these keys. The variants map to
@@ -309,6 +421,8 @@ pub struct Match {
 /// | `DisputeWindowLedgers`     | Instance     | Configurable dispute window duration in ledgers |
 /// | `TimeoutLedgers`           | Instance     | Configurable match timeout duration in ledgers |
 /// | `GameId(String)`           | Persistent   | Deduplication index: game_id → match ID      |
+/// | `RoleAssignment(Role)`     | Instance     | Address holding the given administrative role |
+/// | `PendingDrain`             | Instance     | Armed two-phase emergency drain awaiting confirmation |
 ///
 /// Instance-tier keys share the contract's instance TTL. Persistent-tier keys
 /// have their own TTL extended to `MATCH_TTL_LEDGERS` on every write.
@@ -420,4 +534,19 @@ pub enum DataKey {
     /// [`Error::DuplicateGameId`](crate::errors::Error::DuplicateGameId).
     /// Stored in **persistent** storage with the same TTL as the match.
     GameId(String),
+
+    /// The address currently holding the given administrative [`Role`].
+    ///
+    /// Presence of the key means the role is assigned; absence means it is
+    /// unassigned. Writes are gated on [`Permission::RoleManagement`], which
+    /// only the [`Primary`](Role::Primary) admin holds, so role assignment is
+    /// controlled by the primary admin. Stored in **instance** storage.
+    RoleAssignment(Role),
+
+    /// The armed two-phase emergency drain, if any.
+    ///
+    /// Written by the drain-initiate step and cleared by the drain-confirm
+    /// step (or when the record expires). Its presence means a drain is
+    /// awaiting a second signature. Stored in **instance** storage.
+    PendingDrain,
 }

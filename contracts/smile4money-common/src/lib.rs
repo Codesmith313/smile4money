@@ -38,6 +38,9 @@ use soroban_sdk::contracterror;
 /// | 11   | InvalidGameId      | game_id is empty, exceeds 64 bytes, or contains invalid chars  |
 /// | 15   | TransferFailed     | Token transfer failed                                          |
 /// | 23   | InvalidAdmin       | The admin address is invalid (zero address or same as current) |
+/// | 35   | InsufficientPermission | Caller's role lacks the permission required for this action |
+/// | 40   | TokenNotSep41      | Token does not implement the required SEP-41 interface         |
+/// | 41   | InvalidTokenMetadata | Token metadata is missing or failed validation                |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SharedError {
@@ -59,4 +62,13 @@ pub enum SharedError {
 
     /// [E023] The admin address is invalid (e.g. zero address or same as current admin).
     InvalidAdmin = 23,
+
+    /// [E035] The caller's role does not grant the permission required for this action.
+    InsufficientPermission = 35,
+
+    /// [E040] The token does not implement the required SEP-41 (Stellar Asset Contract) interface.
+    TokenNotSep41 = 40,
+
+    /// [E041] The token metadata is missing or failed validation.
+    InvalidTokenMetadata = 41,
 }

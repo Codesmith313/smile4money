@@ -4910,3 +4910,379 @@ fn result_correction_keeps_original_submission_in_audit_events() {
         Err(Ok(Error::InvalidState))
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #2080 — Role-based access control
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_primary_admin_can_assign_roles() {
+    let (env, contract_id, _oracle, _p1, _p2, _token, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let secondary = Address::generate(&env);
+    let emergency = Address::generate(&env);
+
+    client.assign_role(&admin, &secondary, &AdminRole::Secondary);
+    client.assign_role(&admin, &emergency, &AdminRole::Emergency);
+
+    assert_eq!(client.get_role(&secondary), Some(AdminRole::Secondary));
+    assert_eq!(client.get_role(&emergency), Some(AdminRole::Emergency));
+    assert_eq!(client.get_role(&admin), Some(AdminRole::Primary));
+}
+
+#[test]
+fn test_non_primary_admin_cannot_assign_roles() {
+    let (env, contract_id, _oracle, _p1, _p2, _token, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let secondary = Address::generate(&env);
+    let target = Address::generate(&env);
+    client.assign_role(&admin, &secondary, &AdminRole::Secondary);
+
+    assert_eq!(
+        client.try_assign_role(&secondary, &target, &AdminRole::Emergency),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(client.get_role(&target), None);
+}
+
+#[test]
+fn test_role_permissions_allow_and_deny() {
+    let (env, contract_id, _oracle, _p1, _p2, _token, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let secondary = Address::generate(&env);
+    let emergency = Address::generate(&env);
+    client.assign_role(&admin, &secondary, &AdminRole::Secondary);
+    client.assign_role(&admin, &emergency, &AdminRole::Emergency);
+
+    // Primary may pause, drain and rotate.
+    assert!(client.has_permission(&admin, &Permission::Pause));
+    assert!(client.has_permission(&admin, &Permission::Drain));
+    assert!(client.has_permission(&admin, &Permission::RotateOracle));
+
+    // Secondary may pause and rotate but not drain.
+    assert!(client.has_permission(&secondary, &Permission::Pause));
+    assert!(client.has_permission(&secondary, &Permission::RotateOracle));
+    assert!(!client.has_permission(&secondary, &Permission::Drain));
+
+    // Emergency may only pause.
+    assert!(client.has_permission(&emergency, &Permission::Pause));
+    assert!(!client.has_permission(&emergency, &Permission::Drain));
+    assert!(!client.has_permission(&emergency, &Permission::RotateOracle));
+
+    // Unknown addresses have no permissions.
+    let stranger = Address::generate(&env);
+    assert!(!client.has_permission(&stranger, &Permission::Pause));
+}
+
+#[test]
+fn test_emergency_role_can_pause_but_not_drain_or_rotate() {
+    let (env, contract_id, _oracle, _p1, _p2, _token, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let emergency = Address::generate(&env);
+    client.assign_role(&admin, &emergency, &AdminRole::Emergency);
+
+    // Emergency role may pause.
+    client.pause_as(&emergency);
+    assert!(client.is_paused());
+    client.unpause_as(&emergency);
+    assert!(!client.is_paused());
+
+    // Emergency role may not rotate the oracle.
+    let new_oracle = Address::generate(&env);
+    assert_eq!(
+        client.try_update_oracle_as(&emergency, &new_oracle),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Emergency role may not drain.
+    client.pause();
+    assert_eq!(
+        client.try_emergency_drain(&emergency),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #2082 — Graceful shutdown
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_pause_blocks_create_match_and_deposit() {
+    let (env, contract_id, _oracle, player1, player2, token, _admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &Some(token),
+        &String::from_str(&env, "shutdown_deposit"),
+        &Platform::Lichess,
+    );
+    client.pause();
+
+    assert_eq!(
+        client.try_create_match(
+            &player1,
+            &player2,
+            &100,
+            &Some(token),
+            &String::from_str(&env, "shutdown_new"),
+            &Platform::Lichess,
+        ),
+        Err(Ok(Error::ContractPaused))
+    );
+    assert_eq!(
+        client.try_deposit(&id, &player1),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn test_pause_allows_active_match_to_complete() {
+    let (env, contract_id, oracle, player1, player2, token, _admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let token_client = TokenClient::new(&env, &token);
+
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &Some(token),
+        &String::from_str(&env, "shutdown_complete"),
+        &Platform::Lichess,
+    );
+    client.deposit(&id, &player1);
+    client.deposit(&id, &player2);
+    assert_eq!(client.get_match(&id).state, MatchState::Active);
+
+    client.pause();
+
+    // In-flight match can still be settled.
+    client.submit_result(
+        &id,
+        &String::from_str(&env, "shutdown_complete"),
+        &Winner::Player1,
+        &oracle,
+    );
+    env.ledger().set_sequence_number(
+        env.ledger().sequence() + crate::DISPUTE_WINDOW_LEDGERS + 1,
+    );
+    client.finalize_result(&id, &player1);
+
+    assert_eq!(client.get_match(&id).state, MatchState::Completed);
+    assert_eq!(token_client.balance(&player1), 1100);
+}
+
+#[test]
+fn test_withdraw_rejected_while_paused() {
+    let (env, contract_id, _oracle, player1, player2, token, _admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &Some(token),
+        &String::from_str(&env, "shutdown_withdraw"),
+        &Platform::Lichess,
+    );
+    client.deposit(&id, &player1);
+    client.pause();
+
+    assert_eq!(
+        client.try_withdraw(&id, &player1),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn test_unpause_restores_operations() {
+    let (env, contract_id, _oracle, player1, player2, token, _admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    client.pause();
+    client.unpause();
+    assert!(!client.is_paused());
+
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &Some(token),
+        &String::from_str(&env, "shutdown_resume"),
+        &Platform::Lichess,
+    );
+    client.deposit(&id, &player1);
+    assert_eq!(client.get_escrow_balance(&id), 100);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #2084 — Two-factor approval for emergency drain
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_two_factor_drain_initiate_and_confirm() {
+    let (env, contract_id, _oracle, _p1, _p2, token, admin, safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let token_client = TokenClient::new(&env, &token);
+    let second = Address::generate(&env);
+    client.assign_role(&admin, &second, &AdminRole::Secondary);
+
+    client.pause();
+    let total = token_client.balance(&contract_id);
+
+    client.initiate_drain(&admin);
+    // First signature alone must not move funds.
+    assert_eq!(token_client.balance(&contract_id), total);
+
+    client.confirm_drain(&second);
+    assert_eq!(token_client.balance(&contract_id), 0);
+    assert_eq!(token_client.balance(&safe), total);
+}
+
+#[test]
+fn test_two_factor_drain_same_signer_rejected() {
+    let (env, contract_id, _oracle, _p1, _p2, _token, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    client.pause();
+    client.initiate_drain(&admin);
+    assert_eq!(
+        client.try_confirm_drain(&admin),
+        Err(Ok(Error::SameSignerNotAllowed))
+    );
+}
+
+#[test]
+fn test_two_factor_drain_missing_second_signature_leaves_funds() {
+    let (env, contract_id, _oracle, _p1, _p2, token, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let token_client = TokenClient::new(&env, &token);
+
+    client.pause();
+    let total = token_client.balance(&contract_id);
+    client.initiate_drain(&admin);
+
+    // No confirmation: funds remain in the contract.
+    assert_eq!(token_client.balance(&contract_id), total);
+}
+
+#[test]
+fn test_two_factor_drain_expired_proposal_rejected() {
+    let (env, contract_id, _oracle, _p1, _p2, _token, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let second = Address::generate(&env);
+    client.assign_role(&admin, &second, &AdminRole::Secondary);
+
+    client.pause();
+    client.initiate_drain(&admin);
+    env.ledger().set_sequence_number(
+        env.ledger().sequence() + crate::DRAIN_APPROVAL_WINDOW_LEDGERS + 1,
+    );
+    assert_eq!(
+        client.try_confirm_drain(&second),
+        Err(Ok(Error::DrainApprovalExpired))
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #2085 — SAC token metadata validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_add_token_accepts_compliant_sac() {
+    let (env, contract_id, _oracle, player1, player2, _token, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let usdc = setup_second_token(&env, &contract_id, &player1, &player2);
+
+    client.add_token(&usdc, &admin);
+    assert!(client.is_token_allowlisted(&usdc));
+}
+
+#[test]
+fn test_add_token_rejects_non_sep41_contract() {
+    let (env, contract_id, _oracle, _p1, _p2, _token, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    // A contract that does not implement the SEP-41 interface.
+    let bogus = env.register(DummyContract, ());
+    assert_eq!(
+        client.try_add_token(&bogus, &admin),
+        Err(Ok(Error::TokenNotSep41))
+    );
+    assert!(!client.is_token_allowlisted(&bogus));
+}
+
+#[test]
+fn test_add_token_rejects_invalid_metadata() {
+    let (env, contract_id, _oracle, _p1, _p2, _token, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    // A SEP-41-shaped contract that reports an empty symbol/name.
+    let bad = env.register(BadMetadataToken, ());
+    assert_eq!(
+        client.try_add_token(&bad, &admin),
+        Err(Ok(Error::InvalidTokenMetadata))
+    );
+}
+
+#[test]
+fn test_add_token_emits_validation_event() {
+    let (env, contract_id, _oracle, player1, player2, _token, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let usdc = setup_second_token(&env, &contract_id, &player1, &player2);
+
+    client.add_token(&usdc, &admin);
+
+    let events = env.events().all();
+    let validated = events.iter().find(|(_, t, _)| {
+        t.len() == 2
+            && Symbol::try_from_val(&env, &t.get(0).unwrap()).unwrap()
+                == Symbol::new(&env, "token")
+            && Symbol::try_from_val(&env, &t.get(1).unwrap()).unwrap()
+                == symbol_short!("validat")
+    });
+    assert!(
+        validated.is_some(),
+        "token validation event not found ({} events total)",
+        events.len()
+    );
+}
+
+// Minimal contract used to prove non-SEP-41 tokens are rejected.
+#[contract]
+pub struct DummyContract;
+
+#[contractimpl]
+impl DummyContract {
+    pub fn ping() -> u32 {
+        0
+    }
+}
+
+// SEP-41-shaped contract that returns invalid metadata.
+#[contract]
+pub struct BadMetadataToken;
+
+#[contractimpl]
+impl BadMetadataToken {
+    pub fn name(_env: Env) -> String {
+        String::from_str(&_env, "")
+    }
+    pub fn symbol(_env: Env) -> String {
+        String::from_str(&_env, "")
+    }
+    pub fn decimals(_env: Env) -> u32 {
+        7
+    }
+    pub fn balance(_env: Env, _id: Address) -> i128 {
+        0
+    }
+    pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {}
+    pub fn transfer_from(_env: Env, _spender: Address, _from: Address, _to: Address, _amount: i128) {}
+    pub fn approve(_env: Env, _from: Address, _spender: Address, _amount: i128, _expiration_ledger: u32) {}
+    pub fn allowance(_env: Env, _from: Address, _spender: Address) -> i128 {
+        0
+    }
+}

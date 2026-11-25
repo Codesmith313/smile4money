@@ -72,7 +72,13 @@ use soroban_sdk::{contract, contractimpl, symbol_short, token, vec, Address, Env
 const CONTRACT_PAUSED: Symbol = symbol_short!("paused");
 /// Topic symbol for the event emitted when the contract is unpaused.
 const CONTRACT_UNPAUSED: Symbol = symbol_short!("unpaused");
-use types::{DataKey, Match, MatchState, OptionalWinner, Platform, Winner};
+use types::{AdminRole, DataKey, Match, MatchState, OptionalWinner, PendingDrain, Permission, Platform, Winner};
+
+/// Maximum number of decimals a SEP-41 token may report for it to be accepted.
+const MAX_TOKEN_DECIMALS: u32 = 18;
+
+/// Number of ledgers a pending drain approval remains valid before it expires.
+const DRAIN_APPROVAL_WINDOW_LEDGERS: u32 = 720; // ~1 hour at 5 s/ledger
 
 fn is_zero_address(env: &Env, addr: &Address) -> bool {
     // The all-zeros Stellar account key encodes to this strkey.
@@ -119,43 +125,137 @@ impl EscrowContract {
             .ok_or(Error::NotInitialized)
     }
 
-    /// Pause the contract, blocking state-changing operations.
+    /// Return the role assigned to `account`, or `None` if it holds no role.
+    pub fn get_role(env: Env, account: Address) -> Option<AdminRole> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Role(account))
+    }
+
+    /// Assign `role` to `account`. Only the primary admin may call this.
     ///
-    /// Only the admin may call this. Emits a `ContractPaused` event carrying the
-    /// admin address and the current ledger sequence number so the action can be
-    /// detected and audited on-chain.
-    pub fn pause(env: Env) -> Result<(), Error> {
+    /// The primary admin is the address stored under [`DataKey::Admin`] at
+    /// initialization. It implicitly holds every permission and is the only
+    /// account allowed to grant or revoke roles.
+    pub fn assign_role(
+        env: Env,
+        caller: Address,
+        account: Address,
+        role: AdminRole,
+    ) -> Result<(), Error> {
+        Self::require_primary_admin(&env, &caller)?;
+        caller.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Role(account.clone()), &role);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Role(account.clone()),
+            MATCH_TTL_LEDGERS,
+            MATCH_TTL_LEDGERS,
+        );
+        Self::bump_instance_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "admin"), symbol_short!("role_set")),
+            (account, role),
+        );
+        Ok(())
+    }
+
+    /// Revoke any role held by `account`. Only the primary admin may call this.
+    pub fn revoke_role(env: Env, caller: Address, account: Address) -> Result<(), Error> {
+        Self::require_primary_admin(&env, &caller)?;
+        caller.require_auth();
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Role(account.clone()));
+        Self::bump_instance_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "admin"), symbol_short!("role_rev")),
+            account,
+        );
+        Ok(())
+    }
+
+    /// Ensure `caller` is the primary admin (the address stored under `DataKey::Admin`).
+    fn require_primary_admin(env: &Env, caller: &Address) -> Result<(), Error> {
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
+        if caller != &admin {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+
+    /// Ensure `caller` holds `permission`, either directly via its assigned role
+    /// or implicitly as the primary admin.
+    fn require_permission(
+        env: &Env,
+        caller: &Address,
+        permission: Permission,
+    ) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if caller == &admin {
+            return Ok(());
+        }
+        let role: AdminRole = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Role(caller.clone()))
+            .ok_or(Error::Unauthorized)?;
+        if role.has_permission(permission) {
+            Ok(())
+        } else {
+            Err(Error::Unauthorized)
+        }
+    }
+
+    /// Pause the contract, blocking new match creation and deposits while
+    /// allowing in-flight matches to settle.
+    ///
+    /// Requires [`Permission::Pause`]. Emits a `ContractPaused` event carrying the
+    /// admin address and the current ledger sequence number so the action can be
+    /// detected and audited on-chain.
+    pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_permission(&env, &caller, Permission::Pause)?;
+        caller.require_auth();
+        if Self::is_paused(&env) {
+            return Ok(());
+        }
         env.storage().instance().set(&DataKey::Paused, &true);
         Self::bump_instance_ttl(&env);
         env.events().publish(
-            (CONTRACT_PAUSED, admin.clone()),
+            (CONTRACT_PAUSED, caller.clone()),
             env.ledger().sequence(),
         );
         Ok(())
     }
 
-    /// Unpause the contract, re-enabling state-changing operations.
+    /// Unpause the contract, re-enabling normal operation.
     ///
-    /// Only the admin may call this. Emits a `ContractUnpaused` event carrying the
-    /// admin address and the current ledger sequence number so the action can be
-    /// detected and audited on-chain.
-    pub fn unpause(env: Env) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
+    /// Requires [`Permission::Unpause`]. Emits a `ContractUnpaused` event carrying
+    /// the admin address and the current ledger sequence number so the action can
+    /// be detected and audited on-chain.
+    pub fn unpause(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_permission(&env, &caller, Permission::Unpause)?;
+        caller.require_auth();
+        if !Self::is_paused(&env) {
+            return Ok(());
+        }
         env.storage().instance().set(&DataKey::Paused, &false);
         Self::bump_instance_ttl(&env);
         env.events().publish(
-            (CONTRACT_UNPAUSED, admin.clone()),
+            (CONTRACT_UNPAUSED, caller.clone()),
             env.ledger().sequence(),
         );
         Ok(())
@@ -357,14 +457,10 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Rotate the oracle address — requires the current admin to authorize.
-    pub fn update_oracle(env: Env, new_oracle: Address) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::Unauthorized)?;
-        admin.require_auth();
+    /// Rotate the oracle address — requires [`Permission::OracleRotation`].
+    pub fn update_oracle(env: Env, caller: Address, new_oracle: Address) -> Result<(), Error> {
+        Self::require_permission(&env, &caller, Permission::OracleRotation)?;
+        caller.require_auth();
         let old_oracle: Address = env
             .storage()
             .instance()
@@ -377,7 +473,7 @@ impl EscrowContract {
                 Symbol::new(&env, "admin"),
                 Symbol::new(&env, "oracle_updated"),
             ),
-            (old_oracle, new_oracle, admin),
+            (old_oracle, new_oracle, caller),
         );
         Ok(())
     }
@@ -408,47 +504,10 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Pause the contract — admin only. Blocks create_match, deposit, and submit_result.
-    pub fn pause(env: Env) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::Unauthorized)?;
-        admin.require_auth();
-        if Self::is_paused(env.clone()) {
-            return Ok(());
-        }
-        env.storage().instance().set(&DataKey::Paused, &true);
-        Self::bump_instance_ttl(&env);
-        env.events().publish(
-            (Symbol::new(&env, "admin"), symbol_short!("paused")),
-            (admin, env.ledger().sequence()),
-        );
-        Ok(())
-    }
-
-    /// Unpause the contract — admin only.
-    pub fn unpause(env: Env) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::Unauthorized)?;
-        admin.require_auth();
-        if !Self::is_paused(env.clone()) {
-            return Ok(());
-        }
-        env.storage().instance().set(&DataKey::Paused, &false);
-        Self::bump_instance_ttl(&env);
-        env.events().publish(
-            (Symbol::new(&env, "admin"), symbol_short!("unpaused")),
-            (admin, env.ledger().sequence()),
-        );
-        Ok(())
-    }
-
     /// Create a new match. Both players must call `deposit` before the game starts.
+    ///
+    /// Rejected with [`Error::ContractPaused`] while the contract is paused, so
+    /// no new matches can be created during maintenance or an emergency.
     ///
     /// `token` selects which SEP-41 token this match is escrowed in. Passing
     /// `None` uses the contract's default token (the one supplied to
@@ -723,6 +782,9 @@ impl EscrowContract {
     ///
     /// `game_id` must match the game_id stored in the match to prevent cross-match
     /// result injection.
+    ///
+    /// Settlement is intentionally **not** blocked while the contract is paused:
+    /// in-flight matches must be able to complete during a graceful shutdown.
     pub fn submit_result(
         env: Env,
         match_id: u64,
@@ -730,10 +792,6 @@ impl EscrowContract {
         winner: Winner,
         caller: Address,
     ) -> Result<(), Error> {
-        if Self::is_paused(&env) {
-            return Err(Error::ContractPaused);
-        }
-
         let oracle: Address = env
             .storage()
             .instance()
@@ -1142,34 +1200,32 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Drain all token holdings to the pre-registered safe address — admin only,
-    /// requires contract to be paused.
+    /// First phase of the two-factor emergency drain.
+    ///
+    /// Requires [`Permission::DrainInitiate`] and a paused contract. Records a
+    /// [`PendingDrain`] under [`DataKey::PendingDrain`] that must be confirmed by
+    /// a *different* authorized address via [`confirm_drain`](EscrowContract::confirm_drain)
+    /// before any funds move. This prevents a single compromised key from draining
+    /// the contract.
     ///
     /// The destination is fixed at initialization time via the `safe_address`
     /// parameter of [`initialize`](EscrowContract::initialize) and stored under
-    /// [`DataKey::SafeAddress`]. The `to` parameter has been intentionally removed:
-    /// accepting an arbitrary destination address would allow a compromised or
-    /// malicious admin to redirect the drain to any address, constituting a
-    /// rug-pull vector against all players with funds in escrow.
+    /// [`DataKey::SafeAddress`]; the drain can never be redirected elsewhere.
     ///
     /// # Errors
     ///
-    /// * [`Error::Unauthorized`] — `caller` is not the admin.
+    /// * [`Error::Unauthorized`] — `caller` lacks [`Permission::DrainInitiate`].
     /// * [`Error::NotPaused`]    — the contract is not currently paused.
-    pub fn emergency_drain(env: Env, caller: Address) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::Unauthorized)?;
-
-        if caller != admin {
-            return Err(Error::Unauthorized);
-        }
+    /// * [`Error::ActiveMatchExists`] — an active match still holds escrowed funds.
+    pub fn initiate_drain(env: Env, caller: Address, amount: i128) -> Result<(), Error> {
+        Self::require_permission(&env, &caller, Permission::DrainInitiate)?;
         caller.require_auth();
 
         if !Self::is_paused(&env) {
             return Err(Error::NotPaused);
+        }
+        if amount <= 0 {
+            return Err(Error::InvalidStakeAmount);
         }
 
         // Safety guard: block the drain when any match is currently `Active`
@@ -1177,7 +1233,7 @@ impl EscrowContract {
         // while funds are locked for active matches would silently steal player
         // stakes. The admin must wait for every active match to reach a terminal
         // state — `Completed` (payout done) or `Cancelled` (funds refunded) —
-        // before calling emergency_drain. (#8)
+        // before initiating a drain. (#8)
         let match_count = Self::get_match_count(&env);
         let mut i: u64 = 0;
         while i < match_count {
@@ -1191,6 +1247,58 @@ impl EscrowContract {
                 }
             }
             i += 1;
+        }
+
+        let expires_at = env
+            .ledger()
+            .sequence()
+            .saturating_add(DRAIN_APPROVAL_WINDOW_LEDGERS);
+        let pending = PendingDrain {
+            initiator: caller.clone(),
+            amount,
+            expires_at,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingDrain, &pending);
+        Self::bump_instance_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "admin"), symbol_short!("drn_init")),
+            (caller, amount, expires_at),
+        );
+        Ok(())
+    }
+
+    /// Second phase of the two-factor emergency drain.
+    ///
+    /// Requires [`Permission::DrainConfirm`] and must be called by an address
+    /// **different** from the initiator. Verifies the pending approval has not
+    /// expired, transfers the approved amount to the pre-registered safe address,
+    /// and clears the pending entry.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Unauthorized`] — `caller` lacks [`Permission::DrainConfirm`] or
+    ///   is the same address that initiated the drain.
+    /// * [`Error::NoPendingDrain`] — no drain is awaiting confirmation.
+    /// * [`Error::DrainApprovalExpired`] — the approval window has elapsed.
+    pub fn confirm_drain(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_permission(&env, &caller, Permission::DrainConfirm)?;
+        caller.require_auth();
+
+        let pending: PendingDrain = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingDrain)
+            .ok_or(Error::NoPendingDrain)?;
+
+        if caller == pending.initiator {
+            return Err(Error::Unauthorized);
+        }
+        if env.ledger().sequence() > pending.expires_at {
+            env.storage().instance().remove(&DataKey::PendingDrain);
+            return Err(Error::DrainApprovalExpired);
         }
 
         let safe_address: Address = env
@@ -1208,23 +1316,58 @@ impl EscrowContract {
         let client = token::Client::new(&env, &token);
         let contract = env.current_contract_address();
         let balance = client.balance(&contract);
-
-        if balance > 0 {
-            client.transfer(&contract, &safe_address, &balance);
-            env.events().publish(
-                (Symbol::new(&env, "admin"), symbol_short!("drain")),
-                (balance, safe_address, admin),
-            );
+        let amount = if pending.amount > balance {
+            balance
         } else {
-            // Preserve the audit trail even when there are no funds to drain.
-            // A silent success with no event would complicate post-mortems.
-            env.events().publish(
-                (Symbol::new(&env, "admin"), symbol_short!("drn_noop")),
-                (0i128, safe_address, admin),
-            );
+            pending.amount
+        };
+
+        if amount > 0 {
+            client.transfer(&contract, &safe_address, &amount);
         }
+        env.events().publish(
+            (Symbol::new(&env, "admin"), symbol_short!("drain")),
+            (amount, safe_address, pending.initiator, caller),
+        );
+
+        env.storage().instance().remove(&DataKey::PendingDrain);
         Self::bump_instance_ttl(&env);
 
+        Ok(())
+    }
+
+    /// Validate that `token` implements the SEP-41 interface and has sane metadata.
+    ///
+    /// Constructs a token client and probes `decimals`, `name`, `symbol`, and
+    /// `balance`. A token that does not implement SEP-41 will fail one of these
+    /// calls. Metadata is validated: `decimals` must not exceed
+    /// [`MAX_TOKEN_DECIMALS`], and `name`/`symbol` must be non-empty.
+    ///
+    /// Emits a `token_validated` event carrying the token address and a success
+    /// flag so the outcome is logged on-chain.
+    fn validate_token(env: &Env, token: &Address) -> Result<(), Error> {
+        let client = token::Client::new(env, token);
+        let contract = env.current_contract_address();
+
+        let decimals = client.try_decimals().map_err(|_| Error::TokenNotSep41)?;
+        let decimals = decimals.map_err(|_| Error::TokenNotSep41)?;
+        let name = client.try_name().map_err(|_| Error::TokenNotSep41)?;
+        let name = name.map_err(|_| Error::TokenNotSep41)?;
+        let symbol = client.try_symbol().map_err(|_| Error::TokenNotSep41)?;
+        let symbol = symbol.map_err(|_| Error::TokenNotSep41)?;
+        let _ = client
+            .try_balance(&contract)
+            .map_err(|_| Error::TokenNotSep41)?
+            .map_err(|_| Error::TokenNotSep41)?;
+
+        let valid = decimals <= MAX_TOKEN_DECIMALS && name.len() > 0 && symbol.len() > 0;
+        env.events().publish(
+            (Symbol::new(env, "token"), symbol_short!("validated")),
+            (token.clone(), valid),
+        );
+        if !valid {
+            return Err(Error::InvalidTokenMetadata);
+        }
         Ok(())
     }
 

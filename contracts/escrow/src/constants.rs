@@ -83,3 +83,24 @@ pub const INSTANCE_BUMP_AMOUNT: u32 = MATCH_TTL_LEDGERS;
 /// the real XLM minimum is provided by a separate admin-funded native top-up
 /// (see `docs/deployment.md`).
 pub const ESCROW_RESERVE_BUFFER_STROOPS: i128 = 15_000_000;
+
+/// Number of ledgers a pending emergency-drain proposal stays open awaiting its
+/// second signature (24 hours).
+///
+/// **Source:** policy decided by this repository for the two-factor drain
+/// approval flow (issue #2084). A drain must be initiated by one authorized
+/// signer and confirmed by a second authorized signer within this window;
+/// otherwise the proposal expires and must be re-initiated. Bounding the window
+/// limits how long a single compromised key can leave a drain pending.
+///
+/// `LEDGERS_PER_DAY` ledgers = 24 h at the Stellar 5 s/ledger average.
+pub const DRAIN_APPROVAL_WINDOW_LEDGERS: u32 = LEDGERS_PER_DAY;
+
+/// Maximum number of decimals accepted when validating SEP-41 token metadata.
+///
+/// **Source:** policy decided by this repository for SAC token metadata
+/// validation (issue #2085). `decimals` is a `u32` in the SEP-41 interface, but
+/// values beyond 18 are not meaningful for any real asset and would make
+/// amount scaling overflow-prone, so tokens reporting more are rejected at
+/// registration time.
+pub const MAX_TOKEN_DECIMALS: u32 = 18;
