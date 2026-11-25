@@ -13,12 +13,98 @@ import { getCachedProviderGameResult } from './game-validation-cache.js';
 import type { MatchRecord } from '../store/match-store.js';
 import type { MatchStorePort, MatchStatistics } from '../store/match-store.js';
 import { errorToHttpStatus, ValidationError, ConflictError } from '../errors/errorToHttpStatus.js';
+import { logger } from '../utils/logger.js';
 import { isMatchState } from '../types/match-state.js';
 
 // Mirrors contracts/escrow/src/constants.rs and contracts/smile4money-common.
 export const MIN_STAKE = 1;
 export const MAX_STAKE = 10_000_000_000_000;
 export const MAX_GAME_ID_LEN = 64;
+
+/**
+ * Default dispute window (in seconds) after a result is submitted during which
+ * players may challenge the result. Overridable via the
+ * `DISPUTE_WINDOW_SECONDS` environment variable.
+ */
+export const DEFAULT_DISPUTE_WINDOW_SECONDS = 3600;
+
+/**
+ * Resolve the configured dispute window duration in seconds.
+ *
+ * Reads `DISPUTE_WINDOW_SECONDS` from the environment, falling back to
+ * {@link DEFAULT_DISPUTE_WINDOW_SECONDS} when unset or invalid.
+ */
+export function getDisputeWindowSeconds(): number {
+  const raw = process.env.DISPUTE_WINDOW_SECONDS;
+  if (raw === undefined || raw.trim() === '') {
+    return DEFAULT_DISPUTE_WINDOW_SECONDS;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 0) {
+    logger.warn(
+      { raw },
+      'Invalid DISPUTE_WINDOW_SECONDS; falling back to default dispute window',
+    );
+    return DEFAULT_DISPUTE_WINDOW_SECONDS;
+  }
+  return parsed;
+}
+
+/**
+ * Compute the dispute deadline (ISO timestamp) from a result submission time.
+ */
+export function computeDisputeDeadline(
+  resultSubmittedAt: Date,
+  windowSeconds: number = getDisputeWindowSeconds(),
+): string {
+  return new Date(resultSubmittedAt.getTime() + windowSeconds * 1000).toISOString();
+}
+
+/**
+ * Determine whether the dispute window for a match is still open.
+ *
+ * A match with no recorded result submission has no active dispute window.
+ * Returns `true` when `now` is at or before the dispute deadline.
+ */
+export function isDisputeWindowOpen(
+  match: Pick<MatchRecord, 'resultSubmittedAt' | 'disputeDeadline'>,
+  now: Date = new Date(),
+): boolean {
+  if (!match.resultSubmittedAt || !match.disputeDeadline) {
+    return false;
+  }
+  const deadline = new Date(match.disputeDeadline).getTime();
+  if (Number.isNaN(deadline)) {
+    return false;
+  }
+  return now.getTime() <= deadline;
+}
+
+/**
+ * Record the result submission time on a match and derive its dispute
+ * deadline from the configured dispute window.
+ *
+ * Logs the window opening event so operators can audit dispute timing.
+ */
+export async function recordResultSubmission(
+  store: MatchStorePort,
+  matchId: string,
+  submittedAt: Date = new Date(),
+): Promise<MatchRecord> {
+  const windowSeconds = getDisputeWindowSeconds();
+  const disputeDeadline = computeDisputeDeadline(submittedAt, windowSeconds);
+  const match = await store.recordResultSubmission(matchId, submittedAt, disputeDeadline);
+  logger.info(
+    {
+      matchId,
+      resultSubmittedAt: submittedAt.toISOString(),
+      disputeDeadline,
+      disputeWindowSeconds: windowSeconds,
+    },
+    'Dispute window opened for match result submission',
+  );
+  return match;
+}
 
 // Pagination defaults and bounds for match history queries.
 export const DEFAULT_MATCH_PAGE_SIZE = 20;
@@ -212,6 +298,53 @@ export interface CreateMatchInput {
 export type CreateMatchSuccess = { ok: true; match: MatchRecord };
 export type CreateMatchFailure = { ok: false; status: number; error: string; details?: string };
 export type CreateMatchResult = CreateMatchSuccess | CreateMatchFailure;
+
+export type DisputeCheckSuccess = { ok: true };
+export type DisputeCheckFailure = { ok: false; status: number; error: string };
+export type DisputeCheckResult = DisputeCheckSuccess | DisputeCheckFailure;
+
+/**
+ * Verify that a dispute may be filed for the given match, enforcing the
+ * dispute window that starts when the result was submitted.
+ *
+ * Returns `{ ok: true }` when the window is open, otherwise a failure with an
+ * HTTP status and error message. Window rejection events are logged.
+ */
+export function checkDisputeWindow(
+  match: MatchRecord,
+  now: Date = new Date(),
+): DisputeCheckResult {
+  if (!match.resultSubmittedAt || !match.disputeDeadline) {
+    logger.warn(
+      { matchId: match.id },
+      'Dispute rejected: result has not been submitted yet',
+    );
+    return {
+      ok: false,
+      status: errorToHttpStatus(new ConflictError('result not submitted')),
+      error: 'result has not been submitted yet',
+    };
+  }
+
+  if (!isDisputeWindowOpen(match, now)) {
+    logger.warn(
+      {
+        matchId: match.id,
+        resultSubmittedAt: match.resultSubmittedAt,
+        disputeDeadline: match.disputeDeadline,
+        now: now.toISOString(),
+      },
+      'Dispute rejected: dispute window has closed',
+    );
+    return {
+      ok: false,
+      status: errorToHttpStatus(new ConflictError('dispute window closed')),
+      error: 'dispute window has closed',
+    };
+  }
+
+  return { ok: true };
+}
 
 /**
  * Categorised reasons a match can be cancelled.
@@ -412,6 +545,20 @@ export async function createMatchForPlayer(
     }
     return { ok: false, status: errorToHttpStatus(error), error: message };
   }
+}
+
+/**
+ * Submit a match result and open the dispute window.
+ *
+ * Records the submission time and computes the dispute deadline from the
+ * configured window duration. Logs the window opening event.
+ */
+export async function submitMatchResult(
+  store: MatchStorePort,
+  matchId: string,
+  submittedAt: Date = new Date(),
+): Promise<MatchRecord> {
+  return recordResultSubmission(store, matchId, submittedAt);
 }
 
 /**

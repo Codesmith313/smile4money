@@ -9,6 +9,7 @@ import {
   ProviderFetchError,
   providerGet,
 } from './provider-validation.js';
+import { logProviderRequest } from '../logging/provider-request-logger.js';
 
 /** Maps to the on-chain MatchResult enum. */
 export type MatchResult = 'Player1Wins' | 'Player2Wins' | 'Draw';
@@ -96,13 +97,42 @@ export async function fetchLichessResult(gameId: string): Promise<NormalizedGame
   const url = `https://lichess.org/game/export/${encodeURIComponent(gameId)}`;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const response = await providerGet(url, {
+    const requestOptions = {
       headers: {
         Accept: 'application/json',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
       timeout: 10_000,
-      validateStatus: (s) => s < 500,
+      validateStatus: (s: number) => s < 500,
+    };
+
+    const startedAt = Date.now();
+    let response: Awaited<ReturnType<typeof providerGet>>;
+    try {
+      response = await providerGet(url, requestOptions);
+    } catch (err) {
+      logProviderRequest({
+        provider: 'lichess',
+        method: 'GET',
+        url,
+        requestHeaders: requestOptions.headers,
+        requestParams: { gameId, attempt },
+        durationMs: Date.now() - startedAt,
+        error: err,
+      });
+      throw err;
+    }
+
+    logProviderRequest({
+      provider: 'lichess',
+      method: 'GET',
+      url,
+      requestHeaders: requestOptions.headers,
+      requestParams: { gameId, attempt },
+      status: response.status,
+      responseHeaders: response.headers,
+      responseBody: response.data,
+      durationMs: Date.now() - startedAt,
     });
 
     if (response.status === 429) {

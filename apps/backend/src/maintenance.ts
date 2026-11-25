@@ -16,6 +16,7 @@ import type { DlqEntry } from './store/persistent-queue-store.js';
 import { startStorageCapacityMonitor, type CapacityLogger } from './store/storage-capacity.js';
 import { startQueueStallDetector, type QueueStallDetectorOptions } from './store/queue-stall.js';
 import { startIntegrityCheckJob } from './store/integrity-check.js';
+import { startProviderLogRotation } from './store/provider-log-rotation.js';
 
 export interface MaintenanceOptions {
   logger: CapacityLogger;
@@ -29,10 +30,19 @@ export interface MaintenanceOptions {
   retentionDays?: number;
   /** Archive job interval in ms. Defaults to ARCHIVE_INTERVAL_MS or 24h. */
   archiveIntervalMs?: number;
+  /** Provider request log retention in days. Defaults to PROVIDER_LOG_RETENTION_DAYS or 14. */
+  providerLogRetentionDays?: number;
+  /** Provider request log max size in MB before rotation. Defaults to PROVIDER_LOG_MAX_SIZE_MB or 50. */
+  providerLogMaxSizeMb?: number;
+  /** Provider request log rotation check interval in ms. Defaults to PROVIDER_LOG_ROTATE_INTERVAL_MS or 1h. */
+  providerLogRotateIntervalMs?: number;
 }
 
 const DEFAULT_RETENTION_DAYS = 30;
 const DEFAULT_ARCHIVE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_PROVIDER_LOG_RETENTION_DAYS = 14;
+const DEFAULT_PROVIDER_LOG_MAX_SIZE_MB = 50;
+const DEFAULT_PROVIDER_LOG_ROTATE_INTERVAL_MS = 60 * 60 * 1000;
 
 function envNumber(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -53,6 +63,21 @@ export function resolveArchivalOptions(options: MaintenanceOptions): ArchivalOpt
 
 /** Query archived records separately from live data. */
 export { queryArchived };
+
+/** Resolve provider request log rotation settings from options, env vars and defaults. */
+export function resolveProviderLogOptions(options: MaintenanceOptions): ProviderLogOptions {
+  return {
+    retentionDays:
+      options.providerLogRetentionDays ??
+      envNumber('PROVIDER_LOG_RETENTION_DAYS', DEFAULT_PROVIDER_LOG_RETENTION_DAYS),
+    maxSizeMb:
+      options.providerLogMaxSizeMb ??
+      envNumber('PROVIDER_LOG_MAX_SIZE_MB', DEFAULT_PROVIDER_LOG_MAX_SIZE_MB),
+    intervalMs:
+      options.providerLogRotateIntervalMs ??
+      envNumber('PROVIDER_LOG_ROTATE_INTERVAL_MS', DEFAULT_PROVIDER_LOG_ROTATE_INTERVAL_MS),
+  };
+}
 
 /** All SQLite databases in the queue database's directory. */
 export function listDatabases(dir: string): string[] {
@@ -119,6 +144,10 @@ export function installMaintenance(options: MaintenanceOptions): () => void {
   const stopStallDetector = startQueueStallDetector({
     logger: options.logger,
     ...options.stall,
+  });
+  const stopProviderLogRotation = startProviderLogRotation({
+    logger: options.logger,
+    ...resolveProviderLogOptions(options),
   });
   const archival = resolveArchivalOptions(options);
   let archiving = false;
@@ -191,6 +220,7 @@ export function installMaintenance(options: MaintenanceOptions): () => void {
     stopMonitor();
     stopStallDetector();
     stopIntegrityCheck();
+    stopProviderLogRotation();
     process.off(signal, onSignal);
   };
 }

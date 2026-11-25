@@ -60,6 +60,18 @@ const DEFAULT_SQLITE_POOL_IDLE_TIMEOUT_MS = 30 * 1000;
 const DEFAULT_SESSION_TTL_MS = 60 * 60 * 1000;
 
 /**
+ * Default grace period (seconds) during which old API credentials remain
+ * valid after a rotation (#2112). Defaults to 24 hours.
+ */
+const DEFAULT_CREDENTIAL_ROTATION_GRACE_SECONDS = 86_400;
+
+/**
+ * Default dispute window (seconds) after result submission during which a
+ * result may be disputed (#2115). Defaults to 1 hour.
+ */
+const DEFAULT_DISPUTE_WINDOW_SECONDS = 3_600;
+
+/**
  * Reads an optional string environment variable, falling back to a default.
  */
 function parseString(name: string, defaultValue: string): string {

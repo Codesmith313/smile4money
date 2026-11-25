@@ -12,6 +12,9 @@ import {
   validateGameExists,
   getGameResultWithPlayerIdentities,
   createMatchForPlayer,
+  submitResultForMatch,
+  isDisputeWindowOpen,
+  DISPUTE_WINDOW_SECONDS,
 } from '../../src/services/match-service.js';
 import { validateGame } from '../../src/services/validate-game-service.js';
 import {
@@ -397,5 +400,91 @@ describe('createMatchForPlayer', () => {
       expect(result.status).toBe(409);
       expect(result.error).toBe('duplicate gameId');
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// dispute window tracking
+// ---------------------------------------------------------------------------
+describe('dispute window', () => {
+  const PLAYER1 = 'GPLAYER1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+  const PLAYER2 = 'GPLAYER2BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
+
+  let store: MatchStore;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearGameValidationCache();
+    store = new MatchStore();
+  });
+
+  async function createPendingMatch(): Promise<string> {
+    mockFetchLichess.mockResolvedValue(LICHESS_GAME);
+    const created = await createMatchForPlayer(store, PLAYER1, {
+      player2: PLAYER2,
+      stakeAmount: 100,
+      token: 'XLM',
+      gameId: 'game-abc',
+      platform: 'lichess',
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error('match creation failed');
+    return created.match.id;
+  }
+
+  it('exposes a configurable dispute window duration', () => {
+    expect(typeof DISPUTE_WINDOW_SECONDS).toBe('number');
+    expect(DISPUTE_WINDOW_SECONDS).toBeGreaterThan(0);
+  });
+
+  it('records resultSubmittedAt and disputeDeadline on result submission', async () => {
+    const matchId = await createPendingMatch();
+    const before = Date.now();
+
+    const result = await submitResultForMatch(store, matchId, 'Player1Wins');
+    expect(result.ok).toBe(true);
+
+    const match = store.getMatch(matchId);
+    expect(match).toBeDefined();
+    expect(match!.resultSubmittedAt).toBeInstanceOf(Date);
+    expect(match!.disputeDeadline).toBeInstanceOf(Date);
+
+    const submittedAt = match!.resultSubmittedAt!.getTime();
+    const deadline = match!.disputeDeadline!.getTime();
+    expect(submittedAt).toBeGreaterThanOrEqual(before);
+    expect(deadline - submittedAt).toBe(DISPUTE_WINDOW_SECONDS * 1000);
+  });
+
+  it('treats the window as open immediately after result submission', async () => {
+    const matchId = await createPendingMatch();
+    await submitResultForMatch(store, matchId, 'Player1Wins');
+
+    const match = store.getMatch(matchId)!;
+    expect(isDisputeWindowOpen(match)).toBe(true);
+  });
+
+  it('rejects disputes once the window has elapsed', async () => {
+    const matchId = await createPendingMatch();
+    await submitResultForMatch(store, matchId, 'Player1Wins');
+
+    const match = store.getMatch(matchId)!;
+    const afterWindow = new Date(
+      match.disputeDeadline!.getTime() + 1,
+    );
+    expect(isDisputeWindowOpen(match, afterWindow)).toBe(false);
+  });
+
+  it('keeps the window open exactly at the deadline boundary', async () => {
+    const matchId = await createPendingMatch();
+    await submitResultForMatch(store, matchId, 'Player1Wins');
+
+    const match = store.getMatch(matchId)!;
+    expect(isDisputeWindowOpen(match, match.disputeDeadline!)).toBe(true);
+  });
+
+  it('treats the window as closed before any result is submitted', async () => {
+    const matchId = await createPendingMatch();
+    const match = store.getMatch(matchId)!;
+    expect(isDisputeWindowOpen(match)).toBe(false);
   });
 });

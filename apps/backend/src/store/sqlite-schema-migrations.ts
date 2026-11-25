@@ -225,6 +225,27 @@ export const SQLITE_SCHEMA_MIGRATIONS: Record<string, SqliteMigration[]> = {
       down: ["DROP TABLE IF EXISTS sponsorships"],
     },
   ],
+  credentials: [
+    {
+      version: 1,
+      name: "create-api-credentials",
+      statements: [
+        `CREATE TABLE IF NOT EXISTS api_credentials (
+          id TEXT PRIMARY KEY NOT NULL,
+          name TEXT NOT NULL,
+          hashed_secret TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'active',
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER
+        )`,
+        "CREATE INDEX IF NOT EXISTS idx_api_credentials_status_expires_at ON api_credentials(status, expires_at)",
+      ],
+      down: [
+        "DROP INDEX IF EXISTS idx_api_credentials_status_expires_at",
+        "DROP TABLE IF EXISTS api_credentials",
+      ],
+    },
+  ],
   sessions: [
     {
       version: 1,

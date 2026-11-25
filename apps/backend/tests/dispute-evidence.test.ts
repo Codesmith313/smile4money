@@ -7,6 +7,14 @@ import {
 } from "../src/services/dispute-evidence.js";
 import type { MatchRecord } from "../src/store/match-store.js";
 import type { DlqEntry } from "../src/store/persistent-queue-store.js";
+import {
+  DisputeWindowError,
+  isWithinDisputeWindow,
+  openDisputeWindow,
+  resolveDisputeWindow,
+  type DisputeWindowConfig,
+  type DisputeWindowEvent,
+} from "../src/services/dispute-window.js";
 
 /** Dispute evidence bundle: contents, privacy and refusal to leak secrets (issue #116). */
 
@@ -227,6 +235,68 @@ describe("buildEvidenceBundle", () => {
         deps({ listDlqEntries: async () => [leaking] }),
       ),
     ).rejects.toThrow(/Stellar secret seed/);
+  });
+});
+
+describe("dispute window", () => {
+  const SUBMITTED_AT = new Date("2026-02-01T00:00:00Z");
+  const config = (overrides: Partial<DisputeWindowConfig> = {}) =>
+    ({ durationMs: 60 * 60 * 1000, ...overrides }) as DisputeWindowConfig;
+
+  const at = (offsetMs: number) => new Date(SUBMITTED_AT.getTime() + offsetMs);
+
+  it("computes the window from result submission using the configured duration", () => {
+    const w = openDisputeWindow(7, SUBMITTED_AT, config());
+    expect(w.matchId).toBe(7);
+    expect(w.openedAt).toBe(SUBMITTED_AT.toISOString());
+    expect(w.closesAt).toBe(at(60 * 60 * 1000).toISOString());
+    expect(w.durationMs).toBe(60 * 60 * 1000);
+  });
+
+  it("honours a configurable duration", () => {
+    const short = openDisputeWindow(7, SUBMITTED_AT, config({ durationMs: 5_000 }));
+    const long = openDisputeWindow(7, SUBMITTED_AT, config({ durationMs: 86_400_000 }));
+    expect(short.closesAt).toBe(at(5_000).toISOString());
+    expect(long.closesAt).toBe(at(86_400_000).toISOString());
+  });
+
+  it("accepts a dispute inside the window", () => {
+    const w = openDisputeWindow(7, SUBMITTED_AT, config());
+    expect(isWithinDisputeWindow(w, at(0))).toBe(true);
+    expect(isWithinDisputeWindow(w, at(59 * 60 * 1000))).toBe(true);
+    expect(isWithinDisputeWindow(w, at(60 * 60 * 1000))).toBe(true);
+  });
+
+  it("rejects a dispute outside the window", () => {
+    const w = openDisputeWindow(7, SUBMITTED_AT, config());
+    expect(isWithinDisputeWindow(w, at(60 * 60 * 1000 + 1))).toBe(false);
+    expect(isWithinDisputeWindow(w, at(-1))).toBe(false);
+    expect(() => resolveDisputeWindow(w, at(60 * 60 * 1000 + 1))).toThrow(
+      DisputeWindowError,
+    );
+  });
+
+  it("logs window lifecycle events", () => {
+    const events: DisputeWindowEvent[] = [];
+    const log = (e: DisputeWindowEvent) => events.push(e);
+
+    const w = openDisputeWindow(7, SUBMITTED_AT, config(), log);
+    resolveDisputeWindow(w, at(1_000), log);
+    expect(() => resolveDisputeWindow(w, at(60 * 60 * 1000 + 1), log)).toThrow(
+      DisputeWindowError,
+    );
+
+    expect(events.map((e) => e.type)).toEqual([
+      "dispute_window_opened",
+      "dispute_window_accepted",
+      "dispute_window_rejected",
+    ]);
+    expect(events[0]).toMatchObject({
+      matchId: 7,
+      openedAt: SUBMITTED_AT.toISOString(),
+      closesAt: at(60 * 60 * 1000).toISOString(),
+    });
+    expect(events[2]).toMatchObject({ matchId: 7 });
   });
 });
 

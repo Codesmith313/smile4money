@@ -68,6 +68,14 @@ export interface EvidenceBundle {
     player2: string;
     identityHash: string | null;
   };
+  disputeWindow: {
+    /** When the result was submitted, starting the dispute window (ISO). */
+    resultSubmittedAt: string | null;
+    /** Deadline for filing a dispute (ISO), or null when no window is open. */
+    disputeDeadline: string | null;
+    /** Whether a dispute could still be filed at `generatedAt`. */
+    windowOpen: boolean;
+  };
   provider: {
     gameUrl: string | null;
     lookup:
@@ -232,6 +240,41 @@ export function verifyEvidenceBundle(bundle: EvidenceBundle): void {
 }
 
 /**
+ * Derive the dispute window state from the match record. The window opens when
+ * the result is submitted and lasts `disputeWindowMs`; a missing submission
+ * time or window length means no window is open.
+ */
+function disputeWindowState(
+  match: MatchRecord,
+  nowMs: number,
+): EvidenceBundle["disputeWindow"] {
+  const submittedAt =
+    typeof match.resultSubmittedAt === "number" &&
+    Number.isFinite(match.resultSubmittedAt)
+      ? match.resultSubmittedAt
+      : null;
+  const windowMs =
+    typeof match.disputeWindowMs === "number" &&
+    Number.isFinite(match.disputeWindowMs) &&
+    match.disputeWindowMs > 0
+      ? match.disputeWindowMs
+      : null;
+  if (submittedAt === null || windowMs === null) {
+    return {
+      resultSubmittedAt: iso(submittedAt),
+      disputeDeadline: null,
+      windowOpen: false,
+    };
+  }
+  const deadline = submittedAt + windowMs;
+  return {
+    resultSubmittedAt: iso(submittedAt),
+    disputeDeadline: iso(deadline),
+    windowOpen: nowMs < deadline,
+  };
+}
+
+/**
  * Build the evidence bundle for the match behind `gameId`. When `matchId` is
  * given it must agree with the stored record, so a ticket's two references
  * can't silently point at different matches.
@@ -303,7 +346,7 @@ export async function buildEvidenceBundle(
 
   const body: Omit<EvidenceBundle, "digest" | "hash" | "hashAlgorithm"> = {
     bundleVersion: EVIDENCE_BUNDLE_VERSION,
-    generatedAt: (deps.now?.() ?? new Date()).toISOString(),
+    generatedAt: now.toISOString(),
     match: {
       matchId: match.matchId,
       gameId: match.gameId,
@@ -315,6 +358,7 @@ export async function buildEvidenceBundle(
       player2: match.player2,
       identityHash: match.identityHash ?? null,
     },
+    disputeWindow: disputeWindowState(match, now.getTime()),
     provider: { gameUrl: providerGameUrl(match), lookup },
     oracle: { dlqEntries },
     ledger: {

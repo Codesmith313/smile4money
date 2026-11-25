@@ -7,6 +7,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import { requestLogging } from '../../src/middleware/request-logging.js';
+import { sanitizeForLogging } from '../../src/utils/log-sanitizer.js';
 
 function captureConsoleLog(): string[] {
   const lines: string[] = [];
@@ -100,5 +101,68 @@ describe('requestLogging middleware', () => {
 
     const logs = parsedLogs(lines);
     expect(logs.find((l) => l.message === 'http_request_body')).toBeUndefined();
+  });
+});
+
+describe('provider request logging', () => {
+  const originalLogLevel = process.env.LOG_LEVEL;
+  const originalNodeEnv = process.env.NODE_ENV;
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    if (originalLogLevel === undefined) delete process.env.LOG_LEVEL;
+    else process.env.LOG_LEVEL = originalLogLevel;
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
+  });
+
+  it('sanitizeForLogging redacts sensitive provider fields', () => {
+    const sanitized = sanitizeForLogging({
+      apiKey: 'sk-live-SECRET',
+      authorization: 'Bearer SECRET',
+      player1: 'GSECRETADDRESS',
+      username: 'alice',
+      gameId: 'game-123',
+      nested: { secret: 'SECRET', value: 42 },
+    }) as Record<string, any>;
+
+    const serialized = JSON.stringify(sanitized);
+    expect(serialized).not.toContain('sk-live-SECRET');
+    expect(serialized).not.toContain('GSECRETADDRESS');
+    expect(serialized).not.toContain('alice');
+    expect(serialized).not.toContain('SECRET');
+    expect(sanitized.gameId).toBe('game-123');
+    expect(sanitized.nested.value).toBe(42);
+  });
+
+  it('provider request logs never leak secrets at INFO level', async () => {
+    process.env.NODE_ENV = 'production';
+    delete process.env.LOG_LEVEL;
+    const lines = captureConsoleLog();
+
+    await request(appWithLogging())
+      .post('/echo')
+      .set('Authorization', 'Bearer SECRET-TOKEN')
+      .send({
+        apiKey: 'sk-live-SECRET',
+        player1: 'GSECRETADDRESS',
+        username: 'alice',
+      });
+
+    const output = lines.join('');
+    expect(output).not.toMatch(/SECRET-TOKEN|sk-live-SECRET|GSECRETADDRESS|alice/);
+  });
+
+  it('emits sanitized bodies only at DEBUG level', async () => {
+    process.env.LOG_LEVEL = 'debug';
+    const lines = captureConsoleLog();
+
+    await request(appWithLogging())
+      .post('/echo')
+      .send({ apiKey: 'sk-live-SECRET', gameId: 'game-123' });
+
+    const output = lines.join('');
+    expect(output).not.toContain('sk-live-SECRET');
+    expect(output).not.toContain('SECRET-TOKEN');
   });
 });

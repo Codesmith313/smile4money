@@ -214,3 +214,134 @@ describe('POST /api/oracle/submit-result — matchId validation', () => {
     expect(countSpy).not.toHaveBeenCalled();
   });
 });
+
+// #2115 — dispute window enforcement. Submitting a result opens a dispute
+// window; challenges are only accepted while that window is open.
+describe('POST /api/oracle/submit-result — dispute window', () => {
+  const seedMatch = async () =>
+    matchStore.createMatch({
+      player1: 'GPLAYER1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      player2: 'GPLAYER2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      player1Username: 'alice',
+      player2Username: 'bob',
+      stakeAmount: 100,
+      token: 'XLM',
+      gameId: VALID_BODY.gameId,
+      platform: 'lichess',
+    });
+
+  const mockLichessGame = () => {
+    vi.mocked(axios.get).mockResolvedValueOnce({
+      status: 200,
+      data: {
+        id: VALID_BODY.gameId,
+        status: 'mate',
+        winner: 'white',
+        createdAt: 1700000000000,
+        lastMoveAt: 1700000060000,
+        players: {
+          white: { user: { name: 'alice' } },
+          black: { user: { name: 'bob' } },
+        },
+      },
+    });
+  };
+
+  const parseLogs = (logSpy: ReturnType<typeof vi.spyOn>) =>
+    logSpy.mock.calls
+      .flatMap((args) => args)
+      .map((arg) => {
+        try { return JSON.parse(arg as string); } catch { return null; }
+      })
+      .filter(Boolean);
+
+  it('opens a dispute window when the result is submitted', async () => {
+    const match = await seedMatch();
+    mockLichessGame();
+
+    const res = await request(createApp())
+      .post('/api/oracle/submit-result')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .send(VALID_BODY);
+
+    expect(res.status).toBe(200);
+
+    const stored = await matchStore.getMatch(match.matchId);
+    expect(stored?.disputeWindow).toBeDefined();
+    expect(stored?.disputeWindow?.openedAt).toBeDefined();
+    expect(stored?.disputeWindow?.expiresAt).toBeGreaterThan(
+      stored!.disputeWindow!.openedAt,
+    );
+  });
+
+  it('logs dispute_window_opened when the result is submitted', async () => {
+    await seedMatch();
+    mockLichessGame();
+    const logSpy = vi.spyOn(console, 'log');
+
+    await request(createApp())
+      .post('/api/oracle/submit-result')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .send(VALID_BODY);
+
+    const entry = parseLogs(logSpy).find(
+      (m) => m.message === 'dispute_window_opened',
+    );
+    expect(entry).toBeDefined();
+    expect(entry.game_id).toBe(VALID_BODY.gameId);
+    expect(entry.match_id).toBe(0);
+  });
+
+  it('rejects a dispute submitted after the window has expired', async () => {
+    const match = await seedMatch();
+    mockLichessGame();
+
+    await request(createApp())
+      .post('/api/oracle/submit-result')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .send(VALID_BODY);
+
+    // Force the window closed by moving its expiry into the past.
+    const stored = await matchStore.getMatch(match.matchId);
+    await matchStore.updateMatch(match.matchId, {
+      disputeWindow: {
+        ...stored!.disputeWindow!,
+        expiresAt: Date.now() - 1,
+      },
+    });
+
+    const logSpy = vi.spyOn(console, 'log');
+
+    const res = await request(createApp())
+      .post('/api/oracle/dispute')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .send({ matchId: match.matchId, reason: 'wrong winner' });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('DISPUTE_WINDOW_CLOSED');
+
+    const entry = parseLogs(logSpy).find(
+      (m) => m.message === 'dispute_window_expired',
+    );
+    expect(entry).toBeDefined();
+    expect(entry.match_id).toBe(match.matchId);
+  });
+
+  it('accepts a dispute submitted within the window', async () => {
+    const match = await seedMatch();
+    mockLichessGame();
+
+    await request(createApp())
+      .post('/api/oracle/submit-result')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .send(VALID_BODY);
+
+    const res = await request(createApp())
+      .post('/api/oracle/dispute')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .send({ matchId: match.matchId, reason: 'wrong winner' });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ matchId: match.matchId, disputed: true });
+  });
+});

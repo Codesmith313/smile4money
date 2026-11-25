@@ -18,6 +18,24 @@ import { SqliteConnectionPool } from './sqlite-connection-pool.js';
 import { getCurrentSchemaVersion, applySqliteMigrations } from './sqlite-migrations.js';
 import { SQLITE_SCHEMA_MIGRATIONS } from './sqlite-schema-migrations.js';
 
+// #2115 — Dispute window enforcement.
+// The dispute window duration is configurable via DISPUTE_WINDOW_MS.
+// Defaults to 24 hours when unset or invalid.
+const DEFAULT_DISPUTE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+export function getDisputeWindowMs(): number {
+  const raw = process.env.DISPUTE_WINDOW_MS;
+  if (raw === undefined || raw === '') {
+    return DEFAULT_DISPUTE_WINDOW_MS;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    console.warn('invalid_dispute_window_ms', { value: raw, fallback_ms: DEFAULT_DISPUTE_WINDOW_MS });
+    return DEFAULT_DISPUTE_WINDOW_MS;
+  }
+  return parsed;
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // #2203 — Query optimization.
@@ -64,6 +82,8 @@ function readMatch(row: any): MatchRecord {
     platform: row.platform,
     state: row.state,
     identityHash: row.identityHash ?? undefined,
+    resultSubmittedAt: row.resultSubmittedAt ?? undefined,
+    disputeDeadline: row.disputeDeadline ?? undefined,
     cancellationReason: row.cancellationReason ?? undefined,
   };
 }
@@ -440,9 +460,27 @@ export class SqliteMatchStore implements MatchStorePort {
           return null;
         }
         const previousState = match.state;
+        // #2115 — When a result is submitted, record the submission time and
+        // compute the dispute deadline from the configurable window.
+        let resultSubmittedAt = match.resultSubmittedAt;
+        let disputeDeadline = match.disputeDeadline;
+        if (state === 'ResultSubmitted' && previousState !== 'ResultSubmitted') {
+          resultSubmittedAt = Date.now();
+          disputeDeadline = resultSubmittedAt + getDisputeWindowMs();
+          console.info('dispute_window_opened', {
+            matchId,
+            resultSubmittedAt,
+            disputeDeadline,
+            windowMs: disputeDeadline - resultSubmittedAt,
+          });
+        }
         // #2137 — Record the cancellation reason when the match is cancelled.
         const reason = state === 'Cancelled' ? cancellationReason ?? match.cancellationReason : match.cancellationReason;
-        await runWithParams(db, 'UPDATE matches SET state = ?, cancellationReason = ? WHERE matchId = ?', [state, reason ?? null, matchId]);
+        await runWithParams(
+          db,
+          'UPDATE matches SET state = ?, resultSubmittedAt = ?, disputeDeadline = ?, cancellationReason = ? WHERE matchId = ?',
+          [state, resultSubmittedAt ?? null, disputeDeadline ?? null, reason ?? null, matchId],
+        );
         const subscriptions = await new Promise<Array<{ id: string; url: string; secret: string }>>((resolve, reject) =>
           db.all(
             'SELECT id, url, secret FROM webhook_subscriptions WHERE matchId = ?',
@@ -475,7 +513,11 @@ export class SqliteMatchStore implements MatchStorePort {
           }
         }
         await runAsync(db, 'COMMIT');
-        return { match: { ...match, state, cancellationReason: reason ?? undefined }, previousState, state };
+        return {
+          match: { ...match, state, resultSubmittedAt, disputeDeadline, cancellationReason: reason ?? undefined },
+          previousState,
+          state,
+        };
       } catch (error) {
         await runAsync(db, 'ROLLBACK').catch(() => undefined);
         throw error;

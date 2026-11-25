@@ -3,6 +3,7 @@ import jwt, { JsonWebTokenError, TokenExpiredError } from 'jsonwebtoken';
 import crypto from 'crypto';
 import { ErrorCode, errorEnvelope } from '../errors/errorResponse.js';
 import { privateEnv } from '../config/private-env.js';
+import { getJwtVerificationSecrets } from '../security/credentialStore.js';
 import { logAuthFailure, logAuthSuccess } from '../audit/authAudit.js';
 
 /**
@@ -12,17 +13,35 @@ import { logAuthFailure, logAuthSuccess } from '../audit/authAudit.js';
  * NEVER use default in production.
  */
 const DEFAULT_SECRET = 'test-secret';
-const SECRET = privateEnv.jwtSecret || DEFAULT_SECRET;
 
 // Hard fail at startup in production: a missing or default JWT_SECRET lets
 // anyone forge tokens with the well-known default, so refusing to start is
 // the only safe behavior. The default is only acceptable for local development.
-if (process.env.NODE_ENV === 'production' && SECRET === DEFAULT_SECRET) {
+if (process.env.NODE_ENV === 'production' && !privateEnv.jwtSecret) {
   throw new Error(
     'JWT_SECRET is not set (or is set to the known default "test-secret"). ' +
       'Refusing to start in production. Set JWT_SECRET to a strong, random ' +
       'string in your environment variables.',
   );
+}
+
+/**
+ * Resolves the set of secrets that may currently verify a token.
+ *
+ * The credential store returns the active secret first, followed by any
+ * previous secret still inside its rotation grace period. Resolving this per
+ * request (rather than caching a module-level constant) means credentials can
+ * be rotated without restarting the backend, and tokens signed with the old
+ * secret keep working until the grace period elapses.
+ */
+function resolveVerificationSecrets(): string[] {
+  const secrets = getJwtVerificationSecrets();
+  if (secrets.length === 0) {
+    // Fall back to the environment-provided secret (or the dev default) so
+    // the middleware keeps working if the store has not been initialized.
+    return [privateEnv.jwtSecret || DEFAULT_SECRET];
+  }
+  return secrets;
 }
 
 declare module 'express-serve-static-core' {
@@ -238,12 +257,38 @@ export function authenticate(req: Request, res: Response, next: NextFunction) {
 
   const token = auth.slice(7);
   try {
-    const payload = jwt.verify(token, SECRET) as {
-      address?: string;
-      scope?: unknown;
-      permissions?: unknown;
-      session_id?: string;
-    };
+    const secrets = resolveVerificationSecrets();
+    let payload:
+      | {
+          address?: string;
+          scope?: unknown;
+          permissions?: unknown;
+          session_id?: string;
+        }
+      | undefined;
+    let lastError: unknown;
+
+    // Try the active secret first, then any previous secret still within its
+    // grace period, so rotation never interrupts in-flight sessions.
+    for (const secret of secrets) {
+      try {
+        payload = jwt.verify(token, secret) as {
+          address?: string;
+          scope?: unknown;
+          permissions?: unknown;
+          session_id?: string;
+        };
+        lastError = undefined;
+        break;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    if (lastError) {
+      throw lastError;
+    }
+
     if (!payload || typeof payload.address !== 'string') {
       logAuthFailure('invalid_token_payload', auditContext);
       return res.status(401).json(errorEnvelope(ErrorCode.UNAUTHORIZED, 'Invalid token payload'));
