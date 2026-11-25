@@ -26,9 +26,9 @@ pub use smile4money_common::SharedError;
 /// | 15   | TransferFailed     | ✓       | Token transfer in withdraw failed                        |
 /// | 23   | InvalidAdmin       | ✓       | new_admin is the zero/burn address                       |
 /// | 24   | NoPendingAdmin     |         | accept_admin/cancel called with no pending proposal      |
-/// | 25   | InvalidProof       |         | Result proof (signature/hash) failed verification        |
-/// | 26   | NotAuthorizedOracle|         | Caller is neither the primary nor a fallback oracle      |
-/// | 27   | PrimaryOracleUnavailable |   | Primary oracle is unavailable; fallback required         |
+/// | 25   | ReplayDetected     |         | Result nonce has already been used (replay attack)       |
+/// | 26   | InvalidTimestamp   |         | Result timestamp outside match-creation..ledger window   |
+/// | 27   | MatchAlreadyCompleted |      | Match is Completed; result is final and cannot change    |
 ///
 /// > **Note**: Error codes for shared variants were unified with the escrow contract.
 /// > Previously `Unauthorized` was 1, `AlreadyInitialized` was 4, `InvalidGameId` was 5,
@@ -73,17 +73,18 @@ pub enum Error {
     /// pending admin proposal outstanding.
     NoPendingAdmin = 24,
 
-    /// [E025] The cryptographic proof accompanying a result submission (signature
-    /// or hash) could not be verified against the provider's data.
-    InvalidProof = 25,
+    /// [E025] The supplied result nonce has already been consumed for this match.
+    /// Re-submitting an identical result (replay attack) is rejected.
+    ReplayDetected = 25,
 
-    /// [E026] Caller is neither the configured primary oracle nor an authorized
-    /// fallback oracle, so it may not submit results.
-    NotAuthorizedOracle = 26,
+    /// [E026] The result timestamp is outside the valid window: it must be strictly
+    /// after the match creation time and not in the future (before the current
+    /// ledger time).
+    InvalidTimestamp = 26,
 
-    /// [E027] The primary oracle is unavailable and a fallback oracle must be used
-    /// to submit the result.
-    PrimaryOracleUnavailable = 27,
+    /// [E027] The match has already transitioned to `Completed`. Its result is final
+    /// and cannot be overwritten by a new submission.
+    MatchAlreadyCompleted = 27,
 }
 
 /// Convert a [`SharedError`] into an oracle [`Error`].

@@ -5,8 +5,10 @@ import {
   submitWithRetry,
   retryDlqEntry,
   submitWithIdempotence,
+  validateResultSubmission,
   type RetryConfig,
   type OracleSubmission,
+  type ResultValidationContext,
 } from '../src/services/oracle-submit.js';
 import { initializeQueue, closeQueue, listDlqEntries, removeDlqEntry } from '../src/queue.js';
 
@@ -405,5 +407,118 @@ describe('submitWithIdempotence', () => {
 
       expect(existenceChecker).toHaveBeenCalledWith(sub.matchId);
     }
+  });
+});
+
+describe('validateResultSubmission', () => {
+  const registeredOracle = 'GORACLE1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ234567890';
+  const now = 1_700_000_000_000;
+  const matchCreatedAt = now - 60_000;
+
+  function makeContext(overrides: Partial<ResultValidationContext> = {}): ResultValidationContext {
+    return {
+      registeredOracle,
+      signer: registeredOracle,
+      now,
+      matchCreatedAt,
+      matchStatus: 'InProgress',
+      usedNonces: new Set<string>(),
+      ...overrides,
+    };
+  }
+
+  function makeSubmission(overrides: Partial<OracleSubmission> = {}): OracleSubmission {
+    return {
+      matchId: 42,
+      gameId: 'lichess_abc123',
+      result: 'Player1Wins',
+      nonce: 'nonce-1',
+      timestamp: now - 1_000,
+      ...overrides,
+    };
+  }
+
+  it('accepts a valid submission', () => {
+    const outcome = validateResultSubmission(makeSubmission(), makeContext());
+    expect(outcome.ok).toBe(true);
+  });
+
+  it('rejects a duplicate nonce as a replay', () => {
+    const context = makeContext({ usedNonces: new Set(['nonce-1']) });
+    const outcome = validateResultSubmission(makeSubmission(), context);
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.code).toBe('REPLAY_DETECTED');
+      expect(outcome.message.toLowerCase()).toContain('replay');
+    }
+  });
+
+  it('rejects a submission from a non-oracle signer', () => {
+    const context = makeContext({ signer: 'GATTACKER000000000000000000000000000000000000000000000000' });
+    const outcome = validateResultSubmission(makeSubmission(), context);
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.code).toBe('UNAUTHORIZED_ORACLE');
+      expect(outcome.message.toLowerCase()).toContain('authoriz');
+    }
+  });
+
+  it('rejects a future timestamp', () => {
+    const context = makeContext();
+    const outcome = validateResultSubmission(
+      makeSubmission({ timestamp: now + 10_000 }),
+      context
+    );
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.code).toBe('INVALID_TIMESTAMP');
+      expect(outcome.message.toLowerCase()).toContain('timestamp');
+    }
+  });
+
+  it('rejects a timestamp before match creation', () => {
+    const context = makeContext();
+    const outcome = validateResultSubmission(
+      makeSubmission({ timestamp: matchCreatedAt - 1 }),
+      context
+    );
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.code).toBe('INVALID_TIMESTAMP');
+    }
+  });
+
+  it('rejects a submission for an already completed match', () => {
+    const context = makeContext({ matchStatus: 'Completed' });
+    const outcome = validateResultSubmission(makeSubmission(), context);
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.code).toBe('MATCH_ALREADY_COMPLETED');
+      expect(outcome.message.toLowerCase()).toContain('completed');
+    }
+  });
+
+  it('does not write non-retryable validation failures to the DLQ', async () => {
+    const config: RetryConfig = { maxRetries: 2, baseDelayMs: 100, maxDelayMs: 1000 };
+    const context = makeContext({ usedNonces: new Set(['nonce-1']) });
+    const handler = vi.fn().mockResolvedValue(undefined);
+
+    const result = await submitWithIdempotence(
+      makeSubmission(),
+      handler,
+      vi.fn().mockResolvedValue(false),
+      config,
+      context
+    );
+
+    expect(result).toBeDefined();
+    expect(result?.failureReason.toLowerCase()).toContain('replay');
+    expect(handler).not.toHaveBeenCalled();
+    expect(await listDlqEntries()).toHaveLength(0);
   });
 });

@@ -13,6 +13,9 @@ An on-chain Soroban contract that:
 - Stores verified results keyed by `match_id`
 - Accepts result submissions only from the registered admin (the oracle service key)
 - Prevents duplicate submissions for the same `match_id`
+- Rejects replayed submissions via a per-submission nonce
+- Rejects results whose timestamp falls outside the valid window
+- Treats a submitted result as final: a completed match cannot be overwritten
 - Emits an on-chain event for every accepted result
 
 ### Off-chain Oracle Service
@@ -34,7 +37,7 @@ Chess platform API
 Oracle Service
   1. fetch game result
   2. map to MatchResult enum
-  3. oracle_contract.submit_result(match_id, game_id, result)
+  3. oracle_contract.submit_result(match_id, game_id, result, nonce, timestamp)
   4. escrow_contract.submit_result(match_id, winner, oracle_address)
        â”‚
        â–¼
@@ -65,24 +68,41 @@ Escrow Contract
 
 ```
 initialize(admin: Address)
-submit_result(match_id: u64, game_id: String, result: MatchResult) -> Result<(), Error>
+submit_result(
+    match_id: u64,
+    game_id: String,
+    result: MatchResult,
+    nonce: u64,
+    timestamp: u64,
+) -> Result<(), Error>
 get_result(match_id: u64) -> Result<ResultEntry, Error>
 has_result(match_id: u64) -> bool
 ```
+
+`submit_result` requires the caller to be the registered admin (the oracle
+service key) and to have authorised the invocation as a Stellar transaction
+signer. The `nonce` and `timestamp` arguments are validated before the result is
+accepted (see "Security Properties" below).
 
 ### Errors
 
 | Error | Code | Meaning |
 |-------|------|---------|
-| `Unauthorized` | 1 | Caller is not the admin |
+| `Unauthorized` | 1 | Caller is not the admin / oracle address, or the transaction signature is missing or invalid |
 | `AlreadySubmitted` | 2 | Result already exists for this match |
 | `ResultNotFound` | 3 | No result stored for this match |
 | `AlreadyInitialized` | 4 | Contract has already been initialized |
+| `ReplayDetected` | 5 | The supplied `nonce` has already been used for this match (replay attempt) |
+| `InvalidTimestamp` | 6 | `timestamp` is in the future, before match creation, or otherwise outside the valid window |
+| `MatchAlreadyCompleted` | 7 | The match is already `Completed`; the submitted result cannot override the final outcome |
 
 ## Security Properties
 
 - The oracle admin key is the only address that can submit results; any other caller is rejected with `Error::Unauthorized`.
-- Once a result is submitted it is immutable â€” `AlreadySubmitted` prevents overwriting.
+- **Caller and signature validation.** Before accepting a result the contract checks that the caller address matches the registered oracle address and that the invocation carries a valid Stellar transaction signature from that address. A non-oracle caller or an unsigned/incorrectly signed transaction is rejected with `Error::Unauthorized`.
+- **Replay protection.** Every submission carries a `nonce`. The contract records the last accepted nonce per match and rejects any submission whose nonce has already been used with `Error::ReplayDetected`. This prevents an identical result from being re-submitted (for example by replaying a previously observed transaction).
+- **Timestamp window.** The supplied `timestamp` must satisfy `match_creation_time < timestamp < current_ledger_time`. Future timestamps and timestamps at or before match creation are rejected with `Error::InvalidTimestamp`.
+- **Result finality.** Once a result is accepted and the match transitions to `Completed`, the outcome is immutable. Any further submission for that match is rejected with `Error::MatchAlreadyCompleted`; override attempts are logged. `AlreadySubmitted` additionally prevents a second result from being stored for the same `match_id`.
 - The escrow contract independently verifies the caller against its stored oracle address before executing any payout.
 - The oracle contract and escrow contract are separate deployments; a compromised oracle contract does not grant direct access to escrow funds.
 - The off-chain match record's player identities are bound to the match by a hash at creation time (see "Player Identity Binding" below), independently of the on-chain contracts.

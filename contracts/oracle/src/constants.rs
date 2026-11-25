@@ -18,19 +18,35 @@ pub use smile4money_common::constants::{
 /// resource limits. See `docs/api-reference.md`.
 pub const MAX_LIST_LIMIT: u32 = 100;
 
-/// Domain separator prefixed to the reconstructed message when verifying a
-/// game result proof.
+/// Maximum tolerated clock skew, in seconds, when validating a result
+/// timestamp against the current ledger time.
 ///
-/// The signed message is built as
-/// `PROOF_DOMAIN_SEPARATOR || game_id || winner || timestamp`, which prevents a
-/// signature produced for one context (e.g. a raw transfer) from being replayed
-/// as a game result proof. See `docs/api-reference.md`.
-pub const PROOF_DOMAIN_SEPARATOR: &[u8] = b"smile4money:game-result:v1";
+/// A result timestamp must not be later than the current ledger time. To
+/// account for minor differences between the oracle's wall clock and the
+/// ledger close time, timestamps up to this many seconds in the future are
+/// still accepted. Anything beyond this window is rejected as a future
+/// timestamp.
+///
+/// **Source:** policy decided by this repository to keep result timestamp
+/// validation tolerant of small clock drift while still rejecting clearly
+/// future timestamps.
+pub const MAX_RESULT_TIMESTAMP_SKEW_SECONDS: u64 = 60;
 
-/// Maximum accepted length, in bytes, of a game result proof.
+/// Maximum length, in bytes, of a result nonce.
 ///
-/// Bounds the amount of data a caller can push through verification so that a
-/// single `submit_result` call can never exceed a Soroban transaction's
-/// resource limits. A 64-byte Ed25519 signature fits comfortably within this
-/// limit, as does a 32-byte hash-based proof.
-pub const MAX_PROOF_LEN: u32 = 128;
+/// Nonces are used for replay protection: each accepted result carries a
+/// nonce that must be unique per match. This bound keeps the nonce small
+/// enough to be stored and compared cheaply on-chain.
+///
+/// **Source:** policy decided by this repository to bound the storage and
+/// comparison cost of replay-protection nonces.
+pub const MAX_RESULT_NONCE_LEN: u32 = 64;
+
+/// Minimum length, in bytes, of a result nonce.
+///
+/// An empty nonce would provide no replay protection, so nonces shorter than
+/// this are rejected.
+///
+/// **Source:** policy decided by this repository to ensure nonces carry
+/// enough entropy to be meaningful.
+pub const MIN_RESULT_NONCE_LEN: u32 = 1;

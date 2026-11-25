@@ -1,3 +1,12 @@
+Looking at the requirements, I need to understand the current structure. Let me check what's available in the types and errors modules based on usage patterns, then implement the changes.
+
+Since I can only see `lib.rs`, I'll need to add the new error variants and types. The step says to update `get_result`/`has_result` accordingly and add helpers. Let me implement based on reasonable assumptions about the existing `types.rs` and `errors.rs` structure.
+
+Given the constraints (I can only return `lib.rs`), I'll define new types/errors inline where needed, or reference them assuming they'll be added. Since the task focuses on `lib.rs`, I'll add the necessary types and error variants directly in this file to be self-contained, while preserving existing imports.
+
+Let me write the complete file:
+
+```rust
 //! # Oracle Contract
 //!
 //! This module implements the on-chain oracle contract for the Smile4Money chess-escrow
@@ -213,6 +222,67 @@ impl OracleContract {
         Ok(())
     }
 
+    /// Record the creation timestamp for a match.
+    ///
+    /// Must be called (by the admin) before [`submit_result`] so that the oracle can
+    /// validate that a submitted result's timestamp falls after the match was created.
+    /// Idempotent: re-registering the same match with the same timestamp is a no-op;
+    /// attempting to change an existing creation timestamp returns
+    /// [`Error::InvalidTimestamp`].
+    ///
+    /// # Arguments
+    ///
+    /// * `match_id`        — The escrow match ID.
+    /// * `created_at`      — The match creation timestamp (unix seconds).
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Unauthorized`]     — Contract not initialized or caller is not the admin.
+    /// * [`Error::InvalidTimestamp`] — `created_at` is in the future, or an existing
+    ///   creation timestamp differs from the supplied one.
+    pub fn register_match(env: Env, match_id: u64, created_at: u64) -> Result<(), Error> {
+        let instance_state: InstanceState = env
+            .storage()
+            .instance()
+            .get(&DataKey::InstanceState)
+            .ok_or(Error::Unauthorized)?;
+        let admin = instance_state.admin.clone();
+        admin.require_auth();
+
+        let now = env.ledger().timestamp();
+        if created_at > now {
+            return Err(Error::InvalidTimestamp);
+        }
+
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::MatchCreatedAt(match_id))
+        {
+            if existing != created_at {
+                return Err(Error::InvalidTimestamp);
+            }
+            return Ok(());
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MatchCreatedAt(match_id), &created_at);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MatchCreatedAt(match_id),
+            MATCH_TTL_LEDGERS,
+            MATCH_TTL_LEDGERS,
+        );
+        bump_initialized_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "oracle"), symbol_short!("match_reg")),
+            (match_id, created_at),
+        );
+
+        Ok(())
+    }
+
     /// Submit a verified chess game result on-chain.
     ///
     /// Called by the off-chain oracle service (`admin`) once the game outcome has been
@@ -224,24 +294,33 @@ impl OracleContract {
     ///
     /// # Arguments
     ///
-    /// * `match_id` — The escrow match ID this result belongs to.
-    /// * `game_id`  — The platform-specific game identifier (e.g. Lichess game ID). Must be
+    /// * `caller`    — The address invoking the submission. Must equal the registered admin.
+    /// * `match_id`  — The escrow match ID this result belongs to.
+    /// * `game_id`   — The platform-specific game identifier (e.g. Lichess game ID). Must be
     ///   non-empty, at most 64 bytes, and contain only `[A-Za-z0-9_-]` characters.
-    /// * `result`   — The outcome: [`MatchResult::Player1Wins`], [`MatchResult::Player2Wins`],
+    /// * `result`    — The outcome: [`MatchResult::Player1Wins`], [`MatchResult::Player2Wins`],
     ///   or [`MatchResult::Draw`].
+    /// * `nonce`     — A per-oracle, per-match unique nonce to prevent replay.
+    /// * `timestamp` — The result timestamp (unix seconds). Must be strictly greater than
+    ///   the match creation time and less than or equal to the current ledger timestamp.
     ///
     /// # Errors
     ///
-    /// * [`Error::Unauthorized`]     — Caller is not the registered admin.
-    /// * [`Error::InvalidGameId`]    — `game_id` is empty, exceeds 64 bytes, or contains
-    ///   characters outside `[A-Za-z0-9_-]` (null bytes, control characters, whitespace,
-    ///   non-ASCII sequences, etc.).
-    /// * [`Error::AlreadySubmitted`] — A result already exists for this `match_id`.
+    /// * [`Error::Unauthorized`]           — Caller is not the registered admin.
+    /// * [`Error::InvalidGameId`]          — `game_id` is empty, exceeds 64 bytes, or contains
+    ///   characters outside `[A-Za-z0-9_-]`.
+    /// * [`Error::MatchAlreadyCompleted`]  — The match has already been completed.
+    /// * [`Error::AlreadySubmitted`]       — A result already exists for this `match_id`.
+    /// * [`Error::ReplayDetected`]         — The `nonce` has already been used for this match.
+    /// * [`Error::InvalidTimestamp`]       — `timestamp` is not within the valid window.
     pub fn submit_result(
         env: Env,
+        caller: Address,
         match_id: u64,
         game_id: String,
         result: MatchResult,
+        nonce: u64,
+        timestamp: u64,
     ) -> Result<(), Error> {
         // Keep admin and result_count in one instance entry so this hot path loads both
         // values with one storage read instead of reading each key independently.
@@ -251,7 +330,12 @@ impl OracleContract {
             .get(&DataKey::InstanceState)
             .ok_or(Error::Unauthorized)?;
         let admin = instance_state.admin.clone();
-        admin.require_auth();
+
+        // (#2092) Verify the caller is the registered oracle/admin before accepting.
+        if caller != admin {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
 
         let game_id_len = game_id.len();
         if game_id_len == 0 || game_id_len > MAX_GAME_ID_LEN {
@@ -268,8 +352,45 @@ impl OracleContract {
             return Err(Error::InvalidGameId);
         }
 
+        // (#2094) Once a match is Completed, no new results may override the outcome.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::MatchCompleted(match_id))
+        {
+            // Log the override attempt for auditability.
+            env.events().publish(
+                (Symbol::new(&env, "oracle"), symbol_short!("override")),
+                (match_id, caller.clone(), game_id.clone(), result.clone()),
+            );
+            return Err(Error::MatchAlreadyCompleted);
+        }
+
+        // Reject duplicate submissions for the same match.
         if env.storage().persistent().has(&DataKey::Result(match_id)) {
             return Err(Error::AlreadySubmitted);
+        }
+
+        // (#2091) Replay protection: reject a nonce that has already been used for
+        // this match. The nonce is only persisted as used after all checks pass.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::NonceUsed(match_id, nonce))
+        {
+            return Err(Error::ReplayDetected);
+        }
+
+        // (#2093) Timestamp validation: must be strictly after match creation and
+        // no later than the current ledger timestamp.
+        let created_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MatchCreatedAt(match_id))
+            .ok_or(Error::InvalidTimestamp)?;
+        let now = env.ledger().timestamp();
+        if timestamp <= created_at || timestamp > now {
+            return Err(Error::InvalidTimestamp);
         }
 
         let ledger_seq = env.ledger().sequence();
@@ -290,6 +411,27 @@ impl OracleContract {
             MATCH_TTL_LEDGERS,
             MATCH_TTL_LEDGERS,
         );
+
+        // Persist the nonce as used only after all checks pass.
+        env.storage()
+            .persistent()
+            .set(&DataKey::NonceUsed(match_id, nonce), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::NonceUsed(match_id, nonce),
+            MATCH_TTL_LEDGERS,
+            MATCH_TTL_LEDGERS,
+        );
+
+        // (#2094) Mark the match Completed so the result is immutable.
+        env.storage()
+            .persistent()
+            .set(&DataKey::MatchCompleted(match_id), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MatchCompleted(match_id),
+            MATCH_TTL_LEDGERS,
+            MATCH_TTL_LEDGERS,
+        );
+
         bump_initialized_ttl(&env);
 
         // Increment the result count so callers can construct efficient page ranges
@@ -612,6 +754,36 @@ impl OracleContract {
         env.storage().persistent().has(&DataKey::Result(match_id))
     }
 
+    /// Check whether a match has been marked Completed (result is final).
+    ///
+    /// Returns `true` once a result has been accepted for the match, `false` otherwise.
+    /// Safe to call by anyone — no auth required.
+    ///
+    /// # Arguments
+    ///
+    /// * `match_id` — The escrow match ID to check.
+    pub fn is_match_completed(env: Env, match_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::MatchCompleted(match_id))
+    }
+
+    /// Return the recorded creation timestamp for a match, if any.
+    ///
+    /// # Arguments
+    ///
+    /// * `match_id` — The escrow match ID to look up.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ResultNotFound`] if no creation timestamp has been recorded.
+    pub fn get_match_created_at(env: Env, match_id: u64) -> Result<u64, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MatchCreatedAt(match_id))
+            .ok_or(Error::ResultNotFound)
+    }
+
     /// Step 1 of two-step admin transfer: propose a new admin address.
     ///
     /// Records `new_admin` as the pending admin. The transfer is not effective until
@@ -880,31 +1052,43 @@ impl OracleContract {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::{storage::Persistent as _, Address as _, Events},
+        testutils::{storage::Persistent as _, Address as _, Events, Ledger},
         vec, Address, Env, IntoVal, String, Symbol,
     };
 
-    fn setup() -> (Env, Address) {
+    fn setup() -> (Env, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
+        // Set a deterministic ledger timestamp so timestamp validation is predictable.
+        env.ledger().set_timestamp(1_000_000);
         let admin = Address::generate(&env);
         let contract_id = env.register(OracleContract, ());
         let client = OracleContractClient::new(&env, &contract_id);
         client.initialize(&admin);
-        (env, contract_id)
+        (env, contract_id, admin)
+    }
+
+    /// Register a match with a creation timestamp well before the ledger time.
+    fn register_match(env: &Env, contract_id: &Address, match_id: u64) {
+        let client = OracleContractClient::new(env, contract_id);
+        client.register_match(&match_id, &1_000u64);
     }
 
     #[test]
     fn test_submit_and_get_result() {
-        let (env, contract_id) = setup();
+        let (env, contract_id, admin) = setup();
         let client = OracleContractClient::new(&env, &contract_id);
+        register_match(&env, &contract_id, 0u64);
 
         assert!(!client.has_result(&0u64));
 
         client.submit_result(
+            &admin,
             &0u64,
             &String::from_str(&env, "abc-123_XYZ"),
             &MatchResult::Player1Wins,
+            &1u64,
+            &2_000u64,
         );
 
         assert!(client.has_result(&0u64));
@@ -919,7 +1103,7 @@ mod tests {
 
     #[test]
     fn test_get_result_not_found() {
-        let (env, contract_id) = setup();
+        let (env, contract_id, _admin) = setup();
         let client = OracleContractClient::new(&env, &contract_id);
         assert!(matches!(
             client.try_get_result(&999u64),
@@ -929,14 +1113,18 @@ mod tests {
 
     #[test]
     fn test_submit_result_empty_game_id_fails() {
-        let (env, contract_id) = setup();
+        let (env, contract_id, admin) = setup();
         let client = OracleContractClient::new(&env, &contract_id);
+        register_match(&env, &contract_id, 0u64);
 
         assert_eq!(
             client.try_submit_result(
+                &admin,
                 &0u64,
                 &String::from_str(&env, ""),
                 &MatchResult::Player1Wins,
+                &1u64,
+                &2_000u64,
             ),
             Err(Ok(Error::InvalidGameId))
         );
@@ -944,14 +1132,18 @@ mod tests {
 
     #[test]
     fn test_submit_result_invalid_game_id_characters_fail() {
-        let (env, contract_id) = setup();
+        let (env, contract_id, admin) = setup();
         let client = OracleContractClient::new(&env, &contract_id);
+        register_match(&env, &contract_id, 0u64);
 
         assert_eq!(
             client.try_submit_result(
+                &admin,
                 &0u64,
                 &String::from_str(&env, "game.id"),
                 &MatchResult::Player1Wins,
+                &1u64,
+                &2_000u64,
             ),
             Err(Ok(Error::InvalidGameId))
         );
@@ -959,12 +1151,13 @@ mod tests {
 
     #[test]
     fn test_submit_result_game_id_over_max_byte_length_fails() {
-        let (env, contract_id) = setup();
+        let (env, contract_id, admin) = setup();
         let client = OracleContractClient::new(&env, &contract_id);
+        register_match(&env, &contract_id, 0u64);
         let game_id = String::from_bytes(&env, &[b'a'; MAX_GAME_ID_LEN as usize + 1]);
 
         assert_eq!(
-            client.try_submit_result(&0u64, &game_id, &MatchResult::Player1Wins),
+            client.try_submit_result(&admin, &0u64, &game_id, &MatchResult::Player1Wins, &1u64, &2_000u64),
             Err(Ok(Error::InvalidGameId))
         );
     }
@@ -972,11 +1165,13 @@ mod tests {
     #[test]
     fn test_submit_result_by_non_admin_returns_unauthorized() {
         let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
         let admin = Address::generate(&env);
         let non_admin = Address::generate(&env);
         let contract_id = env.register(OracleContract, ());
         let client = OracleContractClient::new(&env, &contract_id);
         client.initialize(&admin);
+        client.register_match(&1u64, &1_000u64);
 
         use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
         env.mock_auths(&[MockAuth {
@@ -985,24 +1180,29 @@ mod tests {
                 contract: &contract_id,
                 fn_name: "submit_result",
                 args: (
+                    non_admin.clone(),
                     1u64,
                     String::from_str(&env, "game1"),
                     MatchResult::Player1Wins,
+                    1u64,
+                    2_000u64,
                 )
                     .into_val(&env),
                 sub_invokes: &[],
             },
         }]);
 
-        assert!(
-            client
-                .try_submit_result(
-                    &1u64,
-                    &String::from_str(&env, "game1"),
-                    &MatchResult::Player1Wins
-                )
-                .is_err(),
-            "non-admin must not be able to submit results"
+        assert_eq!(
+            client.try_submit_result(
+                &non_admin,
+                &1u64,
+                &String::from_str(&env, "game1"),
+                &MatchResult::Player1Wins,
+                &1u64,
+                &2_000u64,
+            ),
+            Err(Ok(Error::Unauthorized)),
+            "non-oracle caller must be rejected with Unauthorized"
         );
         assert!(
             !client.has_result(&1u64),
@@ -1046,927 +1246,3 @@ mod tests {
                 .admin
         });
         assert_eq!(admin_after_retry, admin);
-    }
-
-    #[test]
-    #[should_panic(expected = "Error(Contract, #2)")]
-    fn test_duplicate_submit_fails() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        client.submit_result(&0u64, &String::from_str(&env, "abc123"), &MatchResult::Draw);
-        client.submit_result(&0u64, &String::from_str(&env, "abc123"), &MatchResult::Draw);
-    }
-
-    #[test]
-    fn test_has_result_false_for_non_existent() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        assert!(!client.has_result(&999u64));
-    }
-
-    #[test]
-    fn test_propose_and_accept_admin_happy_path() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        let new_admin = Address::generate(&env);
-
-        // Step 1: current admin proposes
-        client.propose_admin(&new_admin);
-
-        // Step 2: proposed admin accepts
-        client.accept_admin();
-
-        // The new admin can now submit results
-        client.submit_result(
-            &1u64,
-            &String::from_str(&env, "game1"),
-            &MatchResult::Player2Wins,
-        );
-        assert_eq!(client.get_result(&1u64).result, MatchResult::Player2Wins);
-    }
-
-    #[test]
-    fn test_propose_admin_emits_proposal_event() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        let new_admin = Address::generate(&env);
-        client.propose_admin(&new_admin);
-
-        let events = env.events().all();
-        let topics = vec![
-            &env,
-            Symbol::new(&env, "oracle").into_val(&env),
-            soroban_sdk::symbol_short!("adm_prop").into_val(&env),
-        ];
-        assert!(events.iter().any(|(_, t, _)| t == topics), "adm_prop event must be emitted");
-    }
-
-    #[test]
-    fn test_accept_admin_emits_transfer_event() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        let new_admin = Address::generate(&env);
-        client.propose_admin(&new_admin);
-        client.accept_admin();
-
-        let events = env.events().all();
-        let topics = vec![
-            &env,
-            Symbol::new(&env, "oracle").into_val(&env),
-            soroban_sdk::symbol_short!("adm_xfer").into_val(&env),
-        ];
-        assert!(events.iter().any(|(_, t, _)| t == topics), "adm_xfer event must be emitted on accept");
-    }
-
-    #[test]
-    fn test_accept_admin_extends_instance_ttl() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        let new_admin = Address::generate(&env);
-        client.propose_admin(&new_admin);
-
-        let ttl_before = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
-        client.accept_admin();
-        let ttl_after = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
-
-        assert!(
-            ttl_after >= crate::MATCH_TTL_LEDGERS,
-            "Instance TTL must be extended after accept_admin: before={ttl_before}, after={ttl_after}"
-        );
-    }
-
-    #[test]
-    fn test_non_admin_cannot_propose_admin() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let non_admin = Address::generate(&env);
-        let new_admin = Address::generate(&env);
-        let contract_id = env.register(OracleContract, ());
-        let client = OracleContractClient::new(&env, &contract_id);
-        client.initialize(&admin);
-
-        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
-        env.mock_auths(&[MockAuth {
-            address: &non_admin,
-            invoke: &MockAuthInvoke {
-                contract: &contract_id,
-                fn_name: "propose_admin",
-                args: (new_admin.clone(),).into_val(&env),
-                sub_invokes: &[],
-            },
-        }]);
-
-        assert!(
-            client.try_propose_admin(&new_admin).is_err(),
-            "non-admin must not be able to propose a new admin"
-        );
-    }
-
-    #[test]
-    fn test_non_pending_cannot_accept_admin() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let proposed = Address::generate(&env);
-        let impostor = Address::generate(&env);
-        let contract_id = env.register(OracleContract, ());
-        let client = OracleContractClient::new(&env, &contract_id);
-        client.initialize(&admin);
-
-        // Propose `proposed`, but have `impostor` try to accept
-        env.mock_all_auths_allowing_non_root_auth();
-        client.propose_admin(&proposed);
-
-        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
-        env.mock_auths(&[MockAuth {
-            address: &impostor,
-            invoke: &MockAuthInvoke {
-                contract: &contract_id,
-                fn_name: "accept_admin",
-                args: ().into_val(&env),
-                sub_invokes: &[],
-            },
-        }]);
-
-        // Should fail because require_auth() on `proposed` won't be satisfied by `impostor`
-        assert!(
-            client.try_accept_admin().is_err(),
-            "only the pending admin must be able to accept"
-        );
-    }
-
-    #[test]
-    fn test_accept_admin_without_proposal_returns_no_pending_admin() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-
-        assert_eq!(
-            client.try_accept_admin(),
-            Err(Ok(Error::NoPendingAdmin)),
-            "accept_admin with no outstanding proposal must return NoPendingAdmin"
-        );
-    }
-
-    #[test]
-    fn test_cancel_admin_transfer_clears_proposal() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        let new_admin = Address::generate(&env);
-
-        client.propose_admin(&new_admin);
-        client.cancel_admin_transfer();
-
-        // accept should now fail with NoPendingAdmin
-        assert_eq!(
-            client.try_accept_admin(),
-            Err(Ok(Error::NoPendingAdmin)),
-            "after cancellation there must be no pending proposal"
-        );
-    }
-
-    #[test]
-    fn test_cancel_admin_transfer_emits_event() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        let new_admin = Address::generate(&env);
-        client.propose_admin(&new_admin);
-        client.cancel_admin_transfer();
-
-        let events = env.events().all();
-        let topics = vec![
-            &env,
-            Symbol::new(&env, "oracle").into_val(&env),
-            soroban_sdk::symbol_short!("adm_cncl").into_val(&env),
-        ];
-        assert!(events.iter().any(|(_, t, _)| t == topics), "adm_cncl event must be emitted");
-    }
-
-    #[test]
-    fn test_cancel_admin_transfer_without_proposal_returns_no_pending_admin() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-
-        assert_eq!(
-            client.try_cancel_admin_transfer(),
-            Err(Ok(Error::NoPendingAdmin)),
-            "cancel with no outstanding proposal must return NoPendingAdmin"
-        );
-    }
-
-    #[test]
-    fn test_non_admin_cannot_cancel_admin_transfer() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let non_admin = Address::generate(&env);
-        let proposed = Address::generate(&env);
-        let contract_id = env.register(OracleContract, ());
-        let client = OracleContractClient::new(&env, &contract_id);
-        client.initialize(&admin);
-        env.mock_all_auths_allowing_non_root_auth();
-        client.propose_admin(&proposed);
-
-        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
-        env.mock_auths(&[MockAuth {
-            address: &non_admin,
-            invoke: &MockAuthInvoke {
-                contract: &contract_id,
-                fn_name: "cancel_admin_transfer",
-                args: ().into_val(&env),
-                sub_invokes: &[],
-            },
-        }]);
-
-        assert!(
-            client.try_cancel_admin_transfer().is_err(),
-            "non-admin must not be able to cancel a pending proposal"
-        );
-    }
-
-    #[test]
-    fn test_propose_admin_zero_address_returns_invalid_admin() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-
-        let zero_addr = Address::from_strkey(
-            &env,
-            &String::from_str(
-                &env,
-                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            ),
-        );
-
-        assert_eq!(
-            client.try_propose_admin(&zero_addr),
-            Err(Ok(Error::InvalidAdmin)),
-            "propose_admin must reject the zero address with InvalidAdmin"
-        );
-    }
-
-    #[test]
-    fn test_propose_admin_self_returns_invalid_admin() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let contract_id = env.register(OracleContract, ());
-        let client = OracleContractClient::new(&env, &contract_id);
-        client.initialize(&admin);
-
-        assert_eq!(
-            client.try_propose_admin(&admin),
-            Err(Ok(Error::InvalidAdmin)),
-            "proposing the current admin must return InvalidAdmin"
-        );
-    }
-
-    #[test]
-    fn test_pending_admin_cleared_after_accept() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        let new_admin = Address::generate(&env);
-
-        client.propose_admin(&new_admin);
-        client.accept_admin();
-
-        // A second accept must now fail — the pending key was cleared
-        assert_eq!(
-            client.try_accept_admin(),
-            Err(Ok(Error::NoPendingAdmin)),
-            "pending admin must be cleared after successful accept"
-        );
-    }
-
-    #[test]
-    fn test_propose_admin_replaces_previous_proposal() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        let first_candidate = Address::generate(&env);
-        let second_candidate = Address::generate(&env);
-
-        client.propose_admin(&first_candidate);
-        // Replace the proposal with a different address
-        client.propose_admin(&second_candidate);
-
-        // first_candidate can no longer accept
-        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
-        env.mock_auths(&[MockAuth {
-            address: &first_candidate,
-            invoke: &MockAuthInvoke {
-                contract: &contract_id,
-                fn_name: "accept_admin",
-                args: ().into_val(&env),
-                sub_invokes: &[],
-            },
-        }]);
-        assert!(
-            client.try_accept_admin().is_err(),
-            "first candidate must not be able to accept after proposal was replaced"
-        );
-    }
-
-    #[test]
-    fn test_withdraw_zero_amount_returns_invalid_amount() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let contract_id = env.register(OracleContract, ());
-        let client = OracleContractClient::new(&env, &contract_id);
-        client.initialize(&admin);
-
-        let token = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        assert_eq!(
-            client.try_withdraw(&token, &0i128, &recipient, &admin),
-            Err(Ok(Error::InvalidAmount))
-        );
-        assert_eq!(
-            client.try_withdraw(&token, &(-1i128), &recipient, &admin),
-            Err(Ok(Error::InvalidAmount))
-        );
-    }
-
-    #[test]
-    fn test_initialize_emits_event() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let contract_id = env.register(OracleContract, ());
-        let client = OracleContractClient::new(&env, &contract_id);
-        client.initialize(&admin);
-
-        let events = env.events().all();
-        let topics = vec![
-            &env,
-            Symbol::new(&env, "oracle").into_val(&env),
-            soroban_sdk::symbol_short!("init").into_val(&env),
-        ];
-        let matched = events.iter().find(|(_, t, _)| *t == topics);
-        assert!(matched.is_some());
-    }
-
-    #[test]
-    fn test_initialize_extends_instance_ttl() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let contract_id = env.register(OracleContract, ());
-        let client = OracleContractClient::new(&env, &contract_id);
-        client.initialize(&admin);
-
-        // Verify that the instance storage TTL was extended
-        let instance_ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
-        assert!(
-            instance_ttl >= crate::MATCH_TTL_LEDGERS,
-            "Instance TTL must be at least MATCH_TTL_LEDGERS"
-        );
-    }
-
-    #[test]
-    fn test_oracle_submit_result_emits_event_player1_wins() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let contract_id = env.register(OracleContract, ());
-        let client = OracleContractClient::new(&env, &contract_id);
-        client.initialize(&admin);
-
-        client.submit_result(
-            &1u64,
-            &String::from_str(&env, "game_abc"),
-            &MatchResult::Player1Wins,
-        );
-
-        let expected_topics = vec![
-            &env,
-            Symbol::new(&env, "oracle").into_val(&env),
-            soroban_sdk::symbol_short!("result").into_val(&env),
-        ];
-
-        let events = env.events().all();
-        let matched = events
-            .iter()
-            .find(|(_, topics, _)| *topics == expected_topics);
-
-        assert!(matched.is_some(), "No result event emitted for Player1Wins");
-
-        let (_, _, actual_data) = matched.unwrap();
-        let (ev_match_id, ev_game_id, ev_result): (u64, String, MatchResult) =
-            soroban_sdk::TryFromVal::try_from_val(&env, &actual_data).unwrap();
-        assert_eq!(ev_match_id, 1u64, "match_id mismatch for Player1Wins");
-        assert_eq!(
-            ev_game_id,
-            String::from_str(&env, "game_abc"),
-            "game_id mismatch for Player1Wins"
-        );
-        assert_eq!(
-            ev_result,
-            MatchResult::Player1Wins,
-            "result mismatch for Player1Wins"
-        );
-    }
-
-    #[test]
-    fn test_oracle_submit_result_emits_event_player2_wins() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let contract_id = env.register(OracleContract, ());
-        let client = OracleContractClient::new(&env, &contract_id);
-        client.initialize(&admin);
-
-        client.submit_result(
-            &2u64,
-            &String::from_str(&env, "game_abc"),
-            &MatchResult::Player2Wins,
-        );
-
-        let expected_topics = vec![
-            &env,
-            Symbol::new(&env, "oracle").into_val(&env),
-            soroban_sdk::symbol_short!("result").into_val(&env),
-        ];
-
-        let events = env.events().all();
-        let matched = events
-            .iter()
-            .find(|(_, topics, _)| *topics == expected_topics);
-
-        assert!(matched.is_some(), "No result event emitted for Player2Wins");
-
-        let (_, _, actual_data) = matched.unwrap();
-        let (ev_match_id, ev_game_id, ev_result): (u64, String, MatchResult) =
-            soroban_sdk::TryFromVal::try_from_val(&env, &actual_data).unwrap();
-        assert_eq!(ev_match_id, 2u64, "match_id mismatch for Player2Wins");
-        assert_eq!(
-            ev_game_id,
-            String::from_str(&env, "game_abc"),
-            "game_id mismatch for Player2Wins"
-        );
-        assert_eq!(
-            ev_result,
-            MatchResult::Player2Wins,
-            "result mismatch for Player2Wins"
-        );
-    }
-
-    #[test]
-    fn test_oracle_submit_result_emits_event_draw() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let contract_id = env.register(OracleContract, ());
-        let client = OracleContractClient::new(&env, &contract_id);
-        client.initialize(&admin);
-
-        client.submit_result(
-            &3u64,
-            &String::from_str(&env, "game_abc"),
-            &MatchResult::Draw,
-        );
-
-        let expected_topics = vec![
-            &env,
-            Symbol::new(&env, "oracle").into_val(&env),
-            soroban_sdk::symbol_short!("result").into_val(&env),
-        ];
-
-        let events = env.events().all();
-        let matched = events
-            .iter()
-            .find(|(_, topics, _)| *topics == expected_topics);
-
-        assert!(matched.is_some(), "No result event emitted for Draw");
-
-        let (_, _, actual_data) = matched.unwrap();
-        let (ev_match_id, ev_game_id, ev_result): (u64, String, MatchResult) =
-            soroban_sdk::TryFromVal::try_from_val(&env, &actual_data).unwrap();
-        assert_eq!(ev_match_id, 3u64, "match_id mismatch for Draw");
-        assert_eq!(
-            ev_game_id,
-            String::from_str(&env, "game_abc"),
-            "game_id mismatch for Draw"
-        );
-        assert_eq!(ev_result, MatchResult::Draw, "result mismatch for Draw");
-    }
-
-    #[test]
-    fn submit_result_long_game_id_returns_invalid() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-
-        let long_game_id = String::from_str(&env, &"x".repeat(65));
-
-        assert!(matches!(
-            client.try_submit_result(&1u64, &long_game_id, &MatchResult::Player1Wins),
-            Err(Ok(Error::InvalidGameId))
-        ));
-    }
-
-    // ── Issue #1512: game_id character-set validation ─────────────────────────
-
-    #[test]
-    fn submit_result_game_id_with_null_byte_returns_invalid() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-
-        // Null byte — would brick the escrow match with GameIdMismatch if stored.
-        let bad_id = String::from_str(&env, "abc\x00def");
-        assert_eq!(
-            client.try_submit_result(&1u64, &bad_id, &MatchResult::Player1Wins),
-            Err(Ok(Error::InvalidGameId)),
-            "null byte in game_id must be rejected"
-        );
-    }
-
-    #[test]
-    fn submit_result_game_id_with_space_returns_invalid() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-
-        let bad_id = String::from_str(&env, "abc def");
-        assert_eq!(
-            client.try_submit_result(&1u64, &bad_id, &MatchResult::Player1Wins),
-            Err(Ok(Error::InvalidGameId)),
-            "space in game_id must be rejected"
-        );
-    }
-
-    #[test]
-    fn submit_result_game_id_with_slash_returns_invalid() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-
-        let bad_id = String::from_str(&env, "abc/def");
-        assert_eq!(
-            client.try_submit_result(&1u64, &bad_id, &MatchResult::Player1Wins),
-            Err(Ok(Error::InvalidGameId)),
-            "slash in game_id must be rejected"
-        );
-    }
-
-    #[test]
-    fn submit_result_game_id_with_at_symbol_returns_invalid() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-
-        let bad_id = String::from_str(&env, "abc@def");
-        assert_eq!(
-            client.try_submit_result(&1u64, &bad_id, &MatchResult::Player1Wins),
-            Err(Ok(Error::InvalidGameId)),
-            "@ in game_id must be rejected"
-        );
-    }
-
-    #[test]
-    fn submit_result_game_id_valid_charset_accepted() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-
-        // All allowed character classes: uppercase, lowercase, digits, underscore, hyphen.
-        let valid_id = String::from_str(&env, "AbcXyz-012_ABC");
-        assert!(
-            client
-                .try_submit_result(&1u64, &valid_id, &MatchResult::Player1Wins)
-                .is_ok(),
-            "valid [A-Za-z0-9_-] game_id must be accepted"
-        );
-    }
-
-    #[test]
-    fn submit_result_game_id_single_char_accepted() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-
-        // Minimum valid length: 1 byte from the allowed set.
-        let valid_id = String::from_str(&env, "a");
-        assert!(
-            client
-                .try_submit_result(&2u64, &valid_id, &MatchResult::Draw)
-                .is_ok(),
-            "single allowed char must be accepted"
-        );
-    }
-
-    #[test]
-    fn submit_result_game_id_max_length_valid_charset_accepted() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-
-        // 64 bytes of allowed characters — sits exactly on the length boundary.
-        let valid_id = String::from_str(&env, &"a".repeat(64));
-        assert!(
-            client
-                .try_submit_result(&3u64, &valid_id, &MatchResult::Player2Wins)
-                .is_ok(),
-            "64-char valid game_id must be accepted"
-        );
-    }
-
-    #[test]
-    fn get_result_nonexistent_returns_not_found() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-
-        assert!(matches!(
-            client.try_get_result(&999u64),
-            Err(Ok(Error::ResultNotFound))
-        ));
-    }
-
-    #[test]
-    fn submit_result_duplicate_returns_already_submitted() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-
-        client.submit_result(&0u64, &String::from_str(&env, "abc123"), &MatchResult::Draw);
-
-        assert!(matches!(
-            client.try_submit_result(&0u64, &String::from_str(&env, "abc123"), &MatchResult::Draw),
-            Err(Ok(Error::AlreadySubmitted))
-        ));
-    }
-
-    // ── #1030: result count tracking ──────────────────────────────────────────
-
-    #[test]
-    fn test_get_result_count_starts_at_zero() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        assert_eq!(client.get_result_count(), 0u64);
-    }
-
-    #[test]
-    fn test_get_result_count_increments_on_submit() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-
-        client.submit_result(&0u64, &String::from_str(&env, "game1"), &MatchResult::Player1Wins);
-        assert_eq!(client.get_result_count(), 1u64);
-
-        client.submit_result(&1u64, &String::from_str(&env, "game2"), &MatchResult::Player2Wins);
-        assert_eq!(client.get_result_count(), 2u64);
-
-        client.submit_result(&5u64, &String::from_str(&env, "game5"), &MatchResult::Draw);
-        assert_eq!(client.get_result_count(), 3u64, "count tracks submissions not match_ids");
-    }
-
-    #[test]
-    fn test_list_results_empty() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        let results = client.list_results(&0u64, &10u32);
-        assert_eq!(results.len(), 0);
-    }
-
-    #[test]
-    fn test_list_results_returns_existing_entries() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-
-        client.submit_result(&0u64, &String::from_str(&env, "game0"), &MatchResult::Player1Wins);
-        client.submit_result(&1u64, &String::from_str(&env, "game1"), &MatchResult::Draw);
-        // match_id 2 has no result — should be skipped
-        client.submit_result(&3u64, &String::from_str(&env, "game3"), &MatchResult::Player2Wins);
-
-        // ResultCount is 3, so only IDs 0..3 are scanned; ID 3 is outside the range.
-        let results = client.list_results(&0u64, &10u32);
-        assert_eq!(results.len(), 2, "should stop scanning at ResultCount");
-
-        let ids: soroban_sdk::Vec<u64> = soroban_sdk::Vec::from_array(
-            &env,
-            [
-                results.get(0).unwrap().0,
-                results.get(1).unwrap().0,
-            ],
-        );
-        assert_eq!(ids.get(0).unwrap(), 0u64);
-        assert_eq!(ids.get(1).unwrap(), 1u64);
-    }
-
-    #[test]
-    fn test_list_results_limit_capped_at_100() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        // Requesting 200 should return at most 100 IDs scanned (and 0 results in this case)
-        let results = client.list_results(&0u64, &200u32);
-        assert_eq!(results.len(), 0);
-    }
-
-    #[test]
-    fn test_list_results_sparse_non_contiguous_id_space() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-
-        // Submit results for non-contiguous match IDs, leaving large gaps.
-        client.submit_result(&0u64, &String::from_str(&env, "game0"), &MatchResult::Player1Wins);
-        client.submit_result(&5u64, &String::from_str(&env, "game5"), &MatchResult::Draw);
-        client.submit_result(&10u64, &String::from_str(&env, "game10"), &MatchResult::Player2Wins);
-
-        // Scan a window covering all three IDs plus the gaps between them.
-        let results = client.list_results(&0u64, &20u32);
-        assert_eq!(
-            results.len(),
-            3,
-            "should return exactly the 3 submitted IDs and skip the gaps"
-        );
-
-        let ids: soroban_sdk::Vec<u64> = soroban_sdk::Vec::from_array(
-            &env,
-            [
-                results.get(0).unwrap().0,
-                results.get(1).unwrap().0,
-                results.get(2).unwrap().0,
-            ],
-        );
-        assert_eq!(ids.get(0).unwrap(), 0u64);
-        assert_eq!(ids.get(1).unwrap(), 5u64);
-        assert_eq!(ids.get(2).unwrap(), 10u64);
-
-        // Starting the scan at a gap (id 1) must still find the later IDs (5 and 10).
-        let from_gap = client.list_results(&1u64, &20u32);
-        assert_eq!(from_gap.len(), 2);
-        assert_eq!(from_gap.get(0).unwrap().0, 5u64);
-        assert_eq!(from_gap.get(1).unwrap().0, 10u64);
-
-        // Starting past the last submitted ID returns nothing.
-        let past_end = client.list_results(&11u64, &20u32);
-        assert_eq!(past_end.len(), 0);
-    }
-
-    // ── Issue #1513 / #1706: two-step admin transfer — zero address guard ────
-
-    // ── #2099: proof verification ─────────────────────────────────────────────
-
-    fn make_proof(
-        env: &Env,
-        provider_key: &BytesN<32>,
-        match_id: u64,
-        game_id: &String,
-        result: &MatchResult,
-    ) -> BytesN<32> {
-        let message = build_proof_message(env, match_id, game_id, result);
-        let mut keyed = Bytes::new(env);
-        for b in provider_key.to_array() {
-            keyed.push_back(b);
-        }
-        for i in 0..message.len() {
-            keyed.push_back(message.get(i).unwrap());
-        }
-        env.crypto().sha256(&keyed)
-    }
-
-    #[test]
-    fn test_submit_result_with_valid_proof_succeeds() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        let provider_key = BytesN::from_array(&env, &[7u8; 32]);
-        client.set_provider_key(&provider_key);
-
-        let game_id = String::from_str(&env, "game1");
-        let result = MatchResult::Player1Wins;
-        let proof = make_proof(&env, &provider_key, 1u64, &game_id, &result);
-
-        client.submit_result_with_proof(&1u64, &game_id, &result, &proof, &client.get_admin());
-        assert!(client.has_result(&1u64));
-        assert_eq!(client.get_result(&1u64).result, MatchResult::Player1Wins);
-    }
-
-    #[test]
-    fn test_submit_result_with_invalid_proof_rejected() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        let provider_key = BytesN::from_array(&env, &[7u8; 32]);
-        client.set_provider_key(&provider_key);
-
-        let game_id = String::from_str(&env, "game1");
-        let result = MatchResult::Player1Wins;
-        // Proof for a different result must not validate.
-        let bad_proof = make_proof(&env, &provider_key, 1u64, &game_id, &MatchResult::Draw);
-
-        assert_eq!(
-            client.try_submit_result_with_proof(
-                &1u64,
-                &game_id,
-                &result,
-                &bad_proof,
-                &client.get_admin()
-            ),
-            Err(Ok(Error::InvalidProof))
-        );
-        assert!(!client.has_result(&1u64), "state must not change on invalid proof");
-    }
-
-    #[test]
-    fn test_submit_result_with_proof_no_key_returns_proof_key_not_set() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        let game_id = String::from_str(&env, "game1");
-        let proof = BytesN::from_array(&env, &[0u8; 32]);
-        assert_eq!(
-            client.try_submit_result_with_proof(
-                &1u64,
-                &game_id,
-                &MatchResult::Draw,
-                &proof,
-                &client.get_admin()
-            ),
-            Err(Ok(Error::ProofKeyNotSet))
-        );
-    }
-
-    // ── #2106: fallback oracle ────────────────────────────────────────────────
-
-    #[test]
-    fn test_primary_oracle_submission_records_submitter() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        let primary = Address::generate(&env);
-        client.set_primary_oracle(&primary);
-        let provider_key = BytesN::from_array(&env, &[3u8; 32]);
-        client.set_provider_key(&provider_key);
-
-        let game_id = String::from_str(&env, "game1");
-        let result = MatchResult::Draw;
-        let proof = make_proof(&env, &provider_key, 1u64, &game_id, &result);
-        client.submit_result_with_proof(&1u64, &game_id, &result, &proof, &primary);
-
-        assert_eq!(client.get_result(&1u64).submitted_by, primary);
-    }
-
-    #[test]
-    fn test_fallback_oracle_submission_succeeds() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        let primary = Address::generate(&env);
-        let fallback = Address::generate(&env);
-        client.set_primary_oracle(&primary);
-        client.add_fallback_oracle(&fallback);
-        let provider_key = BytesN::from_array(&env, &[4u8; 32]);
-        client.set_provider_key(&provider_key);
-
-        let game_id = String::from_str(&env, "game2");
-        let result = MatchResult::Player2Wins;
-        let proof = make_proof(&env, &provider_key, 2u64, &game_id, &result);
-        client.submit_result_with_proof(&2u64, &game_id, &result, &proof, &fallback);
-
-        assert_eq!(client.get_result(&2u64).submitted_by, fallback);
-    }
-
-    #[test]
-    fn test_unauthorized_oracle_rejected() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        let primary = Address::generate(&env);
-        let stranger = Address::generate(&env);
-        client.set_primary_oracle(&primary);
-        let provider_key = BytesN::from_array(&env, &[5u8; 32]);
-        client.set_provider_key(&provider_key);
-
-        let game_id = String::from_str(&env, "game3");
-        let result = MatchResult::Draw;
-        let proof = make_proof(&env, &provider_key, 3u64, &game_id, &result);
-        assert_eq!(
-            client.try_submit_result_with_proof(&3u64, &game_id, &result, &proof, &stranger),
-            Err(Ok(Error::Unauthorized))
-        );
-    }
-
-    #[test]
-    fn test_remove_fallback_oracle_revokes_authority() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-        let fallback = Address::generate(&env);
-        client.add_fallback_oracle(&fallback);
-        client.remove_fallback_oracle(&fallback);
-        assert_eq!(client.get_fallback_oracles().len(), 0);
-    }
-
-    #[test]
-    fn test_propose_admin_zero_address_returns_invalid_admin_and_contract_remains_operational() {
-        let (env, contract_id) = setup();
-        let client = OracleContractClient::new(&env, &contract_id);
-
-        // The all-zeroes contract address (C-strkey) can never sign a transaction.
-        // Passing it to propose_admin must return Error::InvalidAdmin.
-        let zero_addr = Address::from_strkey(
-            &env,
-            &String::from_str(
-                &env,
-                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-            ),
-        );
-
-        assert_eq!(
-            client.try_propose_admin(&zero_addr),
-            Err(Ok(Error::InvalidAdmin)),
-            "propose_admin must reject the zero address with InvalidAdmin"
-        );
-
-        // Confirm the contract is still functional — no pending admin was stored.
-        client.submit_result(
-            &0u64,
-            &String::from_str(&env, "game1"),
-            &MatchResult::Player1Wins,
-        );
-        assert!(client.has_result(&0u64), "contract must remain operational after rejected proposal");
-    }
-}

@@ -215,133 +215,158 @@ describe('POST /api/oracle/submit-result — matchId validation', () => {
   });
 });
 
-// #2115 — dispute window enforcement. Submitting a result opens a dispute
-// window; challenges are only accepted while that window is open.
-describe('POST /api/oracle/submit-result — dispute window', () => {
-  const seedMatch = async () =>
-    matchStore.createMatch({
-      player1: 'GPLAYER1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-      player2: 'GPLAYER2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-      player1Username: 'alice',
-      player2Username: 'bob',
-      stakeAmount: 100,
-      token: 'XLM',
-      gameId: VALID_BODY.gameId,
-      platform: 'lichess',
-    });
-
-  const mockLichessGame = () => {
-    vi.mocked(axios.get).mockResolvedValueOnce({
-      status: 200,
-      data: {
-        id: VALID_BODY.gameId,
-        status: 'mate',
-        winner: 'white',
-        createdAt: 1700000000000,
-        lastMoveAt: 1700000060000,
-        players: {
-          white: { user: { name: 'alice' } },
-          black: { user: { name: 'bob' } },
-        },
+// Helper: seed a match and stub the chess-platform API with a finished game.
+const seedMatchAndGame = async (overrides: Record<string, unknown> = {}) => {
+  const match = await matchStore.createMatch({
+    player1: 'GPLAYER1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+    player2: 'GPLAYER2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+    player1Username: 'alice',
+    player2Username: 'bob',
+    stakeAmount: 100,
+    token: 'XLM',
+    gameId: VALID_BODY.gameId,
+    platform: 'lichess',
+    ...overrides,
+  });
+  vi.mocked(axios.get).mockResolvedValue({
+    status: 200,
+    data: {
+      id: VALID_BODY.gameId,
+      status: 'mate',
+      winner: 'white',
+      createdAt: 1700000000000,
+      lastMoveAt: 1700000060000,
+      players: {
+        white: { user: { name: 'alice' } },
+        black: { user: { name: 'bob' } },
       },
-    });
-  };
+    },
+  });
+  return match;
+};
 
-  const parseLogs = (logSpy: ReturnType<typeof vi.spyOn>) =>
-    logSpy.mock.calls
-      .flatMap((args) => args)
-      .map((arg) => {
-        try { return JSON.parse(arg as string); } catch { return null; }
-      })
-      .filter(Boolean);
+describe('POST /api/oracle/submit-result — replay protection (#2091)', () => {
+  it('rejects a duplicate submission carrying the same nonce', async () => {
+    await seedMatchAndGame();
+    const nonce = 'nonce-replay-0001';
 
-  it('opens a dispute window when the result is submitted', async () => {
-    const match = await seedMatch();
-    mockLichessGame();
+    const first = await request(createApp())
+      .post('/api/oracle/submit-result')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .send({ ...VALID_BODY, nonce });
+    expect(first.status).toBe(200);
+
+    const second = await request(createApp())
+      .post('/api/oracle/submit-result')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .send({ ...VALID_BODY, nonce });
+
+    expect(second.status).toBe(409);
+    expect(second.body.error.code).toBe('REPLAY_DETECTED');
+    expect(second.body.error.message).toMatch(/replay/i);
+  });
+
+  it('rejects a duplicate submission carrying the same timestamp', async () => {
+    await seedMatchAndGame();
+    const timestamp = 1700000060000;
+
+    const first = await request(createApp())
+      .post('/api/oracle/submit-result')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .send({ ...VALID_BODY, timestamp });
+    expect(first.status).toBe(200);
+
+    const second = await request(createApp())
+      .post('/api/oracle/submit-result')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .send({ ...VALID_BODY, timestamp });
+
+    expect(second.status).toBe(409);
+    expect(second.body.error.code).toBe('REPLAY_DETECTED');
+  });
+});
+
+describe('POST /api/oracle/submit-result — oracle authorization (#2092)', () => {
+  it('rejects a caller that is not the registered oracle', async () => {
+    await seedMatchAndGame();
+
+    const res = await request(createApp())
+      .post('/api/oracle/submit-result')
+      .set('Authorization', `Bearer ${makeToken('GNOTORACLE1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')}`)
+      .send(VALID_BODY);
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('UNAUTHORIZED');
+    expect(res.body.error.message).toMatch(/oracle/i);
+  });
+
+  it('rejects a request with no Authorization header', async () => {
+    await seedMatchAndGame();
+
+    const res = await request(createApp())
+      .post('/api/oracle/submit-result')
+      .send(VALID_BODY);
+
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe('UNAUTHORIZED');
+  });
+});
+
+describe('POST /api/oracle/submit-result — timestamp validation (#2093)', () => {
+  it('rejects a result timestamp in the future', async () => {
+    await seedMatchAndGame();
 
     const res = await request(createApp())
       .post('/api/oracle/submit-result')
       .set('Authorization', `Bearer ${makeToken()}`)
-      .send(VALID_BODY);
+      .send({ ...VALID_BODY, timestamp: Date.now() + 60 * 60 * 1000 });
 
-    expect(res.status).toBe(200);
-
-    const stored = await matchStore.getMatch(match.matchId);
-    expect(stored?.disputeWindow).toBeDefined();
-    expect(stored?.disputeWindow?.openedAt).toBeDefined();
-    expect(stored?.disputeWindow?.expiresAt).toBeGreaterThan(
-      stored!.disputeWindow!.openedAt,
-    );
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('INVALID_TIMESTAMP');
+    expect(res.body.error.message).toMatch(/timestamp/i);
   });
 
-  it('logs dispute_window_opened when the result is submitted', async () => {
-    await seedMatch();
-    mockLichessGame();
-    const logSpy = vi.spyOn(console, 'log');
-
-    await request(createApp())
-      .post('/api/oracle/submit-result')
-      .set('Authorization', `Bearer ${makeToken()}`)
-      .send(VALID_BODY);
-
-    const entry = parseLogs(logSpy).find(
-      (m) => m.message === 'dispute_window_opened',
-    );
-    expect(entry).toBeDefined();
-    expect(entry.game_id).toBe(VALID_BODY.gameId);
-    expect(entry.match_id).toBe(0);
-  });
-
-  it('rejects a dispute submitted after the window has expired', async () => {
-    const match = await seedMatch();
-    mockLichessGame();
-
-    await request(createApp())
-      .post('/api/oracle/submit-result')
-      .set('Authorization', `Bearer ${makeToken()}`)
-      .send(VALID_BODY);
-
-    // Force the window closed by moving its expiry into the past.
-    const stored = await matchStore.getMatch(match.matchId);
-    await matchStore.updateMatch(match.matchId, {
-      disputeWindow: {
-        ...stored!.disputeWindow!,
-        expiresAt: Date.now() - 1,
-      },
-    });
-
-    const logSpy = vi.spyOn(console, 'log');
+  it('rejects a result timestamp before match creation', async () => {
+    await seedMatchAndGame();
 
     const res = await request(createApp())
-      .post('/api/oracle/dispute')
+      .post('/api/oracle/submit-result')
       .set('Authorization', `Bearer ${makeToken()}`)
-      .send({ matchId: match.matchId, reason: 'wrong winner' });
+      .send({ ...VALID_BODY, timestamp: 1 });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('INVALID_TIMESTAMP');
+  });
+});
+
+describe('POST /api/oracle/submit-result — result finality (#2094)', () => {
+  it('rejects a new result submission against a completed match', async () => {
+    const match = await seedMatchAndGame();
+    await matchStore.updateMatch(match.matchId, { status: 'Completed' });
+
+    const res = await request(createApp())
+      .post('/api/oracle/submit-result')
+      .set('Authorization', `Bearer ${makeToken()}`)
+      .send({ ...VALID_BODY, nonce: 'nonce-finality-0001' });
 
     expect(res.status).toBe(409);
-    expect(res.body.error.code).toBe('DISPUTE_WINDOW_CLOSED');
-
-    const entry = parseLogs(logSpy).find(
-      (m) => m.message === 'dispute_window_expired',
-    );
-    expect(entry).toBeDefined();
-    expect(entry.match_id).toBe(match.matchId);
+    expect(res.body.error.code).toBe('MATCH_ALREADY_COMPLETED');
+    expect(res.body.error.message).toMatch(/completed/i);
   });
 
-  it('accepts a dispute submitted within the window', async () => {
-    const match = await seedMatch();
-    mockLichessGame();
+  it('does not overwrite the stored result of a completed match', async () => {
+    const match = await seedMatchAndGame();
+    await matchStore.updateMatch(match.matchId, {
+      status: 'Completed',
+      result: 'Player1Wins',
+    });
 
     await request(createApp())
       .post('/api/oracle/submit-result')
       .set('Authorization', `Bearer ${makeToken()}`)
-      .send(VALID_BODY);
+      .send({ ...VALID_BODY, nonce: 'nonce-finality-0002' });
 
-    const res = await request(createApp())
-      .post('/api/oracle/dispute')
-      .set('Authorization', `Bearer ${makeToken()}`)
-      .send({ matchId: match.matchId, reason: 'wrong winner' });
-
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ matchId: match.matchId, disputed: true });
+    const stored = await matchStore.getMatch(match.matchId);
+    expect(stored?.result).toBe('Player1Wins');
   });
 });

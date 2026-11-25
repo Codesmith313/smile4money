@@ -485,6 +485,119 @@ describe('verifyGameResult', () => {
     });
   });
 
+  // #2093 — result timestamps must fall within a valid window: after the
+  // match was created and no later than the current ledger time.
+  describe('result timestamp validation (#2093)', () => {
+    it('rejects a result whose timestamp is in the future', async () => {
+      await seedMatch(store);
+      const futureEndTime = '2999-01-01T00:00:00.000Z';
+      mockFetchLichess.mockResolvedValue({
+        ...LICHESS_GAME,
+        endedAt: futureEndTime,
+        evidence: { ...LICHESS_GAME.evidence, endedAt: futureEndTime },
+      });
+
+      const result = await verifyGameResult(store, {
+        matchId: 0,
+        gameId: 'lichess-game-abc',
+        platform: 'lichess',
+      });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.status).toBe(425);
+        expect(result.error).toBe('Result submission timing violation');
+        expect(result.details).toContain(futureEndTime);
+      }
+      await expect(store.getSettlementEvidence(0)).resolves.toBeNull();
+    });
+
+    it('rejects a result whose timestamp predates match creation', async () => {
+      const match = await seedMatch(store);
+      const createdAt = new Date(match.createdAt).getTime();
+      const beforeCreation = new Date(createdAt - 60_000).toISOString();
+      mockFetchLichess.mockResolvedValue({
+        ...LICHESS_GAME,
+        endedAt: beforeCreation,
+        evidence: { ...LICHESS_GAME.evidence, endedAt: beforeCreation },
+      });
+
+      const result = await verifyGameResult(store, {
+        matchId: 0,
+        gameId: 'lichess-game-abc',
+        platform: 'lichess',
+      });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.status).toBe(425);
+        expect(result.error).toBe('Result submission timing violation');
+        expect(result.details).toContain(beforeCreation);
+      }
+      await expect(store.getSettlementEvidence(0)).resolves.toBeNull();
+    });
+
+    it('accepts a result whose timestamp falls within the valid window', async () => {
+      const match = await seedMatch(store);
+      const createdAt = new Date(match.createdAt).getTime();
+      const withinWindow = new Date(createdAt + 1_000).toISOString();
+      mockFetchLichess.mockResolvedValue({
+        ...LICHESS_GAME,
+        endedAt: withinWindow,
+        evidence: { ...LICHESS_GAME.evidence, endedAt: withinWindow },
+      });
+
+      const result = await verifyGameResult(store, {
+        matchId: 0,
+        gameId: 'lichess-game-abc',
+        platform: 'lichess',
+      });
+
+      expect(result.ok).toBe(true);
+    });
+  });
+
+  // #2094 — once a match is Completed, its result is final and cannot be
+  // overridden by a new submission.
+  describe('result finality (#2094)', () => {
+    it('rejects a new result submission for an already completed match', async () => {
+      const match = await seedMatch(store);
+      match.status = 'Completed';
+      mockFetchLichess.mockResolvedValue(LICHESS_GAME);
+
+      const result = await verifyGameResult(store, {
+        matchId: 0,
+        gameId: 'lichess-game-abc',
+        platform: 'lichess',
+      });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.status).toBe(409);
+        expect(result.error).toBe('Match already completed');
+      }
+      expect(mockFetchLichess).not.toHaveBeenCalled();
+    });
+
+    it('logs an override attempt against a completed match', async () => {
+      const match = await seedMatch(store);
+      match.status = 'Completed';
+      mockFetchLichess.mockResolvedValue(LICHESS_GAME);
+      const logger = (await import('../../src/logger.js')).default;
+
+      await verifyGameResult(store, {
+        matchId: 0,
+        gameId: 'lichess-game-abc',
+        platform: 'lichess',
+      });
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('override'),
+        expect.objectContaining({ matchId: 0 }),
+      );
+    });
+  });
+
   // #1720 — the oracle must reject a result if the match's bound identity
   // hash no longer matches its current fields.
   describe('identity hash verification (#1720)', () => {
