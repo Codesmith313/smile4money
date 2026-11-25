@@ -1,5 +1,4 @@
 import express from 'express';
-import cors from 'cors';
 import healthRouter from './routes/health.js';
 import matchRouter from './routes/matches.js';
 import validateGameRouter from './routes/validate-game.js';
@@ -21,64 +20,16 @@ import { requestLogging } from './middleware/request-logging.js';
 import { httpRequestMetrics } from './middleware/http-metrics.js';
 import { traceContext } from './middleware/trace-context.js';
 import { apiErrorHandler } from './middleware/error-handler.js';
-
-/**
- * Parse the ALLOWED_ORIGINS environment variable into an array of origin strings.
- * Accepts a comma-separated list, e.g. "https://app.example.com,https://staging.example.com".
- * Falls back to the frontend URL in production or localhost in development.
- */
-function getAllowedOrigins(): string[] {
-  if (process.env.ALLOWED_ORIGINS) {
-    return process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean);
-  }
-  if (process.env.FRONTEND_URL) {
-    return [process.env.FRONTEND_URL];
-  }
-  // Development fallback — not used when ALLOWED_ORIGINS is set in production
-  return ['http://localhost:5173'];
-}
+import { corsMiddleware } from './middleware/cors.js';
+import { authenticate } from './middleware/authenticate.js';
+import { sessionStore } from './auth/session-store.js';
 
 export const app = express();
 
 app.use(traceContext());
 app.use(httpRequestMetrics());
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      const allowed = getAllowedOrigins();
-      // Allow server-to-server requests (no Origin header) and listed origins
-      if (!origin || allowed.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(
-          Object.assign(
-            new Error(`CORS: origin '${origin}' is not allowed`),
-            { status: 403 },
-          ),
-        );
-      }
-    },
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: [
-      'Content-Type',
-      'Authorization',
-      'traceparent',
-      'tracestate',
-      'x-trace-id',
-    ],
-    exposedHeaders: [
-      'traceparent',
-      'x-request-id',
-      'x-correlation-id',
-      'x-trace-id',
-      'X-RateLimit-Limit',
-      'X-RateLimit-Remaining',
-      'X-RateLimit-Reset',
-      'Retry-After',
-    ],
-    credentials: true,
-  })
-);
+// #2130 — CORS restricted to whitelisted frontend domains (env.corsAllowedOrigins)
+app.use(corsMiddleware());
 
 app.use(express.json());
 // #1722 — logs method/path/status/duration at INFO (no body ever); request
@@ -90,6 +41,10 @@ app.use('/health', healthRouter);
 app.use('/auth', authRouter);
 // #2127 — API key management (machine-to-machine auth)
 app.use('/api-keys', apiKeysRouter);
+// #2133/#2134/#2135 — match search/filter, cursor pagination, and statistics
+// routes are all served by matchRouter under /api/matches. The router must
+// register its specific paths (e.g. GET /statistics) before any parameterized
+// routes (e.g. GET /:id) so they are not shadowed; no extra wiring is needed here.
 // #2126 — per-user rate limiting applied after authentication on protected routers
 app.use('/api/matches', rateLimit(), matchRouter);
 app.use('/api/validate-game', rateLimit(), validateGameRouter);
@@ -99,10 +54,24 @@ app.use('/api/oracle', rateLimit(), oracleRouter);
 app.use('/api/player-identity', rateLimit(), playerIdentityRouter);
 app.use('/status', statusRouter);
 
+// #2129 — session termination: revokes the current session and returns 204
+app.post('/auth/logout', authenticate, (req, res) => {
+  if (req.sessionId) {
+    sessionStore.revoke(req.sessionId);
+  }
+  res.status(204).end();
+});
+
 app.use((_req, res) => {
   res
     .status(404)
-    .json(errorEnvelope(ErrorCode.NOT_FOUND, userFacingErrorMessage(404)));
+    .json(
+      errorEnvelope(
+        ErrorCode.NOT_FOUND,
+        userFacingErrorMessage(404),
+        { method: req.method, path: req.originalUrl ?? req.url },
+      ),
+    );
 });
 
 app.use(apiErrorHandler);
