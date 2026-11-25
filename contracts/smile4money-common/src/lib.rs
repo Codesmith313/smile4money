@@ -16,38 +16,12 @@
 //! Ledger-duration and identifier constants shared by the escrow and oracle
 //! contracts live in [`constants`] so that both contracts — and the frontend —
 //! agree on a single set of values.
-//!
-//! ## Token decimals normalization
-//!
-//! Tokens may use different decimal configurations (e.g. 6, 7, or 8 decimals).
-//! To perform accurate arithmetic across tokens, all amounts are normalized to a
-//! common base unit defined by [`BASE_DECIMALS`] (7 decimals, matching Stellar's
-//! native precision). [`MAX_TOKEN_DECIMALS`] bounds the decimals a supported token
-//! may declare; tokens exceeding it are rejected.
-//!
-//! ### Rounding policy
-//!
-//! When converting an amount from a token's native decimals to the base unit
-//! (scaling **up**, i.e. `token_decimals <= BASE_DECIMALS`), the amount is
-//! multiplied by `10^(BASE_DECIMALS - token_decimals)` — this is exact and loses
-//! no precision.
-//!
-//! When converting from the base unit back down to a token's native decimals
-//! (scaling **down**, i.e. `token_decimals < BASE_DECIMALS`), the result is
-//! truncated toward zero (floor for non-negative amounts). Any fractional
-//! remainder below the token's smallest unit is discarded. Callers that require
-//! exact conservation of value should keep balances in the base unit and only
-//! convert at the token-transfer boundary.
-//!
-//! Conversions between tokens with the same decimals are identity operations.
 
 #![no_std]
 
 pub mod constants;
 
 use soroban_sdk::contracterror;
-
-pub use constants::{BASE_DECIMALS, MAX_TOKEN_DECIMALS};
 
 /// Error variants that are shared across the escrow and oracle contracts.
 ///
@@ -64,6 +38,9 @@ pub use constants::{BASE_DECIMALS, MAX_TOKEN_DECIMALS};
 /// | 11   | InvalidGameId      | game_id is empty, exceeds 64 bytes, or contains invalid chars  |
 /// | 15   | TransferFailed     | Token transfer failed                                          |
 /// | 23   | InvalidAdmin       | The admin address is invalid (zero address or same as current) |
+/// | 35   | InsufficientPermission | Caller's role lacks the permission required for this action |
+/// | 40   | TokenNotSep41      | Token does not implement the required SEP-41 interface         |
+/// | 41   | InvalidTokenMetadata | Token metadata is missing or failed validation                |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SharedError {
@@ -85,4 +62,13 @@ pub enum SharedError {
 
     /// [E023] The admin address is invalid (e.g. zero address or same as current admin).
     InvalidAdmin = 23,
+
+    /// [E035] The caller's role does not grant the permission required for this action.
+    InsufficientPermission = 35,
+
+    /// [E040] The token does not implement the required SEP-41 (Stellar Asset Contract) interface.
+    TokenNotSep41 = 40,
+
+    /// [E041] The token metadata is missing or failed validation.
+    InvalidTokenMetadata = 41,
 }

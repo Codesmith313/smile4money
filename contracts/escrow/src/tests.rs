@@ -313,7 +313,7 @@ fn test_deposit_and_activate() {
     assert!(!client.is_funded(&id));
     client.deposit(&id, &player2);
     assert!(client.is_funded(&id));
-    assert_eq!(client.get_escrow_balance(&id).total, 200);
+    assert_eq!(client.get_escrow_balance(&id), 200);
     assert_eq!(client.get_match(&id).state, MatchState::Active);
     assert_eq!(token_client.balance(&player1), 900);
     assert_eq!(token_client.balance(&player2), 900);
@@ -345,7 +345,7 @@ fn test_payout_winner() {
     assert_eq!(token_client.balance(&player1), 1100);
     assert_eq!(token_client.balance(&player2), 900);
     assert_eq!(client.get_match(&id).state, MatchState::Completed);
-    assert_eq!(client.get_escrow_balance(&id).total, 0);
+    assert_eq!(client.get_escrow_balance(&id), 0);
 }
 
 #[test]
@@ -374,7 +374,7 @@ fn test_payout_winner_player2() {
     assert_eq!(token_client.balance(&player1), 900);
     assert_eq!(token_client.balance(&player2), 1100);
     assert_eq!(client.get_match(&id).state, MatchState::Completed);
-    assert_eq!(client.get_escrow_balance(&id).total, 0);
+    assert_eq!(client.get_escrow_balance(&id), 0);
 }
 
 #[test]
@@ -2434,10 +2434,10 @@ fn test_escrow_balance_zero_after_cancel() {
         &Platform::Lichess,
     );
     client.deposit(&id, &player1);
-    assert_eq!(client.get_escrow_balance(&id).total, 100);
+    assert_eq!(client.get_escrow_balance(&id), 100);
 
     client.cancel_match(&id, &player1);
-    assert_eq!(client.get_escrow_balance(&id).total, 0);
+    assert_eq!(client.get_escrow_balance(&id), 0);
     assert_eq!(token_client.balance(&player1), 1000); // fully refunded
 }
 
@@ -2459,7 +2459,7 @@ fn test_escrow_balance_full_pot_while_pending_result() {
 
     client.deposit(&id, &player1);
     client.deposit(&id, &player2);
-    assert_eq!(client.get_escrow_balance(&id).total, stake * 2);
+    assert_eq!(client.get_escrow_balance(&id), stake * 2);
 
     client.submit_result(
         &id,
@@ -2469,7 +2469,7 @@ fn test_escrow_balance_full_pot_while_pending_result() {
     );
 
     assert_eq!(client.get_match(&id).state, MatchState::PendingResult);
-    assert_eq!(client.get_escrow_balance(&id).total, stake * 2);
+    assert_eq!(client.get_escrow_balance(&id), stake * 2);
 }
 
 // Issue #180: Once both players have deposited the match transitions to Active.
@@ -2502,7 +2502,7 @@ fn test_cancel_with_both_deposits_requires_auth() {
     // Both players are fully refunded
     assert_eq!(token_client.balance(&player1), 1000);
     assert_eq!(token_client.balance(&player2), 1000);
-    assert_eq!(client.get_escrow_balance(&id).total, 0);
+    assert_eq!(client.get_escrow_balance(&id), 0);
 }
 
 // Issue #100: Test that submit_result on a cancelled match returns InvalidState (no deposit)
@@ -2583,7 +2583,7 @@ fn test_player2_win_payout_full_pot() {
     client.deposit(&id, &player1);
     client.deposit(&id, &player2);
     assert!(client.is_funded(&id));
-    assert_eq!(client.get_escrow_balance(&id).total, stake * 2);
+    assert_eq!(client.get_escrow_balance(&id), stake * 2);
 
     client.submit_result(
         &id,
@@ -2597,7 +2597,7 @@ fn test_player2_win_payout_full_pot() {
     assert_eq!(token_client.balance(&player2), p2_before + stake);
     assert_eq!(token_client.balance(&player1), p1_before - stake); // net loss = stake
     assert_eq!(client.get_match(&id).state, MatchState::Completed);
-    assert_eq!(client.get_escrow_balance(&id).total, 0);
+    assert_eq!(client.get_escrow_balance(&id), 0);
 }
 
 // Issue #222: cancel_match refunds only player1 when only player1 has deposited;
@@ -2621,7 +2621,7 @@ fn test_cancel_match_refunds_only_player1_when_only_player1_deposited() {
     client.deposit(&id, &player1);
     assert_eq!(token_client.balance(&player1), 900);
     assert_eq!(token_client.balance(&player2), 1000); // player2 untouched
-    assert_eq!(client.get_escrow_balance(&id).total, 100);
+    assert_eq!(client.get_escrow_balance(&id), 100);
 
     // Cancel â€” player2 triggers the cancellation
     client.cancel_match(&id, &player2);
@@ -2631,7 +2631,7 @@ fn test_cancel_match_refunds_only_player1_when_only_player1_deposited() {
     // player2 balance must be unchanged (never deposited, must not receive anything)
     assert_eq!(token_client.balance(&player2), 1000);
     // Escrow must be empty
-    assert_eq!(client.get_escrow_balance(&id).total, 0);
+    assert_eq!(client.get_escrow_balance(&id), 0);
     // Match must be in Cancelled state
     assert_eq!(client.get_match(&id).state, MatchState::Cancelled);
 }
@@ -2684,7 +2684,7 @@ fn test_reentrancy_deposit_checks_effects_interactions() {
     let m = client.get_match(&id);
     assert!(m.player1_deposited);
     assert_eq!(token_client.balance(&player1), 900);
-    assert_eq!(client.get_escrow_balance(&id).total, 100);
+    assert_eq!(client.get_escrow_balance(&id), 100);
 }
 
 #[test]
@@ -2723,7 +2723,7 @@ fn test_reentrancy_submit_result_checks_effects_interactions() {
     assert_eq!(client.get_match(&id).state, MatchState::Completed);
     assert_eq!(token_client.balance(&player1), 1100);
     assert_eq!(token_client.balance(&player2), 900);
-    assert_eq!(client.get_escrow_balance(&id).total, 0);
+    assert_eq!(client.get_escrow_balance(&id), 0);
 }
 
 // Issue: deposit returns InsufficientAllowance when player has not approved the contract
@@ -2786,7 +2786,7 @@ fn test_deposit_succeeds_with_exact_allowance() {
 
     client.deposit(&id, &player1);
     assert_eq!(token_client.balance(&player1), 900);
-    assert_eq!(client.get_escrow_balance(&id).total, 100);
+    assert_eq!(client.get_escrow_balance(&id), 100);
 }
 
 // Issue #1102: emergency_drain â€” success, unpaused guard, non-admin guard
@@ -4912,271 +4912,377 @@ fn result_correction_keeps_original_submission_in_audit_events() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Issue #2086 — token whitelist: admin-only access, happy paths, events,
-// and rejection of non-whitelisted tokens.
+// Issue #2080 — Role-based access control
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn test_add_token_emits_whitelist_event() {
-    let (env, contract_id, _oracle, player1, player2, _token, admin, _safe) = setup();
+fn test_primary_admin_can_assign_roles() {
+    let (env, contract_id, _oracle, _p1, _p2, _token, admin, _safe) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
-    let usdc = setup_second_token(&env, &contract_id, &player1, &player2);
+    let secondary = Address::generate(&env);
+    let emergency = Address::generate(&env);
 
-    client.add_token(&usdc, &admin);
+    client.assign_role(&admin, &secondary, &AdminRole::Secondary);
+    client.assign_role(&admin, &emergency, &AdminRole::Emergency);
 
-    let events = env.events().all();
-    let topics = vec![
-        &env,
-        Symbol::new(&env, "admin").into_val(&env),
-        symbol_short!("addtoken").into_val(&env),
-    ];
-    let ev = events
-        .iter()
-        .find(|(_, t, _)| *t == topics)
-        .expect("add_token must emit a whitelist event");
-    let (logged_token, listed): (Address, bool) =
-        TryFromVal::try_from_val(&env, &ev.2).unwrap();
-    assert_eq!(logged_token, usdc);
-    assert!(listed);
+    assert_eq!(client.get_role(&secondary), Some(AdminRole::Secondary));
+    assert_eq!(client.get_role(&emergency), Some(AdminRole::Emergency));
+    assert_eq!(client.get_role(&admin), Some(AdminRole::Primary));
 }
 
 #[test]
-fn test_remove_token_emits_whitelist_event() {
-    let (env, contract_id, _oracle, player1, player2, _token, admin, _safe) = setup();
+fn test_non_primary_admin_cannot_assign_roles() {
+    let (env, contract_id, _oracle, _p1, _p2, _token, admin, _safe) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
-    let usdc = setup_second_token(&env, &contract_id, &player1, &player2);
-    client.add_token(&usdc, &admin);
+    let secondary = Address::generate(&env);
+    let target = Address::generate(&env);
+    client.assign_role(&admin, &secondary, &AdminRole::Secondary);
 
-    client.remove_token(&usdc, &admin);
-
-    let events = env.events().all();
-    let topics = vec![
-        &env,
-        Symbol::new(&env, "admin").into_val(&env),
-        symbol_short!("rmtoken").into_val(&env),
-    ];
-    let ev = events
-        .iter()
-        .find(|(_, t, _)| *t == topics)
-        .expect("remove_token must emit a whitelist event");
-    let (logged_token, listed): (Address, bool) =
-        TryFromVal::try_from_val(&env, &ev.2).unwrap();
-    assert_eq!(logged_token, usdc);
-    assert!(!listed);
+    assert_eq!(
+        client.try_assign_role(&secondary, &target, &AdminRole::Emergency),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(client.get_role(&target), None);
 }
 
 #[test]
-fn test_create_match_rejects_non_whitelisted_token() {
-    let (env, contract_id, _oracle, player1, player2, _token, _admin, _safe) = setup();
+fn test_role_permissions_allow_and_deny() {
+    let (env, contract_id, _oracle, _p1, _p2, _token, admin, _safe) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
-    let rogue = setup_second_token(&env, &contract_id, &player1, &player2);
+    let secondary = Address::generate(&env);
+    let emergency = Address::generate(&env);
+    client.assign_role(&admin, &secondary, &AdminRole::Secondary);
+    client.assign_role(&admin, &emergency, &AdminRole::Emergency);
+
+    // Primary may pause, drain and rotate.
+    assert!(client.has_permission(&admin, &Permission::Pause));
+    assert!(client.has_permission(&admin, &Permission::Drain));
+    assert!(client.has_permission(&admin, &Permission::RotateOracle));
+
+    // Secondary may pause and rotate but not drain.
+    assert!(client.has_permission(&secondary, &Permission::Pause));
+    assert!(client.has_permission(&secondary, &Permission::RotateOracle));
+    assert!(!client.has_permission(&secondary, &Permission::Drain));
+
+    // Emergency may only pause.
+    assert!(client.has_permission(&emergency, &Permission::Pause));
+    assert!(!client.has_permission(&emergency, &Permission::Drain));
+    assert!(!client.has_permission(&emergency, &Permission::RotateOracle));
+
+    // Unknown addresses have no permissions.
+    let stranger = Address::generate(&env);
+    assert!(!client.has_permission(&stranger, &Permission::Pause));
+}
+
+#[test]
+fn test_emergency_role_can_pause_but_not_drain_or_rotate() {
+    let (env, contract_id, _oracle, _p1, _p2, _token, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let emergency = Address::generate(&env);
+    client.assign_role(&admin, &emergency, &AdminRole::Emergency);
+
+    // Emergency role may pause.
+    client.pause_as(&emergency);
+    assert!(client.is_paused());
+    client.unpause_as(&emergency);
+    assert!(!client.is_paused());
+
+    // Emergency role may not rotate the oracle.
+    let new_oracle = Address::generate(&env);
+    assert_eq!(
+        client.try_update_oracle_as(&emergency, &new_oracle),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    // Emergency role may not drain.
+    client.pause();
+    assert_eq!(
+        client.try_emergency_drain(&emergency),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #2082 — Graceful shutdown
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_pause_blocks_create_match_and_deposit() {
+    let (env, contract_id, _oracle, player1, player2, token, _admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &Some(token),
+        &String::from_str(&env, "shutdown_deposit"),
+        &Platform::Lichess,
+    );
+    client.pause();
 
     assert_eq!(
         client.try_create_match(
             &player1,
             &player2,
             &100,
-            &Some(rogue),
-            &String::from_str(&env, "rogue_token"),
+            &Some(token),
+            &String::from_str(&env, "shutdown_new"),
             &Platform::Lichess,
         ),
-        Err(Ok(Error::TokenNotAllowlisted))
+        Err(Ok(Error::ContractPaused))
+    );
+    assert_eq!(
+        client.try_deposit(&id, &player1),
+        Err(Ok(Error::ContractPaused))
     );
 }
 
 #[test]
-fn test_deposit_rejects_non_whitelisted_token() {
-    let (env, contract_id, _oracle, player1, player2, _token, admin, _safe) = setup();
+fn test_pause_allows_active_match_to_complete() {
+    let (env, contract_id, oracle, player1, player2, token, _admin, _safe) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
-    let usdc = setup_second_token(&env, &contract_id, &player1, &player2);
-    client.add_token(&usdc, &admin);
+    let token_client = TokenClient::new(&env, &token);
 
     let id = client.create_match(
         &player1,
         &player2,
         &100,
-        &Some(usdc.clone()),
-        &String::from_str(&env, "deposit_delisted"),
+        &Some(token),
+        &String::from_str(&env, "shutdown_complete"),
         &Platform::Lichess,
     );
+    client.deposit(&id, &player1);
+    client.deposit(&id, &player2);
+    assert_eq!(client.get_match(&id).state, MatchState::Active);
 
-    // Delisting after creation must block further deposits into that match.
-    client.remove_token(&usdc, &admin);
-    assert_eq!(
-        client.try_deposit(&id, &player1),
-        Err(Ok(Error::TokenNotAllowlisted))
-    );
-}
+    client.pause();
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Issue #2087 / #2089 — per-token ledgers, no cross-token contamination,
-// aggregate totals, and get_escrow_balance_by_token.
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn test_escrow_balance_map_tracks_tokens_independently() {
-    let (env, contract_id, _oracle, player1, player2, xlm, admin, _safe) = setup();
-    let client = EscrowContractClient::new(&env, &contract_id);
-    let usdc = setup_second_token(&env, &contract_id, &player1, &player2);
-    client.add_token(&usdc, &admin);
-
-    let xlm_id = client.create_match(
-        &player1,
-        &player2,
-        &100,
-        &Some(xlm.clone()),
-        &String::from_str(&env, "ledger-xlm"),
-        &Platform::Lichess,
-    );
-    let usdc_id = client.create_match(
-        &player1,
-        &player2,
-        &250,
-        &Some(usdc.clone()),
-        &String::from_str(&env, "ledger-usdc"),
-        &Platform::Lichess,
-    );
-
-    client.deposit(&xlm_id, &player1);
-    client.deposit(&usdc_id, &player1);
-    client.deposit(&usdc_id, &player2);
-
-    // Per-match map: only the match's own token has a non-zero entry.
-    let xlm_bal = client.get_escrow_balance(&xlm_id);
-    assert_eq!(xlm_bal.total, 100);
-    assert_eq!(xlm_bal.balances.get(xlm.clone()), Some(100));
-    assert_eq!(xlm_bal.balances.get(usdc.clone()), None);
-
-    let usdc_bal = client.get_escrow_balance(&usdc_id);
-    assert_eq!(usdc_bal.total, 500);
-    assert_eq!(usdc_bal.balances.get(usdc.clone()), Some(500));
-    assert_eq!(usdc_bal.balances.get(xlm.clone()), None);
-
-    // Query by token agrees with the ledger entries.
-    assert_eq!(client.get_escrow_balance_by_token(&xlm_id, &xlm), 100);
-    assert_eq!(client.get_escrow_balance_by_token(&usdc_id, &usdc), 500);
-    assert_eq!(client.get_escrow_balance_by_token(&xlm_id, &usdc), 0);
-    assert_eq!(client.get_escrow_balance_by_token(&usdc_id, &xlm), 0);
-}
-
-#[test]
-fn test_platform_reserves_tracked_per_token() {
-    let (env, contract_id, _oracle, player1, player2, xlm, admin, _safe) = setup();
-    let client = EscrowContractClient::new(&env, &contract_id);
-    let usdc = setup_second_token(&env, &contract_id, &player1, &player2);
-    client.add_token(&usdc, &admin);
-
-    let xlm_id = client.create_match(
-        &player1,
-        &player2,
-        &100,
-        &Some(xlm.clone()),
-        &String::from_str(&env, "reserve-xlm"),
-        &Platform::Lichess,
-    );
-    let usdc_id = client.create_match(
-        &player1,
-        &player2,
-        &100,
-        &Some(usdc.clone()),
-        &String::from_str(&env, "reserve-usdc"),
-        &Platform::Lichess,
-    );
-    client.deposit(&xlm_id, &player1);
-    client.deposit(&xlm_id, &player2);
-    client.deposit(&usdc_id, &player1);
-    client.deposit(&usdc_id, &player2);
-
-    // Settling the XLM match must not touch the USDC ledger.
+    // In-flight match can still be settled.
     client.submit_result(
-        &xlm_id,
-        &String::from_str(&env, "reserve-xlm"),
+        &id,
+        &String::from_str(&env, "shutdown_complete"),
         &Winner::Player1,
         &oracle,
     );
-    env.ledger().set_sequence_number(env.ledger().sequence() + 17_281);
-    client.finalize_result(&xlm_id, &player1);
+    env.ledger().set_sequence_number(
+        env.ledger().sequence() + crate::DISPUTE_WINDOW_LEDGERS + 1,
+    );
+    client.finalize_result(&id, &player1);
 
-    assert_eq!(client.get_escrow_balance(&xlm_id).total, 0);
-    assert_eq!(client.get_escrow_balance(&usdc_id).total, 200);
-    assert_eq!(client.get_escrow_balance_by_token(&usdc_id, &usdc), 200);
+    assert_eq!(client.get_match(&id).state, MatchState::Completed);
+    assert_eq!(token_client.balance(&player1), 1100);
 }
 
 #[test]
-fn test_total_balance_sums_across_enabled_tokens() {
-    let (env, contract_id, _oracle, player1, player2, xlm, admin, _safe) = setup();
+fn test_withdraw_rejected_while_paused() {
+    let (env, contract_id, _oracle, player1, player2, token, _admin, _safe) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
-    let usdc = setup_second_token(&env, &contract_id, &player1, &player2);
-    client.add_token(&usdc, &admin);
 
-    let xlm_id = client.create_match(
+    let id = client.create_match(
         &player1,
         &player2,
         &100,
-        &Some(xlm.clone()),
-        &String::from_str(&env, "total-xlm"),
+        &Some(token),
+        &String::from_str(&env, "shutdown_withdraw"),
         &Platform::Lichess,
     );
-    let usdc_id = client.create_match(
+    client.deposit(&id, &player1);
+    client.pause();
+
+    assert_eq!(
+        client.try_withdraw(&id, &player1),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn test_unpause_restores_operations() {
+    let (env, contract_id, _oracle, player1, player2, token, _admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    client.pause();
+    client.unpause();
+    assert!(!client.is_paused());
+
+    let id = client.create_match(
         &player1,
         &player2,
-        &300,
-        &Some(usdc.clone()),
-        &String::from_str(&env, "total-usdc"),
+        &100,
+        &Some(token),
+        &String::from_str(&env, "shutdown_resume"),
         &Platform::Lichess,
     );
-    client.deposit(&xlm_id, &player1);
-    client.deposit(&usdc_id, &player1);
-    client.deposit(&usdc_id, &player2);
-
-    let total = client.get_total_escrow_balance();
-    assert_eq!(total.balances.get(xlm.clone()), Some(100));
-    assert_eq!(total.balances.get(usdc.clone()), Some(600));
-    assert_eq!(total.total, 700);
+    client.deposit(&id, &player1);
+    assert_eq!(client.get_escrow_balance(&id), 100);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Issue #2088 — decimals normalization: 6-, 7-, and 8-decimal tokens,
-// boundary values and round-down behaviour.
+// Issue #2084 — Two-factor approval for emergency drain
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn test_normalize_amount_six_decimals() {
-    let (env, contract_id, ..) = setup();
+fn test_two_factor_drain_initiate_and_confirm() {
+    let (env, contract_id, _oracle, _p1, _p2, token, admin, safe) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
-    // 1 unit at 6 decimals == 1_000_000 base units.
-    assert_eq!(client.normalize_amount(&1_000_000, &6), 1_000_000);
-    assert_eq!(client.normalize_amount(&0, &6), 0);
+    let token_client = TokenClient::new(&env, &token);
+    let second = Address::generate(&env);
+    client.assign_role(&admin, &second, &AdminRole::Secondary);
+
+    client.pause();
+    let total = token_client.balance(&contract_id);
+
+    client.initiate_drain(&admin);
+    // First signature alone must not move funds.
+    assert_eq!(token_client.balance(&contract_id), total);
+
+    client.confirm_drain(&second);
+    assert_eq!(token_client.balance(&contract_id), 0);
+    assert_eq!(token_client.balance(&safe), total);
 }
 
 #[test]
-fn test_normalize_amount_seven_decimals_rounds_down() {
-    let (env, contract_id, ..) = setup();
+fn test_two_factor_drain_same_signer_rejected() {
+    let (env, contract_id, _oracle, _p1, _p2, _token, admin, _safe) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
-    // 1 unit at 7 decimals == 10_000_000 base units; converting to the 6-decimal
-    // common base unit drops the extra digit (round down, never up).
-    assert_eq!(client.normalize_amount(&10_000_000, &7), 1_000_000);
-    assert_eq!(client.normalize_amount(&19_999_999, &7), 1_000_000);
-    assert_eq!(client.normalize_amount(&9, &7), 0);
+
+    client.pause();
+    client.initiate_drain(&admin);
+    assert_eq!(
+        client.try_confirm_drain(&admin),
+        Err(Ok(Error::SameSignerNotAllowed))
+    );
 }
 
 #[test]
-fn test_normalize_amount_eight_decimals_rounds_down() {
-    let (env, contract_id, ..) = setup();
+fn test_two_factor_drain_missing_second_signature_leaves_funds() {
+    let (env, contract_id, _oracle, _p1, _p2, token, admin, _safe) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
-    assert_eq!(client.normalize_amount(&100_000_000, &8), 1_000_000);
-    assert_eq!(client.normalize_amount(&199_999_999, &8), 1_000_000);
-    assert_eq!(client.normalize_amount(&99, &8), 0);
+    let token_client = TokenClient::new(&env, &token);
+
+    client.pause();
+    let total = token_client.balance(&contract_id);
+    client.initiate_drain(&admin);
+
+    // No confirmation: funds remain in the contract.
+    assert_eq!(token_client.balance(&contract_id), total);
 }
 
 #[test]
-fn test_normalize_amount_boundary_values() {
-    let (env, contract_id, ..) = setup();
+fn test_two_factor_drain_expired_proposal_rejected() {
+    let (env, contract_id, _oracle, _p1, _p2, _token, admin, _safe) = setup();
     let client = EscrowContractClient::new(&env, &contract_id);
-    // Zero and the smallest representable amounts must not panic or wrap.
-    assert_eq!(client.normalize_amount(&0, &8), 0);
-    assert_eq!(client.normalize_amount(&1, &8), 0);
-    assert_eq!(client.normalize_amount(&1, &6), 1);
-    // i128::MAX at 6 decimals is already the base unit and stays unchanged.
-    assert_eq!(client.normalize_amount(&i128::MAX, &6), i128::MAX);
+    let second = Address::generate(&env);
+    client.assign_role(&admin, &second, &AdminRole::Secondary);
+
+    client.pause();
+    client.initiate_drain(&admin);
+    env.ledger().set_sequence_number(
+        env.ledger().sequence() + crate::DRAIN_APPROVAL_WINDOW_LEDGERS + 1,
+    );
+    assert_eq!(
+        client.try_confirm_drain(&second),
+        Err(Ok(Error::DrainApprovalExpired))
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #2085 — SAC token metadata validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_add_token_accepts_compliant_sac() {
+    let (env, contract_id, _oracle, player1, player2, _token, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let usdc = setup_second_token(&env, &contract_id, &player1, &player2);
+
+    client.add_token(&usdc, &admin);
+    assert!(client.is_token_allowlisted(&usdc));
+}
+
+#[test]
+fn test_add_token_rejects_non_sep41_contract() {
+    let (env, contract_id, _oracle, _p1, _p2, _token, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    // A contract that does not implement the SEP-41 interface.
+    let bogus = env.register(DummyContract, ());
+    assert_eq!(
+        client.try_add_token(&bogus, &admin),
+        Err(Ok(Error::TokenNotSep41))
+    );
+    assert!(!client.is_token_allowlisted(&bogus));
+}
+
+#[test]
+fn test_add_token_rejects_invalid_metadata() {
+    let (env, contract_id, _oracle, _p1, _p2, _token, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    // A SEP-41-shaped contract that reports an empty symbol/name.
+    let bad = env.register(BadMetadataToken, ());
+    assert_eq!(
+        client.try_add_token(&bad, &admin),
+        Err(Ok(Error::InvalidTokenMetadata))
+    );
+}
+
+#[test]
+fn test_add_token_emits_validation_event() {
+    let (env, contract_id, _oracle, player1, player2, _token, admin, _safe) = setup();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let usdc = setup_second_token(&env, &contract_id, &player1, &player2);
+
+    client.add_token(&usdc, &admin);
+
+    let events = env.events().all();
+    let validated = events.iter().find(|(_, t, _)| {
+        t.len() == 2
+            && Symbol::try_from_val(&env, &t.get(0).unwrap()).unwrap()
+                == Symbol::new(&env, "token")
+            && Symbol::try_from_val(&env, &t.get(1).unwrap()).unwrap()
+                == symbol_short!("validat")
+    });
+    assert!(
+        validated.is_some(),
+        "token validation event not found ({} events total)",
+        events.len()
+    );
+}
+
+// Minimal contract used to prove non-SEP-41 tokens are rejected.
+#[contract]
+pub struct DummyContract;
+
+#[contractimpl]
+impl DummyContract {
+    pub fn ping() -> u32 {
+        0
+    }
+}
+
+// SEP-41-shaped contract that returns invalid metadata.
+#[contract]
+pub struct BadMetadataToken;
+
+#[contractimpl]
+impl BadMetadataToken {
+    pub fn name(_env: Env) -> String {
+        String::from_str(&_env, "")
+    }
+    pub fn symbol(_env: Env) -> String {
+        String::from_str(&_env, "")
+    }
+    pub fn decimals(_env: Env) -> u32 {
+        7
+    }
+    pub fn balance(_env: Env, _id: Address) -> i128 {
+        0
+    }
+    pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {}
+    pub fn transfer_from(_env: Env, _spender: Address, _from: Address, _to: Address, _amount: i128) {}
+    pub fn approve(_env: Env, _from: Address, _spender: Address, _amount: i128, _expiration_ledger: u32) {}
+    pub fn allowance(_env: Env, _from: Address, _spender: Address) -> i128 {
+        0
+    }
 }

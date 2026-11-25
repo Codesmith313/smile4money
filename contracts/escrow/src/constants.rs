@@ -84,47 +84,23 @@ pub const INSTANCE_BUMP_AMOUNT: u32 = MATCH_TTL_LEDGERS;
 /// (see `docs/deployment.md`).
 pub const ESCROW_RESERVE_BUFFER_STROOPS: i128 = 15_000_000;
 
-/// Number of decimals in the common base unit all token amounts are normalized
-/// to for arithmetic inside the contract.
+/// Number of ledgers a pending emergency-drain proposal stays open awaiting its
+/// second signature (24 hours).
 ///
-/// **Source:** policy decided by this repository. 7 decimals matches Stellar's
-/// native asset (1 XLM = 10^7 stroops), so native-token amounts need no scaling
-/// and every other token is scaled up/down relative to that same base. See
-/// [`MAX_TOKEN_DECIMALS`] and the rounding policy below.
-pub const BASE_DECIMALS: u32 = 7;
+/// **Source:** policy decided by this repository for the two-factor drain
+/// approval flow (issue #2084). A drain must be initiated by one authorized
+/// signer and confirmed by a second authorized signer within this window;
+/// otherwise the proposal expires and must be re-initiated. Bounding the window
+/// limits how long a single compromised key can leave a drain pending.
+///
+/// `LEDGERS_PER_DAY` ledgers = 24 h at the Stellar 5 s/ledger average.
+pub const DRAIN_APPROVAL_WINDOW_LEDGERS: u32 = LEDGERS_PER_DAY;
 
-/// Upper bound on the number of decimals a token registered via `add_token`
-/// may report. Tokens with more decimals are rejected at registration time so
-/// that normalization can never overflow the `i128` amount type.
+/// Maximum number of decimals accepted when validating SEP-41 token metadata.
 ///
-/// **Source:** policy decided by this repository; `10^18` is the largest power
-/// of ten that keeps scaled amounts within `i128` for realistic balances.
+/// **Source:** policy decided by this repository for SAC token metadata
+/// validation (issue #2085). `decimals` is a `u32` in the SEP-41 interface, but
+/// values beyond 18 are not meaningful for any real asset and would make
+/// amount scaling overflow-prone, so tokens reporting more are rejected at
+/// registration time.
 pub const MAX_TOKEN_DECIMALS: u32 = 18;
-
-/// Rounding policy for decimal normalization.
-///
-/// All token amounts are converted to the common base unit
-/// ([`BASE_DECIMALS`] decimals) before any arithmetic:
-///
-/// - **Scaling up** (token decimals < [`BASE_DECIMALS`]) is exact: the amount is
-///   multiplied by `10^(BASE_DECIMALS - token_decimals)`.
-/// - **Scaling down** (token decimals > [`BASE_DECIMALS`]) **rounds down**
-///   (truncates toward zero) on deposit, so the contract never credits more
-///   base units than were actually transferred in.
-/// - **Non-representable amounts are rejected**: a deposit whose amount is not
-///   an exact multiple of `10^(token_decimals - BASE_DECIMALS)` would lose
-///   precision, so it fails with an error instead of being silently truncated.
-///
-/// This keeps every stored amount an exact multiple of one base unit and makes
-/// conversions deterministic and lossless in the direction that matters
-/// (crediting the user).
-pub const ROUNDING_POLICY: RoundingPolicy = RoundingPolicy::RoundDownRejectInexact;
-
-/// Rounding behaviour applied when normalizing token amounts to
-/// [`BASE_DECIMALS`]. See [`ROUNDING_POLICY`] for the documented policy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RoundingPolicy {
-    /// Round down (truncate toward zero) on deposit and reject amounts that are
-    /// not exactly representable in the base unit.
-    RoundDownRejectInexact,
-}

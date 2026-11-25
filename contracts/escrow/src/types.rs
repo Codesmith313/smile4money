@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Map, String};
+use soroban_sdk::{contracttype, Address, String};
 
 /// Represents the lifecycle state of a chess match held in escrow.
 ///
@@ -292,66 +292,116 @@ pub struct Match {
     pub completed_ledger: Option<u32>,
 }
 
-/// Per-token configuration for a whitelisted SEP-41 token.
+/// Administrative roles recognised by the contract.
 ///
-/// Stored under [`DataKey::TokenWhitelist`] for every token the admin has
-/// approved for matches. The record carries both the token's decimal
-/// configuration — needed to normalize amounts to a common base unit — and the
-/// enabled flag that gates whether new matches may use the token.
-///
-/// # Decimals and rounding
-///
-/// `decimals` is the number of decimal places the token contract reports
-/// (e.g. 7 for XLM, 6 for USDC, 8 for some custom tokens). Amounts are
-/// normalized to a common base unit of [`NORMALIZED_DECIMALS`](crate::NORMALIZED_DECIMALS)
-/// by scaling up when the token has fewer decimals and scaling down — with
-/// truncation towards zero — when it has more. Rounding therefore always
-/// favours the escrow contract, never the caller.
+/// Access control is role-based: each role is granted a fixed set of
+/// [`Permission`]s, and privileged entry points check that the caller holds
+/// the role required for the operation. Role assignments are stored under
+/// [`DataKey::RoleAssignment`] and are managed exclusively by the
+/// [`Primary`](Role::Primary) admin.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TokenConfig {
-    /// Number of decimal places the token contract uses for its amounts.
+pub enum Role {
+    /// The primary administrator.
     ///
-    /// Read from the token contract when the token is whitelisted. Used to
-    /// normalize amounts to a common base unit before arithmetic.
-    pub decimals: u32,
+    /// Holds every permission, including [`Permission::RoleManagement`], and
+    /// is the only role allowed to assign or revoke other roles. There is
+    /// exactly one primary admin, set during
+    /// [`initialize`](crate::EscrowContract::initialize).
+    Primary,
 
-    /// Whether the token is currently enabled for new matches.
+    /// A secondary administrator.
     ///
-    /// A token can be disabled without being removed so that its configuration
-    /// (and any outstanding balances) survive. Disabled tokens are rejected by
-    /// [`create_match`](crate::EscrowContract::create_match) but existing
-    /// matches that already use them can still be settled.
-    pub enabled: bool,
+    /// Intended for day-to-day operational tasks. Holds the routine
+    /// permissions (pause/unpause, oracle rotation, token management) but
+    /// cannot manage roles and cannot initiate or confirm an emergency drain.
+    Secondary,
+
+    /// An emergency administrator.
+    ///
+    /// Deliberately minimal: it may only initiate an emergency drain, and even
+    /// then the drain must be confirmed by a second authorised address (see
+    /// [`PendingDrain`]). It cannot pause, rotate the oracle, manage tokens or
+    /// assign roles.
+    Emergency,
 }
 
-/// Aggregated escrow balances for a single match, broken down by token.
+/// A single privileged action that can be performed on the contract.
 ///
-/// Returned by the multi-token escrow balance query. Each entry in
-/// [`balances`](TokenBalances::balances) is the amount currently held in escrow
-/// for that token, and [`total`](TokenBalances::total) is the sum across all
-/// tokens after normalization to the common base unit.
+/// Permissions are scoped to [`Role`]s rather than to individual addresses so
+/// that the policy is auditable in one place. The mapping is:
 ///
-/// # Cross-token safety
-///
-/// Balances are tracked in independent ledger entries keyed by
-/// `(match_id, token)` — see [`DataKey::EscrowBalance`] — so funds of one token
-/// can never be counted towards another. `total` is a reporting convenience
-/// only; it is never used to authorize a payout.
+/// | Permission        | Primary | Secondary | Emergency |
+/// |-------------------|---------|-----------|-----------|
+/// | `Pause`           | yes     | yes       | no        |
+/// | `Unpause`         | yes     | yes       | no        |
+/// | `DrainInitiate`   | yes     | no        | yes       |
+/// | `DrainConfirm`    | yes     | no        | yes       |
+/// | `OracleRotation`  | yes     | yes       | no        |
+/// | `TokenManagement` | yes     | yes       | no        |
+/// | `RoleManagement`  | yes     | no        | no        |
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TokenBalances {
-    /// Escrowed balance per token, keyed by token contract address.
-    ///
-    /// Only tokens with a non-zero balance are included.
-    pub balances: Map<Address, i128>,
+pub enum Permission {
+    /// Pause the contract, blocking state-changing entry points.
+    Pause,
 
-    /// Sum of all per-token balances, normalized to the common base unit.
+    /// Resume normal operation after a pause.
+    Unpause,
+
+    /// Start the two-phase emergency drain by recording a [`PendingDrain`].
     ///
-    /// Computed by summing each entry of [`balances`](TokenBalances::balances)
-    /// after normalization. Because different tokens have different decimals,
-    /// this figure is meaningful for reporting and monitoring only.
-    pub total: i128,
+    /// The drain does not move funds; it only arms the operation. A second
+    /// authorised address must call the confirm step before any transfer
+    /// happens.
+    DrainInitiate,
+
+    /// Confirm a previously initiated emergency drain and execute it.
+    ///
+    /// Must be authorised by a different address from the initiator.
+    DrainConfirm,
+
+    /// Rotate the trusted oracle address.
+    OracleRotation,
+
+    /// Add or remove tokens from the accepted-token allowlist.
+    TokenManagement,
+
+    /// Assign or revoke [`Role`]s. Reserved for the
+    /// [`Primary`](Role::Primary) admin.
+    RoleManagement,
+}
+
+/// A two-phase emergency drain awaiting its second signature.
+///
+/// The first authorised signer calls the initiate step, which stores this
+/// record. A second authorised signer must then call the confirm step before
+/// `expiry_ledger`; the confirm step executes the transfer to the
+/// pre-registered [`DataKey::SafeAddress`] and clears the record. If the
+/// record expires, the drain is discarded and must be re-initiated.
+///
+/// This dual-signature requirement prevents a single compromised key from
+/// draining the contract.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingDrain {
+    /// The address that initiated the drain.
+    ///
+    /// The confirming address must differ from this one, otherwise a single
+    /// key could satisfy both phases.
+    pub initiator: Address,
+
+    /// The amount to drain, in the smallest unit of the token being drained.
+    ///
+    /// Recorded at initiation time so the confirming signer approves an exact
+    /// amount rather than whatever balance happens to be present later.
+    pub amount: i128,
+
+    /// The ledger sequence number after which this pending drain is invalid.
+    ///
+    /// Once `env.ledger().sequence()` exceeds this value the record can no
+    /// longer be confirmed and must be re-initiated.
+    pub expiry_ledger: u32,
 }
 
 /// Storage keys used by the escrow contract.
@@ -371,6 +421,8 @@ pub struct TokenBalances {
 /// | `DisputeWindowLedgers`     | Instance     | Configurable dispute window duration in ledgers |
 /// | `TimeoutLedgers`           | Instance     | Configurable match timeout duration in ledgers |
 /// | `GameId(String)`           | Persistent   | Deduplication index: game_id → match ID      |
+/// | `RoleAssignment(Role)`     | Instance     | Address holding the given administrative role |
+/// | `PendingDrain`             | Instance     | Armed two-phase emergency drain awaiting confirmation |
 ///
 /// Instance-tier keys share the contract's instance TTL. Persistent-tier keys
 /// have their own TTL extended to `MATCH_TTL_LEDGERS` on every write.
@@ -447,36 +499,6 @@ pub enum DataKey {
     /// Stored in **persistent** storage, bumped alongside the match entries.
     TokenAllowlisted(Address),
 
-    /// Per-token configuration for a whitelisted SEP-41 token.
-    ///
-    /// Maps a token address to its [`TokenConfig`] (decimals and enabled flag).
-    /// Written by [`add_token`](crate::EscrowContract::add_token) and updated by
-    /// [`remove_token`](crate::EscrowContract::remove_token), which disables the
-    /// token rather than deleting the record so its decimals remain available
-    /// for settling existing matches.
-    ///
-    /// Kept in sync with [`TokenAllowlisted`](DataKey::TokenAllowlisted): a token
-    /// is accepted for matches only when both entries exist and the config is
-    /// enabled.
-    /// Stored in **persistent** storage with the same TTL as the match entries.
-    TokenWhitelist(Address),
-
-    /// Escrowed balance for a single `(match_id, token)` pair.
-    ///
-    /// Each supported token has its own independent ledger entry, so balances
-    /// of different tokens can never contaminate one another. Written on
-    /// deposit and decremented on payout or refund.
-    /// Stored in **persistent** storage, bumped alongside the match entry so the
-    /// ledger outlives the match it belongs to.
-    EscrowBalance(u64, Address),
-
-    /// Platform reserve balance held for a single token.
-    ///
-    /// Tracks fees and other funds retained by the platform, kept separately
-    /// per token so reserves of one token are never mixed with another.
-    /// Stored in **persistent** storage with the same TTL as the match entries.
-    PlatformReserve(Address),
-
     /// The pre-registered destination address for [`emergency_drain`](crate::EscrowContract::emergency_drain).
     ///
     /// Write-once: the only write is during [`initialize`](crate::EscrowContract::initialize),
@@ -512,4 +534,19 @@ pub enum DataKey {
     /// [`Error::DuplicateGameId`](crate::errors::Error::DuplicateGameId).
     /// Stored in **persistent** storage with the same TTL as the match.
     GameId(String),
+
+    /// The address currently holding the given administrative [`Role`].
+    ///
+    /// Presence of the key means the role is assigned; absence means it is
+    /// unassigned. Writes are gated on [`Permission::RoleManagement`], which
+    /// only the [`Primary`](Role::Primary) admin holds, so role assignment is
+    /// controlled by the primary admin. Stored in **instance** storage.
+    RoleAssignment(Role),
+
+    /// The armed two-phase emergency drain, if any.
+    ///
+    /// Written by the drain-initiate step and cleared by the drain-confirm
+    /// step (or when the record expires). Its presence means a drain is
+    /// awaiting a second signature. Stored in **instance** storage.
+    PendingDrain,
 }

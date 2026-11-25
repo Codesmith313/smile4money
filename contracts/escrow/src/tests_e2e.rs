@@ -923,3 +923,212 @@ fn test_e2e_finalize_result_rejected_during_dispute_window() {
     // Match must still be PendingResult
     assert_eq!(client.get_match(&match_id).state, MatchState::PendingResult);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #2082 -- Graceful shutdown (pause / unpause) end-to-end
+// ---------------------------------------------------------------------------
+//
+// Scenario:
+//   1. Create and fund a match (both deposits) -> Active.
+//   2. Admin pauses the contract.
+//   3. New match creation is rejected while paused.
+//   4. The already-Active match can still complete via submit_result and
+//      finalize_result (in-flight transactions settle).
+//   5. Withdrawals are blocked while paused.
+//   6. Admin unpauses -> normal operation resumes (new matches can be created).
+
+/// Full graceful-shutdown flow: pause blocks new matches and withdrawals while
+/// allowing an in-flight match to complete, then unpause restores operation.
+#[test]
+fn test_e2e_graceful_shutdown_flow() {
+    let (env, contract_id, oracle, player1, player2, token, admin, _safe_address) = setup_e2e();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let token_client = TokenClient::new(&env, &token);
+
+    let stake: i128 = 200;
+    let game_id = String::from_str(&env, "e2e-shutdown-active");
+
+    // -- Step 1: Create and fund an in-flight match --------------------------
+    let match_id = client.create_match(
+        &player1,
+        &player2,
+        &stake,
+        &Some(token),
+        &game_id,
+        &Platform::Lichess,
+    );
+    client.deposit(&match_id, &player1);
+    client.deposit(&match_id, &player2);
+
+    assert_eq!(client.get_match(&match_id).state, MatchState::Active);
+    assert_eq!(client.get_escrow_balance(&match_id), (stake * 2) as u128);
+
+    let p1_after_deposit = token_client.balance(&player1);
+    let p2_after_deposit = token_client.balance(&player2);
+
+    // -- Step 2: Admin pauses the contract -----------------------------------
+    client.pause(&admin);
+
+    // -- Step 3: New match creation is rejected while paused -----------------
+    let new_game_id = String::from_str(&env, "e2e-shutdown-new");
+    let create_result = client.try_create_match(
+        &player1,
+        &player2,
+        &stake,
+        &Some(token.clone()),
+        &new_game_id,
+        &Platform::Lichess,
+    );
+    assert!(
+        create_result.is_err(),
+        "create_match must be rejected while the contract is paused"
+    );
+
+    // -- Step 4: Withdrawals are blocked while paused ------------------------
+    let withdraw_result = client.try_withdraw(&match_id, &player1);
+    assert!(
+        withdraw_result.is_err(),
+        "withdraw must be blocked while the contract is paused"
+    );
+
+    // -- Step 5: The in-flight match can still complete ----------------------
+    // Oracle submits the result -> match enters PendingResult (no payout yet).
+    client.submit_result(&match_id, &game_id, &Winner::Player1, &oracle);
+    assert_eq!(client.get_match(&match_id).state, MatchState::PendingResult);
+
+    // Balances unchanged -- payout deferred until finalize.
+    assert_eq!(token_client.balance(&player1), p1_after_deposit);
+    assert_eq!(token_client.balance(&player2), p2_after_deposit);
+
+    // Advance past the dispute window and finalize -> payout executes even
+    // though the contract is still paused.
+    let current = env.ledger().sequence();
+    env.ledger().set_sequence_number(current + crate::DISPUTE_WINDOW_LEDGERS + 1);
+    client.finalize_result(&match_id, &player1);
+
+    assert_eq!(client.get_match(&match_id).state, MatchState::Completed);
+    assert_eq!(token_client.balance(&player1), p1_after_deposit + stake * 2);
+    assert_eq!(token_client.balance(&player2), p2_after_deposit);
+    assert_eq!(client.get_escrow_balance(&match_id), 0u128);
+
+    // -- Step 6: Unpause restores normal operation ---------------------------
+    client.unpause(&admin);
+
+    let resumed_game_id = String::from_str(&env, "e2e-shutdown-resumed");
+    let resumed_id = client.create_match(
+        &player1,
+        &player2,
+        &stake,
+        &Some(token),
+        &resumed_game_id,
+        &Platform::Lichess,
+    );
+    assert_eq!(client.get_match(&resumed_id).state, MatchState::Pending);
+
+    // The resumed match can be funded and completed normally.
+    client.deposit(&resumed_id, &player1);
+    client.deposit(&resumed_id, &player2);
+    assert_eq!(client.get_match(&resumed_id).state, MatchState::Active);
+
+    client.submit_result(&resumed_id, &resumed_game_id, &Winner::Draw, &oracle);
+    assert_eq!(client.get_match(&resumed_id).state, MatchState::PendingResult);
+
+    let current = env.ledger().sequence();
+    env.ledger().set_sequence_number(current + crate::DISPUTE_WINDOW_LEDGERS + 1);
+    client.finalize_result(&resumed_id, &player1);
+    assert_eq!(client.get_match(&resumed_id).state, MatchState::Completed);
+    assert_eq!(client.get_escrow_balance(&resumed_id), 0u128);
+}
+
+/// While paused, an already-Active match must still be able to complete via
+/// the immediate `submit_result` payout path (no dispute window involved).
+#[test]
+fn test_e2e_pause_allows_active_match_to_complete() {
+    let (env, contract_id, oracle, player1, player2, token, admin, _safe_address) = setup_e2e();
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let token_client = TokenClient::new(&env, &token);
+
+    let stake: i128 = 100;
+    let game_id = String::from_str(&env, "e2e-pause-complete");
+
+    let match_id = client.create_match(
+        &player1,
+        &player2,
+        &stake,
+        &Some(token),
+        &game_id,
+        &Platform::Lichess,
+    );
+    client.deposit(&match_id, &player1);
+    client.deposit(&match_id, &player2);
+    assert_eq!(client.get_match(&match_id).state, MatchState::Active);
+
+    // Pause the contract mid-match.
+    client.pause(&admin);
+
+    // The active match must still be able to settle.
+    client.submit_result(&match_id, &game_id, &Winner::Player2, &oracle);
+    assert_eq!(client.get_match(&match_id).state, MatchState::PendingResult);
+
+    let current = env.ledger().sequence();
+    env.ledger().set_sequence_number(current + crate::DISPUTE_WINDOW_LEDGERS + 1);
+    client.finalize_result(&match_id, &player1);
+
+    assert_eq!(client.get_match(&match_id).state, MatchState::Completed);
+    assert_eq!(token_client.balance(&player2), 1_000 + stake);
+    assert_eq!(token_client.balance(&player1), 1_000 - stake);
+    assert_eq!(client.get_escrow_balance(&match_id), 0u128);
+}
+
+/// Deposits into an existing (Pending) match must be blocked while paused,
+/// since a paused contract must not accept new funds.
+#[test]
+fn test_e2e_pause_blocks_deposits() {
+    let (env, contract_id, _oracle, player1, player2, token, admin, _safe_address) = setup_e2e();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let game_id = String::from_str(&env, "e2e-pause-deposit");
+
+    let match_id = client.create_match(
+        &player1,
+        &player2,
+        &100,
+        &Some(token),
+        &game_id,
+        &Platform::Lichess,
+    );
+
+    client.pause(&admin);
+
+    let deposit_result = client.try_deposit(&match_id, &player1);
+    assert!(
+        deposit_result.is_err(),
+        "deposit must be blocked while the contract is paused"
+    );
+
+    // Match remains Pending with no funds escrowed.
+    assert_eq!(client.get_match(&match_id).state, MatchState::Pending);
+    assert_eq!(client.get_escrow_balance(&match_id), 0u128);
+
+    // After unpause, the deposit succeeds normally.
+    client.unpause(&admin);
+    client.deposit(&match_id, &player1);
+    assert_eq!(client.get_escrow_balance(&match_id), 100u128);
+}
+
+/// Only the admin may pause/unpause; a non-admin caller must be rejected.
+#[test]
+fn test_e2e_pause_requires_admin() {
+    let (env, contract_id, _oracle, player1, _player2, _token, _admin, _safe_address) = setup_e2e();
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let impostor = Address::generate(&env);
+    assert!(
+        client.try_pause(&impostor).is_err(),
+        "non-admin must not be able to pause the contract"
+    );
+    assert!(
+        client.try_unpause(&impostor).is_err(),
+        "non-admin must not be able to unpause the contract"
+    );
+}

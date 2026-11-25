@@ -44,16 +44,21 @@ pub use smile4money_common::SharedError;
 /// | 25   | StakeTooHigh          |         | stake_amount exceeds the maximum allowed stake       |
 /// | 26   | InsufficientReserve   |         | contract balance too low to cover payout + Stellar minimum reserve |
 /// | 27   | InvalidAddress        |         | a player address is invalid (zero address / burn address) |
-/// | 28   | TokenNotAllowlisted   |         | the token is not on the admin-managed allowlist      |
-/// | 29   | TokenAlreadyListed    |         | add_token called for a token already allowlisted     |
-/// | 30   | TokenNotListed        |         | remove_token called for a token not allowlisted      |
-/// | 31   | CannotRemoveDefault   |         | remove_token called for the contract's default token |
-/// | 32   | InvalidStakeAmount    |         | stake_amount is exactly zero                         |
-/// | 33   | ActiveMatchExists     |         | emergency_drain called while a match is Active       |
-/// | 34   | DisputeWindowExpired  |         | override_result called after the dispute window expired |
-/// | 35   | InvalidTokenDecimals  |         | token decimals outside the accepted range            |
-/// | 36   | AmountNotRepresentable|         | amount cannot be normalized to the base unit without loss |
-/// | 37   | TokenDisabled         |         | whitelisted token is currently disabled              |
+/// | 28   | DisputeWindowExpired  |         | override_result called after the dispute window expired |
+/// | 29   | TokenNotAllowlisted   |         | token is not on the admin-managed allowlist          |
+/// | 30   | TokenAlreadyListed    |         | add_token called for an already allowlisted token    |
+/// | 31   | TokenNotListed        |         | remove_token called for a token that is not allowlisted |
+/// | 32   | CannotRemoveDefault   |         | remove_token called for the contract's default token |
+/// | 33   | InvalidStakeAmount    |         | stake_amount is exactly zero                         |
+/// | 34   | ActiveMatchExists     |         | emergency_drain called while an Active match exists  |
+/// | 35   | RoleNotAssigned       |         | caller has no role assigned for this operation       |
+/// | 36   | InsufficientPermission|         | caller's role does not grant the required permission |
+/// | 37   | PendingDrainExists    |         | a drain is already awaiting second-signer approval   |
+/// | 38   | NoPendingDrain        |         | no pending drain exists to confirm or cancel         |
+/// | 39   | DrainApprovalExpired  |         | pending drain approval window has expired            |
+/// | 40   | SameSignerNotAllowed  |         | initiator and confirmer must be different addresses  |
+/// | 41   | TokenNotSep41         |         | token does not implement the SEP-41 interface       |
+/// | 42   | InvalidTokenMetadata  |         | token metadata is missing or fails validation        |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -190,27 +195,39 @@ pub enum Error {
     /// [E034] `override_result` was called after the dispute window expired.
     DisputeWindowExpired = 34,
 
-    /// [E035] The token reports a decimals value outside the accepted range.
+    /// [E035] The caller has no role assigned for the requested operation.
     ///
-    /// Returned when a token's `decimals()` result cannot be used for
-    /// normalization — for example a value greater than the maximum supported
-    /// precision. Such a token must not be allowlisted, since amounts could not
-    /// be converted to the common base unit without overflow.
-    InvalidTokenDecimals = 35,
+    /// Returned by role-gated entry points when the caller is not the primary
+    /// admin and holds none of the roles permitted to perform the operation.
+    RoleNotAssigned = 35,
 
-    /// [E036] The amount cannot be normalized to the common base unit without loss.
-    ///
-    /// Returned when converting a token-denominated amount to (or from) the
-    /// base unit would require rounding away a non-zero remainder. Callers must
-    /// supply amounts that are exactly representable in the base unit.
-    AmountNotRepresentable = 36,
+    /// [E036] The caller's role does not grant the permission required by the
+    /// requested operation (e.g. a secondary admin attempting an oracle
+    /// rotation reserved for the primary admin).
+    InsufficientPermission = 36,
 
-    /// [E037] The token is allowlisted but is currently disabled.
-    ///
-    /// A disabled token remains on the allowlist (so its metadata and balances
-    /// are retained) but cannot be used for new matches until re-enabled by the
-    /// admin.
-    TokenDisabled = 37,
+    /// [E037] A two-factor drain is already pending; the existing request must
+    /// be confirmed or cancelled before a new one can be initiated.
+    PendingDrainExists = 37,
+
+    /// [E038] `confirm_drain` / `cancel_drain` was called with no pending drain.
+    NoPendingDrain = 38,
+
+    /// [E039] The pending drain approval window has elapsed; the request must
+    /// be re-initiated by the first signer.
+    DrainApprovalExpired = 39,
+
+    /// [E040] The second signer is the same address as the initiator. Dual
+    /// approval requires two distinct authorized addresses.
+    SameSignerNotAllowed = 40,
+
+    /// [E041] The token does not implement the SEP-41 (Stellar Asset Contract)
+    /// interface required for escrow.
+    TokenNotSep41 = 41,
+
+    /// [E042] The token's metadata (name, symbol, decimals) is missing or fails
+    /// validation.
+    InvalidTokenMetadata = 42,
 }
 
 /// Convert a [`SharedError`] into an escrow [`Error`].

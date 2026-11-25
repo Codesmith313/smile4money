@@ -46,36 +46,6 @@
 //! - [`DataKey`](types::DataKey) — all storage keys used by the contract.
 //! - [`Error`](errors::Error) — every error code the contract can return.
 //!
-//! ## Multi-Token Support
-//!
-//! The contract accepts a configurable set of SEP-41 tokens. Each token is
-//! registered by the admin via [`add_token`](EscrowContract::add_token) and
-//! recorded as a [`TokenConfig`](types::TokenConfig) (decimals + enabled flag)
-//! in the [`DataKey::TokenWhitelist`] map. The token supplied to
-//! [`initialize`](EscrowContract::initialize) is seeded automatically and can
-//! never be removed. Only enabled tokens may be used to create a match or to
-//! deposit into one; delisting a token stops new activity in it without
-//! disturbing in-flight escrows.
-//!
-//! ### Balance Ledgers
-//!
-//! Escrow and platform reserves are tracked **per token**:
-//!
-//! - [`DataKey::EscrowBalance`]`(match_id, token)` — funds held for a match.
-//! - [`DataKey::PlatformReserve`]`(token)` — accumulated platform reserves.
-//!
-//! Ledgers are written on deposit and cleared on payout, refund, or
-//! cancellation, so they always reflect the funds actually held.
-//!
-//! ### Decimals Normalization
-//!
-//! Tokens may use different decimal places (6, 7, 8, …). All reported balances
-//! are normalized to a common **7-decimal base unit** via
-//! [`normalize_to_base`](EscrowContract::normalize_to_base). Tokens with more
-//! than 7 decimals are scaled down and **rounded down** (truncated toward
-//! zero); tokens with fewer are scaled up exactly. Tokens reporting more than
-//! [`MAX_TOKEN_DECIMALS`] decimals are rejected.
-//!
 //! ## Further Reading
 //!
 //! - Architecture & sequence diagrams: [`docs/architecture.md`](../../docs/architecture.md)
@@ -96,18 +66,19 @@ mod types;
 pub use constants::*;
 
 use errors::Error;
-use soroban_sdk::{
-    contract, contractimpl, symbol_short, token, vec, Address, Env, Map, String, Symbol,
-    TryFromVal, Vec,
-};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, vec, Address, Env, String, Symbol, TryFromVal, Vec};
 
 /// Topic symbol for the event emitted when the contract is paused.
 const CONTRACT_PAUSED: Symbol = symbol_short!("paused");
 /// Topic symbol for the event emitted when the contract is unpaused.
 const CONTRACT_UNPAUSED: Symbol = symbol_short!("unpaused");
-use types::{
-    DataKey, Match, MatchState, OptionalWinner, Platform, TokenBalances, TokenConfig, Winner,
-};
+use types::{AdminRole, DataKey, Match, MatchState, OptionalWinner, PendingDrain, Permission, Platform, Winner};
+
+/// Maximum number of decimals a SEP-41 token may report for it to be accepted.
+const MAX_TOKEN_DECIMALS: u32 = 18;
+
+/// Number of ledgers a pending drain approval remains valid before it expires.
+const DRAIN_APPROVAL_WINDOW_LEDGERS: u32 = 720; // ~1 hour at 5 s/ledger
 
 fn is_zero_address(env: &Env, addr: &Address) -> bool {
     // The all-zeros Stellar account key encodes to this strkey.
@@ -154,43 +125,137 @@ impl EscrowContract {
             .ok_or(Error::NotInitialized)
     }
 
-    /// Pause the contract, blocking state-changing operations.
+    /// Return the role assigned to `account`, or `None` if it holds no role.
+    pub fn get_role(env: Env, account: Address) -> Option<AdminRole> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Role(account))
+    }
+
+    /// Assign `role` to `account`. Only the primary admin may call this.
     ///
-    /// Only the admin may call this. Emits a `ContractPaused` event carrying the
-    /// admin address and the current ledger sequence number so the action can be
-    /// detected and audited on-chain.
-    pub fn pause(env: Env) -> Result<(), Error> {
+    /// The primary admin is the address stored under [`DataKey::Admin`] at
+    /// initialization. It implicitly holds every permission and is the only
+    /// account allowed to grant or revoke roles.
+    pub fn assign_role(
+        env: Env,
+        caller: Address,
+        account: Address,
+        role: AdminRole,
+    ) -> Result<(), Error> {
+        Self::require_primary_admin(&env, &caller)?;
+        caller.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Role(account.clone()), &role);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Role(account.clone()),
+            MATCH_TTL_LEDGERS,
+            MATCH_TTL_LEDGERS,
+        );
+        Self::bump_instance_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "admin"), symbol_short!("role_set")),
+            (account, role),
+        );
+        Ok(())
+    }
+
+    /// Revoke any role held by `account`. Only the primary admin may call this.
+    pub fn revoke_role(env: Env, caller: Address, account: Address) -> Result<(), Error> {
+        Self::require_primary_admin(&env, &caller)?;
+        caller.require_auth();
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Role(account.clone()));
+        Self::bump_instance_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "admin"), symbol_short!("role_rev")),
+            account,
+        );
+        Ok(())
+    }
+
+    /// Ensure `caller` is the primary admin (the address stored under `DataKey::Admin`).
+    fn require_primary_admin(env: &Env, caller: &Address) -> Result<(), Error> {
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
+        if caller != &admin {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+
+    /// Ensure `caller` holds `permission`, either directly via its assigned role
+    /// or implicitly as the primary admin.
+    fn require_permission(
+        env: &Env,
+        caller: &Address,
+        permission: Permission,
+    ) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if caller == &admin {
+            return Ok(());
+        }
+        let role: AdminRole = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Role(caller.clone()))
+            .ok_or(Error::Unauthorized)?;
+        if role.has_permission(permission) {
+            Ok(())
+        } else {
+            Err(Error::Unauthorized)
+        }
+    }
+
+    /// Pause the contract, blocking new match creation and deposits while
+    /// allowing in-flight matches to settle.
+    ///
+    /// Requires [`Permission::Pause`]. Emits a `ContractPaused` event carrying the
+    /// admin address and the current ledger sequence number so the action can be
+    /// detected and audited on-chain.
+    pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_permission(&env, &caller, Permission::Pause)?;
+        caller.require_auth();
+        if Self::is_paused(&env) {
+            return Ok(());
+        }
         env.storage().instance().set(&DataKey::Paused, &true);
         Self::bump_instance_ttl(&env);
         env.events().publish(
-            (CONTRACT_PAUSED, admin.clone()),
+            (CONTRACT_PAUSED, caller.clone()),
             env.ledger().sequence(),
         );
         Ok(())
     }
 
-    /// Unpause the contract, re-enabling state-changing operations.
+    /// Unpause the contract, re-enabling normal operation.
     ///
-    /// Only the admin may call this. Emits a `ContractUnpaused` event carrying the
-    /// admin address and the current ledger sequence number so the action can be
-    /// detected and audited on-chain.
-    pub fn unpause(env: Env) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
+    /// Requires [`Permission::Unpause`]. Emits a `ContractUnpaused` event carrying
+    /// the admin address and the current ledger sequence number so the action can
+    /// be detected and audited on-chain.
+    pub fn unpause(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_permission(&env, &caller, Permission::Unpause)?;
+        caller.require_auth();
+        if !Self::is_paused(&env) {
+            return Ok(());
+        }
         env.storage().instance().set(&DataKey::Paused, &false);
         Self::bump_instance_ttl(&env);
         env.events().publish(
-            (CONTRACT_UNPAUSED, admin.clone()),
+            (CONTRACT_UNPAUSED, caller.clone()),
             env.ledger().sequence(),
         );
         Ok(())
@@ -276,154 +341,6 @@ impl EscrowContract {
         true
     }
 
-    /// Read the [`TokenConfig`] for `token` from the whitelist, if present.
-    ///
-    /// A token is considered *enabled* when it has a config entry with
-    /// `enabled == true`. `remove_token` flips the flag to `false` rather than
-    /// deleting the entry so that the recorded `decimals` survive for
-    /// historical reporting (e.g. `get_escrow_balance` on an in-flight match
-    /// whose token was delisted after the match was created).
-    fn get_token_config(env: &Env, token: &Address) -> Option<TokenConfig> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::TokenWhitelist(token.clone()))
-    }
-
-    /// Return whether `token` is currently enabled on the whitelist.
-    fn is_token_enabled(env: &Env, token: &Address) -> bool {
-        match Self::get_token_config(env, token) {
-            Some(cfg) => cfg.enabled,
-            None => false,
-        }
-    }
-
-    /// Persist a [`TokenConfig`] and bump its persistent TTL.
-    fn set_token_config(env: &Env, token: &Address, cfg: &TokenConfig) {
-        let key = DataKey::TokenWhitelist(token.clone());
-        env.storage().persistent().set(&key, cfg);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
-    }
-
-    /// Normalize `amount` from a token with `decimals` decimal places to the
-    /// contract's common 7-decimal base unit.
-    ///
-    /// # Rounding policy
-    ///
-    /// Tokens with **more** than 7 decimals are scaled **down** by
-    /// `10^(decimals - 7)`. Any remainder is **rounded down** (truncated
-    /// toward zero), so the normalized value never overstates the amount held.
-    /// Tokens with **fewer** than 7 decimals are scaled **up** exactly.
-    ///
-    /// # Errors
-    ///
-    /// * [`Error::InvalidDecimals`] — `decimals > MAX_TOKEN_DECIMALS`.
-    /// * [`Error::Overflow`] — the scaled value does not fit in `i128`.
-    fn normalize_to_base(amount: i128, decimals: u32) -> Result<i128, Error> {
-        if decimals > MAX_TOKEN_DECIMALS {
-            return Err(Error::InvalidDecimals);
-        }
-        if decimals == BASE_DECIMALS {
-            return Ok(amount);
-        }
-        if decimals < BASE_DECIMALS {
-            let factor = 10i128
-                .checked_pow(BASE_DECIMALS - decimals)
-                .ok_or(Error::Overflow)?;
-            amount.checked_mul(factor).ok_or(Error::Overflow)
-        } else {
-            let factor = 10i128
-                .checked_pow(decimals - BASE_DECIMALS)
-                .ok_or(Error::Overflow)?;
-            // Integer division truncates toward zero: round-down policy.
-            Ok(amount / factor)
-        }
-    }
-
-    /// Convert a normalized 7-decimal base-unit `amount` back into the native
-    /// units of a token with `decimals` decimal places.
-    ///
-    /// This is the inverse of [`normalize_to_base`](EscrowContract::normalize_to_base)
-    /// for values that are exactly representable; values that were rounded down
-    /// during normalization cannot be recovered. Scaling **down** (token has
-    /// more than 7 decimals) truncates toward zero, matching the round-down
-    /// policy.
-    ///
-    /// # Errors
-    ///
-    /// * [`Error::InvalidDecimals`] — `decimals > MAX_TOKEN_DECIMALS`.
-    /// * [`Error::Overflow`] — the scaled value does not fit in `i128`.
-    fn denormalize_from_base(amount: i128, decimals: u32) -> Result<i128, Error> {
-        if decimals > MAX_TOKEN_DECIMALS {
-            return Err(Error::InvalidDecimals);
-        }
-        if decimals == BASE_DECIMALS {
-            return Ok(amount);
-        }
-        if decimals < BASE_DECIMALS {
-            let factor = 10i128
-                .checked_pow(BASE_DECIMALS - decimals)
-                .ok_or(Error::Overflow)?;
-            Ok(amount / factor)
-        } else {
-            let factor = 10i128
-                .checked_pow(decimals - BASE_DECIMALS)
-                .ok_or(Error::Overflow)?;
-            amount.checked_mul(factor).ok_or(Error::Overflow)
-        }
-    }
-
-    /// Read the escrow ledger entry for `(match_id, token)`.
-    fn get_escrow_ledger(env: &Env, match_id: u64, token: &Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::EscrowBalance(match_id, token.clone()))
-            .unwrap_or(0)
-    }
-
-    /// Overwrite the escrow ledger entry for `(match_id, token)` and bump its TTL.
-    fn set_escrow_ledger(env: &Env, match_id: u64, token: &Address, amount: i128) {
-        let key = DataKey::EscrowBalance(match_id, token.clone());
-        env.storage().persistent().set(&key, &amount);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
-    }
-
-    /// Add `delta` to the escrow ledger entry for `(match_id, token)`.
-    fn add_escrow_ledger(
-        env: &Env,
-        match_id: u64,
-        token: &Address,
-        delta: i128,
-    ) -> Result<(), Error> {
-        let current = Self::get_escrow_ledger(env, match_id, token);
-        let next = current.checked_add(delta).ok_or(Error::Overflow)?;
-        Self::set_escrow_ledger(env, match_id, token, next);
-        Ok(())
-    }
-
-    /// Read the platform reserve ledger entry for `token`.
-    fn get_platform_reserve(env: &Env, token: &Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PlatformReserve(token.clone()))
-            .unwrap_or(0)
-    }
-
-    /// Add `delta` to the platform reserve ledger entry for `token`.
-    fn add_platform_reserve(env: &Env, token: &Address, delta: i128) -> Result<(), Error> {
-        let current = Self::get_platform_reserve(env, token);
-        let next = current.checked_add(delta).ok_or(Error::Overflow)?;
-        let key = DataKey::PlatformReserve(token.clone());
-        env.storage().persistent().set(&key, &next);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
-        Ok(())
-    }
-
     /// Extend the lifetime of every instance-storage entry held by this contract.
     ///
     /// Instance storage (oracle, admin, token, paused, match_count) shares a single
@@ -498,26 +415,23 @@ impl EscrowContract {
             return Err(Error::AlreadyInitialized);
         }
         let token_client = token::Client::new(&env, &token);
-        let decimals = token_client.decimals();
-        if decimals > MAX_TOKEN_DECIMALS {
-            return Err(Error::InvalidDecimals);
-        }
+        let _ = token_client.decimals();
         env.storage().instance().set(&DataKey::Oracle, &oracle);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
 
-        // Seed the whitelist with the default token so a contract that is
-        // never extended behaves exactly as it did before the whitelist
+        // Seed the allowlist with the default token so a contract that is
+        // never extended behaves exactly as it did before the allowlist
         // existed: the only accepted token is the one passed to `initialize`.
         // `remove_token` refuses to remove this entry, so the contract can
         // never be left with no acceptable token at all.
-        Self::set_token_config(
-            &env,
-            &token,
-            &TokenConfig {
-                decimals,
-                enabled: true,
-            },
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenAllowlisted(token.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TokenAllowlisted(token.clone()),
+            MATCH_TTL_LEDGERS,
+            MATCH_TTL_LEDGERS,
         );
         env.storage()
             .instance()
@@ -543,124 +457,10 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Add (or re-enable) a token on the escrow whitelist — admin only.
-    ///
-    /// The token contract is queried for its `decimals()` so that amounts can be
-    /// normalized to the common 7-decimal base unit. Tokens reporting more than
-    /// [`MAX_TOKEN_DECIMALS`] decimals are rejected with
-    /// [`Error::InvalidDecimals`].
-    ///
-    /// Re-adding an already-enabled token updates its recorded decimals and
-    /// emits a fresh `TokenWhitelisted` event, keeping the audit trail complete.
-    ///
-    /// # Errors
-    ///
-    /// * [`Error::Unauthorized`]     — caller is not the admin.
-    /// * [`Error::InvalidDecimals`]  — the token reports unsupported decimals.
-    pub fn add_token(env: Env, caller: Address, token: Address) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::Unauthorized)?;
-        if caller != admin {
-            return Err(Error::Unauthorized);
-        }
+    /// Rotate the oracle address — requires [`Permission::OracleRotation`].
+    pub fn update_oracle(env: Env, caller: Address, new_oracle: Address) -> Result<(), Error> {
+        Self::require_permission(&env, &caller, Permission::OracleRotation)?;
         caller.require_auth();
-
-        let token_client = token::Client::new(&env, &token);
-        let decimals = token_client.decimals();
-        if decimals > MAX_TOKEN_DECIMALS {
-            return Err(Error::InvalidDecimals);
-        }
-
-        Self::set_token_config(
-            &env,
-            &token,
-            &TokenConfig {
-                decimals,
-                enabled: true,
-            },
-        );
-        Self::bump_instance_ttl(&env);
-
-        env.events().publish(
-            (Symbol::new(&env, "token"), symbol_short!("whitelist")),
-            (token, decimals, admin),
-        );
-        Ok(())
-    }
-
-    /// Remove a token from the escrow whitelist — admin only.
-    ///
-    /// The token is marked disabled rather than deleted so its decimals remain
-    /// available for reporting on matches that were created while it was
-    /// enabled. New matches can no longer be created in this token, and
-    /// deposits into existing matches are rejected with
-    /// [`Error::TokenNotAllowlisted`].
-    ///
-    /// The default token supplied to [`initialize`](EscrowContract::initialize)
-    /// cannot be removed; attempting to do so returns
-    /// [`Error::CannotRemoveDefaultToken`].
-    ///
-    /// # Errors
-    ///
-    /// * [`Error::Unauthorized`]             — caller is not the admin.
-    /// * [`Error::TokenNotAllowlisted`]      — the token is not on the whitelist.
-    /// * [`Error::CannotRemoveDefaultToken`] — the token is the contract default.
-    pub fn remove_token(env: Env, caller: Address, token: Address) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::Unauthorized)?;
-        if caller != admin {
-            return Err(Error::Unauthorized);
-        }
-        caller.require_auth();
-
-        let default_token: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Token)
-            .ok_or(Error::Unauthorized)?;
-        if token == default_token {
-            return Err(Error::CannotRemoveDefaultToken);
-        }
-
-        let mut cfg = Self::get_token_config(&env, &token).ok_or(Error::TokenNotAllowlisted)?;
-        if !cfg.enabled {
-            return Err(Error::TokenNotAllowlisted);
-        }
-        cfg.enabled = false;
-        Self::set_token_config(&env, &token, &cfg);
-        Self::bump_instance_ttl(&env);
-
-        env.events().publish(
-            (Symbol::new(&env, "token"), symbol_short!("delisted")),
-            (token, admin),
-        );
-        Ok(())
-    }
-
-    /// Return the [`TokenConfig`] for `token`, or `None` if it was never added.
-    pub fn get_token_config(env: Env, token: Address) -> Option<TokenConfig> {
-        Self::get_token_config(&env, &token)
-    }
-
-    /// Return whether `token` is currently enabled on the escrow whitelist.
-    pub fn is_token_whitelisted(env: Env, token: Address) -> bool {
-        Self::is_token_enabled(&env, &token)
-    }
-
-    /// Rotate the oracle address — requires the current admin to authorize.
-    pub fn update_oracle(env: Env, new_oracle: Address) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::Unauthorized)?;
-        admin.require_auth();
         let old_oracle: Address = env
             .storage()
             .instance()
@@ -673,7 +473,7 @@ impl EscrowContract {
                 Symbol::new(&env, "admin"),
                 Symbol::new(&env, "oracle_updated"),
             ),
-            (old_oracle, new_oracle, admin),
+            (old_oracle, new_oracle, caller),
         );
         Ok(())
     }
@@ -704,47 +504,10 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Pause the contract — admin only. Blocks create_match, deposit, and submit_result.
-    pub fn pause(env: Env) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::Unauthorized)?;
-        admin.require_auth();
-        if Self::is_paused(env.clone()) {
-            return Ok(());
-        }
-        env.storage().instance().set(&DataKey::Paused, &true);
-        Self::bump_instance_ttl(&env);
-        env.events().publish(
-            (Symbol::new(&env, "admin"), symbol_short!("paused")),
-            (admin, env.ledger().sequence()),
-        );
-        Ok(())
-    }
-
-    /// Unpause the contract — admin only.
-    pub fn unpause(env: Env) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::Unauthorized)?;
-        admin.require_auth();
-        if !Self::is_paused(env.clone()) {
-            return Ok(());
-        }
-        env.storage().instance().set(&DataKey::Paused, &false);
-        Self::bump_instance_ttl(&env);
-        env.events().publish(
-            (Symbol::new(&env, "admin"), symbol_short!("unpaused")),
-            (admin, env.ledger().sequence()),
-        );
-        Ok(())
-    }
-
     /// Create a new match. Both players must call `deposit` before the game starts.
+    ///
+    /// Rejected with [`Error::ContractPaused`] while the contract is paused, so
+    /// no new matches can be created during maintenance or an emergency.
     ///
     /// `token` selects which SEP-41 token this match is escrowed in. Passing
     /// `None` uses the contract's default token (the one supplied to
@@ -829,10 +592,14 @@ impl EscrowContract {
             None => stored_token,
         };
 
-        // The default token is whitelisted by `initialize` and cannot be
+        // The default token is allowlisted by `initialize` and cannot be
         // removed, so checking every token — including the default — against
-        // the whitelist is both simpler and stricter than special-casing it.
-        if !Self::is_token_enabled(&env, &token) {
+        // the allowlist is both simpler and stricter than special-casing it.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::TokenAllowlisted(token.clone()))
+        {
             return Err(Error::TokenNotAllowlisted);
         }
 
@@ -937,12 +704,6 @@ impl EscrowContract {
             return Err(Error::AlreadyFunded);
         }
 
-        // A token delisted after the match was created can no longer accept
-        // deposits; existing escrow remains settleable via payout/refund.
-        if !Self::is_token_enabled(&env, &m.token) {
-            return Err(Error::TokenNotAllowlisted);
-        }
-
         let client = token::Client::new(&env, &m.token);
         let allowance = client.allowance(&player, &env.current_contract_address());
         if allowance < m.stake_amount {
@@ -952,9 +713,6 @@ impl EscrowContract {
             .try_transfer(&player, &env.current_contract_address(), &m.stake_amount)
             .map_err(|_| Error::TransferFailed)?
             .map_err(|_| Error::TransferFailed)?;
-
-        // Record the deposit in the per-token escrow ledger for this match.
-        Self::add_escrow_ledger(&env, match_id, &m.token, m.stake_amount)?;
 
         if is_p1 {
             m.player1_deposited = true;
@@ -1024,6 +782,9 @@ impl EscrowContract {
     ///
     /// `game_id` must match the game_id stored in the match to prevent cross-match
     /// result injection.
+    ///
+    /// Settlement is intentionally **not** blocked while the contract is paused:
+    /// in-flight matches must be able to complete during a graceful shutdown.
     pub fn submit_result(
         env: Env,
         match_id: u64,
@@ -1031,10 +792,6 @@ impl EscrowContract {
         winner: Winner,
         caller: Address,
     ) -> Result<(), Error> {
-        if Self::is_paused(&env) {
-            return Err(Error::ContractPaused);
-        }
-
         let oracle: Address = env
             .storage()
             .instance()
@@ -1259,10 +1016,6 @@ impl EscrowContract {
             }
         }
 
-        // Clear the per-token escrow ledger for this match: the funds have
-        // left escrow and the ledger must not report them as still held.
-        Self::set_escrow_ledger(&env, match_id, &m.token, 0);
-
         // STATE TRANSITION: PendingResult → Completed
         m.state = MatchState::Completed;
         m.completed_ledger = Some(env.ledger().sequence());
@@ -1338,9 +1091,6 @@ impl EscrowContract {
         // Refund both players their original stake
         client.transfer(&env.current_contract_address(), &m.player1, &m.stake_amount);
         client.transfer(&env.current_contract_address(), &m.player2, &m.stake_amount);
-
-        // Clear the per-token escrow ledger for this match.
-        Self::set_escrow_ledger(&env, match_id, &m.token, 0);
 
         // STATE TRANSITION: Active → Cancelled (via timeout)
         m.state = MatchState::Cancelled;
@@ -1429,9 +1179,6 @@ impl EscrowContract {
                 .map_err(|_| Error::TransferFailed)?;
         }
 
-        // Clear the per-token escrow ledger for this match.
-        Self::set_escrow_ledger(&env, match_id, &m.token, 0);
-
         // STATE TRANSITION: Pending → Cancelled
         m.state = MatchState::Cancelled;
         m.cancelled_ledger = Some(env.ledger().sequence());
@@ -1453,34 +1200,32 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Drain all token holdings to the pre-registered safe address — admin only,
-    /// requires contract to be paused.
+    /// First phase of the two-factor emergency drain.
+    ///
+    /// Requires [`Permission::DrainInitiate`] and a paused contract. Records a
+    /// [`PendingDrain`] under [`DataKey::PendingDrain`] that must be confirmed by
+    /// a *different* authorized address via [`confirm_drain`](EscrowContract::confirm_drain)
+    /// before any funds move. This prevents a single compromised key from draining
+    /// the contract.
     ///
     /// The destination is fixed at initialization time via the `safe_address`
     /// parameter of [`initialize`](EscrowContract::initialize) and stored under
-    /// [`DataKey::SafeAddress`]. The `to` parameter has been intentionally removed:
-    /// accepting an arbitrary destination address would allow a compromised or
-    /// malicious admin to redirect the drain to any address, constituting a
-    /// rug-pull vector against all players with funds in escrow.
+    /// [`DataKey::SafeAddress`]; the drain can never be redirected elsewhere.
     ///
     /// # Errors
     ///
-    /// * [`Error::Unauthorized`] — `caller` is not the admin.
+    /// * [`Error::Unauthorized`] — `caller` lacks [`Permission::DrainInitiate`].
     /// * [`Error::NotPaused`]    — the contract is not currently paused.
-    pub fn emergency_drain(env: Env, caller: Address) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::Unauthorized)?;
-
-        if caller != admin {
-            return Err(Error::Unauthorized);
-        }
+    /// * [`Error::ActiveMatchExists`] — an active match still holds escrowed funds.
+    pub fn initiate_drain(env: Env, caller: Address, amount: i128) -> Result<(), Error> {
+        Self::require_permission(&env, &caller, Permission::DrainInitiate)?;
         caller.require_auth();
 
         if !Self::is_paused(&env) {
             return Err(Error::NotPaused);
+        }
+        if amount <= 0 {
+            return Err(Error::InvalidStakeAmount);
         }
 
         // Safety guard: block the drain when any match is currently `Active`
@@ -1488,7 +1233,7 @@ impl EscrowContract {
         // while funds are locked for active matches would silently steal player
         // stakes. The admin must wait for every active match to reach a terminal
         // state — `Completed` (payout done) or `Cancelled` (funds refunded) —
-        // before calling emergency_drain. (#8)
+        // before initiating a drain. (#8)
         let match_count = Self::get_match_count(&env);
         let mut i: u64 = 0;
         while i < match_count {
@@ -1502,6 +1247,58 @@ impl EscrowContract {
                 }
             }
             i += 1;
+        }
+
+        let expires_at = env
+            .ledger()
+            .sequence()
+            .saturating_add(DRAIN_APPROVAL_WINDOW_LEDGERS);
+        let pending = PendingDrain {
+            initiator: caller.clone(),
+            amount,
+            expires_at,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingDrain, &pending);
+        Self::bump_instance_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "admin"), symbol_short!("drn_init")),
+            (caller, amount, expires_at),
+        );
+        Ok(())
+    }
+
+    /// Second phase of the two-factor emergency drain.
+    ///
+    /// Requires [`Permission::DrainConfirm`] and must be called by an address
+    /// **different** from the initiator. Verifies the pending approval has not
+    /// expired, transfers the approved amount to the pre-registered safe address,
+    /// and clears the pending entry.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Unauthorized`] — `caller` lacks [`Permission::DrainConfirm`] or
+    ///   is the same address that initiated the drain.
+    /// * [`Error::NoPendingDrain`] — no drain is awaiting confirmation.
+    /// * [`Error::DrainApprovalExpired`] — the approval window has elapsed.
+    pub fn confirm_drain(env: Env, caller: Address) -> Result<(), Error> {
+        Self::require_permission(&env, &caller, Permission::DrainConfirm)?;
+        caller.require_auth();
+
+        let pending: PendingDrain = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingDrain)
+            .ok_or(Error::NoPendingDrain)?;
+
+        if caller == pending.initiator {
+            return Err(Error::Unauthorized);
+        }
+        if env.ledger().sequence() > pending.expires_at {
+            env.storage().instance().remove(&DataKey::PendingDrain);
+            return Err(Error::DrainApprovalExpired);
         }
 
         let safe_address: Address = env
@@ -1519,23 +1316,58 @@ impl EscrowContract {
         let client = token::Client::new(&env, &token);
         let contract = env.current_contract_address();
         let balance = client.balance(&contract);
-
-        if balance > 0 {
-            client.transfer(&contract, &safe_address, &balance);
-            env.events().publish(
-                (Symbol::new(&env, "admin"), symbol_short!("drain")),
-                (balance, safe_address, admin),
-            );
+        let amount = if pending.amount > balance {
+            balance
         } else {
-            // Preserve the audit trail even when there are no funds to drain.
-            // A silent success with no event would complicate post-mortems.
-            env.events().publish(
-                (Symbol::new(&env, "admin"), symbol_short!("drn_noop")),
-                (0i128, safe_address, admin),
-            );
+            pending.amount
+        };
+
+        if amount > 0 {
+            client.transfer(&contract, &safe_address, &amount);
         }
+        env.events().publish(
+            (Symbol::new(&env, "admin"), symbol_short!("drain")),
+            (amount, safe_address, pending.initiator, caller),
+        );
+
+        env.storage().instance().remove(&DataKey::PendingDrain);
         Self::bump_instance_ttl(&env);
 
+        Ok(())
+    }
+
+    /// Validate that `token` implements the SEP-41 interface and has sane metadata.
+    ///
+    /// Constructs a token client and probes `decimals`, `name`, `symbol`, and
+    /// `balance`. A token that does not implement SEP-41 will fail one of these
+    /// calls. Metadata is validated: `decimals` must not exceed
+    /// [`MAX_TOKEN_DECIMALS`], and `name`/`symbol` must be non-empty.
+    ///
+    /// Emits a `token_validated` event carrying the token address and a success
+    /// flag so the outcome is logged on-chain.
+    fn validate_token(env: &Env, token: &Address) -> Result<(), Error> {
+        let client = token::Client::new(env, token);
+        let contract = env.current_contract_address();
+
+        let decimals = client.try_decimals().map_err(|_| Error::TokenNotSep41)?;
+        let decimals = decimals.map_err(|_| Error::TokenNotSep41)?;
+        let name = client.try_name().map_err(|_| Error::TokenNotSep41)?;
+        let name = name.map_err(|_| Error::TokenNotSep41)?;
+        let symbol = client.try_symbol().map_err(|_| Error::TokenNotSep41)?;
+        let symbol = symbol.map_err(|_| Error::TokenNotSep41)?;
+        let _ = client
+            .try_balance(&contract)
+            .map_err(|_| Error::TokenNotSep41)?
+            .map_err(|_| Error::TokenNotSep41)?;
+
+        let valid = decimals <= MAX_TOKEN_DECIMALS && name.len() > 0 && symbol.len() > 0;
+        env.events().publish(
+            (Symbol::new(env, "token"), symbol_short!("validated")),
+            (token.clone(), valid),
+        );
+        if !valid {
+            return Err(Error::InvalidTokenMetadata);
+        }
         Ok(())
     }
 
@@ -1549,10 +1381,7 @@ impl EscrowContract {
     /// Return the token address this contract was initialized with.
     ///
     /// Allows frontends and integrators to verify which SEP-41 token a deployed
-    /// contract accepts without parsing raw WASM storage. Note that additional
-    /// tokens may be enabled via [`add_token`](EscrowContract::add_token); use
-    /// [`is_token_whitelisted`](EscrowContract::is_token_whitelisted) to check
-    /// whether a specific token is accepted.
+    /// contract accepts without parsing raw WASM storage.
     ///
     /// # Errors
     ///
@@ -1599,61 +1428,15 @@ impl EscrowContract {
         Ok(m.player1_deposited && m.player2_deposited)
     }
 
-    /// Return the escrowed balances for a match, broken down by token.
+    /// Return the total escrowed balance for a match (0, 1x, or 2x stake).
     ///
-    /// The result is a [`TokenBalances`] containing:
-    ///
-    /// * `by_token` — a map of token address to the amount held in escrow for
-    ///   that token, **normalized to the common 7-decimal base unit**. Only
-    ///   tokens with a non-zero ledger entry are included.
-    /// * `total` — the sum of every entry in `by_token`, in base units.
-    ///
-    /// The values are read from the per-token escrow ledgers
-    /// ([`DataKey::EscrowBalance`]), which are written on deposit and cleared
-    /// on payout, refund, or cancellation, so the reported balances always
-    /// match the ledger entries.
-    ///
-    /// Terminal matches (`Completed` / `Cancelled`) always report an empty map
-    /// and a zero total.
-    pub fn get_escrow_balance(env: Env, match_id: u64) -> Result<TokenBalances, Error> {
-        let m: Match = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Match(match_id))
-            .ok_or(Error::MatchNotFound)?;
-
-        let mut by_token: Map<Address, i128> = Map::new(&env);
-        let mut total: i128 = 0;
-
-        if m.state == MatchState::Completed || m.state == MatchState::Cancelled {
-            return Ok(TokenBalances { by_token, total });
-        }
-
-        // The match's own token is always reported when it holds a balance.
-        let raw = Self::get_escrow_ledger(&env, match_id, &m.token);
-        if raw != 0 {
-            let decimals = Self::get_token_config(&env, &m.token)
-                .map(|c| c.decimals)
-                .unwrap_or(BASE_DECIMALS);
-            let normalized = Self::normalize_to_base(raw, decimals)?;
-            by_token.set(m.token.clone(), normalized);
-            total = total.checked_add(normalized).ok_or(Error::Overflow)?;
-        }
-
-        Ok(TokenBalances { by_token, total })
-    }
-
-    /// Return the escrowed balance for a single `(match_id, token)` pair,
-    /// normalized to the common 7-decimal base unit.
-    ///
-    /// Returns `0` when the match holds no balance in `token`, including for
-    /// terminal matches. Returns [`Error::MatchNotFound`] when the match does
-    /// not exist.
-    pub fn get_escrow_balance_by_token(
-        env: Env,
-        match_id: u64,
-        token: Address,
-    ) -> Result<i128, Error> {
+    /// The returned value is always non-negative: it is the product of a
+    /// `u128` deposit count (0, 1, or 2) and `Match::stake_amount`, which is
+    /// validated at match creation to be within `[MIN_STAKE, MAX_STAKE]` and
+    /// therefore strictly positive. Returning `u128` makes this invariant
+    /// explicit in the type contract and removes the need for callers to
+    /// handle a negative case that can never occur.
+    pub fn get_escrow_balance(env: Env, match_id: u64) -> Result<u128, Error> {
         let m: Match = env
             .storage()
             .persistent()
@@ -1662,108 +1445,14 @@ impl EscrowContract {
         if m.state == MatchState::Completed || m.state == MatchState::Cancelled {
             return Ok(0);
         }
-        let raw = Self::get_escrow_ledger(&env, match_id, &token);
-        if raw == 0 {
-            return Ok(0);
-        }
-        let decimals = Self::get_token_config(&env, &token)
-            .map(|c| c.decimals)
-            .unwrap_or(BASE_DECIMALS);
-        Self::normalize_to_base(raw, decimals)
-    }
-
-    /// Return the platform reserve held for `token`, normalized to the common
-    /// 7-decimal base unit.
-    pub fn get_platform_reserve(env: Env, token: Address) -> Result<i128, Error> {
-        let raw = Self::get_platform_reserve(&env, &token);
-        if raw == 0 {
-            return Ok(0);
-        }
-        let decimals = Self::get_token_config(&env, &token)
-            .map(|c| c.decimals)
-            .unwrap_or(BASE_DECIMALS);
-        Self::normalize_to_base(raw, decimals)
-    }
-
-    /// Reconcile the contract's actual token holdings against the sum of all
-    /// outstanding escrows.
-    ///
-    /// This is an operational safety check: it reads the contract's balance of
-    /// the default token via the SEP-41 token client, then iterates every stored
-    /// [`Match`] and sums the stakes that are still held in escrow — that is,
-    /// matches in `Active` or `PendingResult` state where both players have
-    /// deposited. Matches in `Pending` state are excluded because their deposits
-    /// are not yet fully escrowed (a half-funded match holds at most one stake,
-    /// which is accounted for separately below), and `Completed` / `Cancelled`
-    /// matches hold nothing.
-    ///
-    /// The two values are compared and a `reconcile` event is emitted carrying
-    /// `(expected_total, actual_balance, discrepancy)`. A non-zero discrepancy
-    /// indicates a bug, an out-of-band token transfer, or a token whose balance
-    /// changed without a corresponding state transition.
-    ///
-    /// This function is read-only and may be called by anyone.
-    pub fn reconcile_balance(env: Env) -> Result<ReconciliationResult, Error> {
-        let token: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Token)
-            .ok_or(Error::Unauthorized)?;
-
-        let client = token::Client::new(&env, &token);
-        let actual_balance = client.balance(&env.current_contract_address());
-
-        // Sum the stakes still held in escrow across every match.
-        let match_count = Self::get_match_count(&env);
-        let mut expected_total: i128 = 0;
-        let mut i: u64 = 0;
-        while i < match_count {
-            if let Some(m) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, Match>(&DataKey::Match(i))
-            {
-                // Only matches whose funds are actually held contribute to the
-                // expected total. Terminal states hold nothing.
-                match m.state {
-                    MatchState::Active | MatchState::PendingResult => {
-                        // Both players must have deposited for the match to be
-                        // Active/PendingResult, so the escrow is 2x the stake.
-                        let deposited: i128 = (m.player1_deposited as i128)
-                            + (m.player2_deposited as i128);
-                        expected_total = expected_total
-                            .checked_add(deposited * m.stake_amount)
-                            .ok_or(Error::Overflow)?;
-                    }
-                    MatchState::Pending => {
-                        // A half-funded match may hold one stake; account for it
-                        // so reconciliation does not report a false discrepancy.
-                        let deposited: i128 = (m.player1_deposited as i128)
-                            + (m.player2_deposited as i128);
-                        expected_total = expected_total
-                            .checked_add(deposited * m.stake_amount)
-                            .ok_or(Error::Overflow)?;
-                    }
-                    MatchState::Completed | MatchState::Cancelled => {}
-                }
-            }
-            i += 1;
-        }
-
-        let discrepancy = actual_balance - expected_total;
-        let matched = discrepancy == 0;
-
-        env.events().publish(
-            (Symbol::new(&env, "admin"), symbol_short!("reconcile")),
-            (expected_total, actual_balance, discrepancy),
-        );
-
-        Ok(ReconciliationResult {
-            expected_total,
-            actual_balance,
-            discrepancy,
-            matched,
-        })
+        let deposited: u128 = match (m.player1_deposited, m.player2_deposited) {
+            (true, true) => 2,
+            (true, false) | (false, true) => 1,
+            (false, false) => 0,
+        };
+        // `stake_amount` is validated to be >= MIN_STAKE (> 0) at creation, so
+        // the conversion to `u128` is lossless and the product is non-negative.
+        Ok(deposited * (m.stake_amount as u128))
     }
 
     /// Return a page of match IDs in the range `[start, start + limit)`.
