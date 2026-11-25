@@ -1550,7 +1550,49 @@ oracle.submit_result(&match_id, &game_id, &MatchResult::Draw);
 
 ## Backend REST API
 
-The off-chain backend (`apps/backend`) exposes `POST /api/matches`, `POST /api/oracle/submit-result`, `POST /api/validate-game`, and `GET /health`. This section documents its error response contract; see `docs/oracle.md` for the off-chain oracle's design.
+The off-chain backend (`apps/backend`) exposes `POST /api/matches`, `POST /api/oracle/submit-result`, `POST /api/oracle/validate-result`, `POST /api/validate-game`, and `GET /health`. This section documents its error response contract; see `docs/oracle.md` for the off-chain oracle's design.
+
+### Result submission pre-validation
+
+`POST /api/oracle/validate-result` accepts the same `matchId`, `gameId`,
+`platform`, and optional Chess.com `username` fields as
+`POST /api/oracle/submit-result`. It validates the field formats, confirms the
+game is recorded for the supplied match and platform, then runs the existing
+provider-result and player-identity checks. Authenticated callers need the
+`submit_results` permission.
+
+The endpoint returns `valid: true` and the provider result only when all checks
+pass. Failures include an `errors` array with the affected field and details.
+Every response includes `gasConsumed: false`: this endpoint only reads the
+backend match/evidence stores and provider APIs; it does not build, sign, or
+submit a Stellar transaction. Validation calls may still be recorded in the
+backend evidence store.
+
+```http
+POST /api/oracle/validate-result
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "matchId": 0,
+  "gameId": "lichess-game-id",
+  "platform": "lichess"
+}
+```
+
+```json
+{
+  "valid": true,
+  "gasConsumed": false,
+  "matchId": 0,
+  "gameId": "lichess-game-id",
+  "result": "Player1Wins",
+  "provider": "lichess",
+  "whitePlayer": "alice",
+  "blackPlayer": "bob",
+  "status": "finished"
+}
+```
 
 ### Error Response Schema
 

@@ -16,7 +16,7 @@ import type { Decision, EvidenceStore } from '../store/evidence-store.js';
 import { withGameLock } from '../store/evidence-store.js';
 import logger from '../logger.js';
 import { errorToHttpStatus, ValidationError, NotFoundError } from '../errors/errorToHttpStatus.js';
-import { getOracleConfig } from './oracle-config.js';
+import { validateSubmitResultInputDetailed } from './submit-result-validation.js';
 
 export interface SubmitResultInput {
   matchId: number;
@@ -74,26 +74,7 @@ async function appendDecision(
  * Returns an error string if validation fails, or null if valid.
  */
 export function validateSubmitResultInput(input: Partial<SubmitResultInput>): string | null {
-  const { matchId, gameId, platform, username } = input;
-
-  // #1717 — matchId is forwarded to the Stellar transaction builder, which
-  // expects a positive integer (a contract-side u64 match id). A non-numeric
-  // value, a float, zero, or a negative number must be rejected here, at the
-  // route layer, rather than surfacing as a runtime error deep in the
-  // transaction-building call stack.
-  if (typeof matchId !== 'number' || !Number.isInteger(matchId) || matchId <= 0) {
-    return 'matchId must be a positive integer';
-  }
-  if (!gameId || typeof gameId !== 'string' || gameId.length === 0) {
-    return 'gameId is required';
-  }
-  if (!platform || (platform !== 'lichess' && platform !== 'chessdotcom')) {
-    return 'platform must be lichess or chessdotcom';
-  }
-  if (platform === 'chessdotcom' && (!username || typeof username !== 'string')) {
-    return 'username is required for chessdotcom';
-  }
-  return null;
+  return validateSubmitResultInputDetailed(input)[0]?.message ?? null;
 }
 
 /**
@@ -164,6 +145,28 @@ async function verifyGameResultCore(
       status: errorToHttpStatus(new NotFoundError('Match not found')),
       error: 'Match not found',
       details: `No match found for gameId: ${gameId}`,
+    };
+  }
+
+  if (match.matchId !== matchId) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'Match ID does not match game',
+      details: `Game ${gameId} is recorded for match ${match.matchId}, not ${matchId}`,
+    };
+  }
+
+  const priorHistory = evidenceStore ? await evidenceStore.history(gameId) : [];
+  const latestDecision = priorHistory[priorHistory.length - 1];
+  if (
+    latestDecision?.state === 'review_required' ||
+    latestDecision?.state === 'operator_decided'
+  ) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'Result is awaiting operator review',
     };
   }
 
