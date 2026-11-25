@@ -15,7 +15,13 @@ export interface Decision {
   id?: number;
   matchId: number;
   gameId: string;
-  state: 'review_required' | 'verified' | 'in_progress' | 'retry_requested' | 'provider_changed';
+  state:
+    | 'review_required'
+    | 'verified'
+    | 'in_progress'
+    | 'retry_requested'
+    | 'provider_changed'
+    | 'operator_decided';
   reason: string;
   provider?: Evidence['provider'];
   previousProvider?: Evidence['provider'];
@@ -23,8 +29,7 @@ export interface Decision {
   previousEvidence?: Evidence;
   recordedAt: string;
   operator?: string;
-  /** SHA-256 hash of the serialized decision body, used for tamper detection. */
-  hash?: string;
+  operatorDecision?: OperatorDecision;
 }
 export interface EvidenceStore {
   history(gameId: string): Promise<Decision[]>;

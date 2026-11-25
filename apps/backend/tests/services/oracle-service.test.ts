@@ -174,6 +174,30 @@ describe('verifyGameResult', () => {
     }
   });
 
+  it('returns a unique durable decision ID for each verification', async () => {
+    await seedMatch(store);
+    const ledger = new MemoryEvidenceStore();
+    mockFetchLichess.mockResolvedValue(LICHESS_GAME);
+
+    const first = await verifyGameResult(
+      store,
+      { matchId: 0, gameId: 'lichess-game-abc', platform: 'lichess' },
+      ledger,
+    );
+    const second = await verifyGameResult(
+      store,
+      { matchId: 0, gameId: 'lichess-game-abc', platform: 'lichess' },
+      ledger,
+    );
+
+    expect(first.ok && first.decisionId).toBe(1);
+    expect(second.ok && second.decisionId).toBe(2);
+    await expect(ledger.history('lichess-game-abc')).resolves.toMatchObject([
+      { id: first.ok ? first.decisionId : undefined },
+      { id: second.ok ? second.decisionId : undefined },
+    ]);
+  });
+
   it('rejects a result whose provider end time is still in the future', async () => {
     await seedMatch(store);
     const futureEndTime = '2999-01-01T00:00:00.000Z';
@@ -274,6 +298,7 @@ describe('verifyGameResult', () => {
   });
 
   it('returns ok:false with 400 when player identities do not match', async () => {
+    const ledger = new MemoryEvidenceStore();
     await seedMatch(store, { player1Username: 'alice', player2Username: 'bob' });
     mockFetchLichess.mockResolvedValue({
       ...LICHESS_GAME,
@@ -285,13 +310,17 @@ describe('verifyGameResult', () => {
       matchId: 0,
       gameId: 'lichess-game-abc',
       platform: 'lichess',
-    });
+    }, ledger);
 
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.status).toBe(400);
       expect(result.error).toBe('Player identity verification failed');
+      expect(result.decisionId).toBe(1);
     }
+    await expect(ledger.history('lichess-game-abc')).resolves.toMatchObject([
+      { id: 1, state: 'review_required' },
+    ]);
   });
 
   it('accepts swapped player colors (player2 is white, player1 is black)', async () => {
