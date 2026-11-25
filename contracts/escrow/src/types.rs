@@ -71,6 +71,10 @@ pub enum MatchState {
     ///   `DISPUTE_WINDOW_LEDGERS` have elapsed since the result was submitted.
     PendingResult,
 
+    /// A player or arbiter has contested the submitted result.
+    /// Finalization is held until resolved by arbiter or admin.
+    Contested,
+
     /// The oracle result has been finalized after the dispute window and the
     /// payout has been executed. This is a **terminal state**.
     ///
@@ -420,4 +424,23 @@ pub enum DataKey {
     /// [`Error::DuplicateGameId`](crate::errors::Error::DuplicateGameId).
     /// Stored in **persistent** storage with the same TTL as the match.
     GameId(String),
+
+    /// The address of the designated dispute arbiter.
+    Arbiter,
+
+    /// Records submitted dispute evidence for a match: (match_id, evidence_index).
+    DisputeEvidence(u64, u32),
+
+    /// Total count of evidence records submitted for a given match.
+    DisputeEvidenceCount(u64),
 }
+
+/// An immutable evidence record submitted in connection with a match dispute.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DisputeEvidenceRecord {
+    pub submitter: Address,
+    pub evidence_hash: BytesN<32>,
+    pub timestamp_ledger: u32,
+}
+
