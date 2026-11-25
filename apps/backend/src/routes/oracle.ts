@@ -72,8 +72,16 @@ router.post(
           : result.details
             ? `${result.error}: ${result.details}`
             : result.error;
-      const extra = result.hint ? { hint: result.hint } : undefined;
-      return res.status(result.status).json(errorEnvelope(statusToErrorCode(result.status), message, extra));
+      return res
+        .status(result.status)
+        .json(
+          errorEnvelope(statusToErrorCode(result.status), message, undefined, {
+            ...(result.hint ? { hint: result.hint } : {}),
+            ...(result.decisionId === undefined
+              ? {}
+              : { decisionId: result.decisionId }),
+          }),
+        );
     }
 
     return res.status(200).json({

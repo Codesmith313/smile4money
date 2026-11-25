@@ -67,6 +67,7 @@ export const LOG_EVENTS = new Set([
   "oracle_dlq_success_rate",
   "oracle_match_not_found",
   "oracle_match_not_found_empty_store",
+  "oracle_decision_recorded",
   "oracle_pending_submissions_loaded",
   "oracle_submit: DLQ entry resolved",
   "oracle_submit: DLQ retry failed",

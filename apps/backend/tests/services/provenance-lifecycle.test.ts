@@ -8,6 +8,7 @@ vi.mock('../../src/queue.js', () => ({
   writeToDlq: vi.fn(async (payload) => ({ id: 'dlq', payload, attempts: 1 })),
 }));
 it('retains the durable decision reference through failure, DLQ and successful retry', async () => {
+  const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
   const submission = {
     matchId: 1,
     gameId: 'game',
@@ -25,4 +26,8 @@ it('retains the durable decision reference through failure, DLQ and successful r
   const successful = vi.fn().mockResolvedValue(undefined);
   expect(await retryDlqEntry(entry!, successful)).toBe(true);
   expect(successful).toHaveBeenCalledWith(submission);
+  expect(logSpy.mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual(
+    expect.arrayContaining([expect.objectContaining({ decision_id: 12 })]),
+  );
+  logSpy.mockRestore();
 });

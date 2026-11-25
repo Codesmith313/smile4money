@@ -20,7 +20,10 @@ and timestamp; raw responses, profiles and PGNs are not retained. The hash allow
 correlation with separately obtained evidence, not reconstruction of a response.
 The returned `decisionId` identifies that record; retain it in `OracleSubmission`
 through retries and DLQ processing. Poll completion callbacks receive it as their
-third argument. The existing contract submission handler remains unimplemented.
+third argument. Persisted review-required and in-progress decisions also return
+their ID on the submit-result error response. Decision IDs are included in
+verification and retry logs. The existing contract submission handler remains
+unimplemented.
 
 Ambiguous evidence, mismatched player identities, or a changed verified outcome
 persist `review_required`. Subsequent verification stops before fetching again,

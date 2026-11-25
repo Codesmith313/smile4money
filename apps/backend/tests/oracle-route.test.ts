@@ -17,7 +17,11 @@ import axios from 'axios';
 vi.mock('axios');
 vi.mock('../src/store/index.js', async () => {
   const { MatchStore } = await import('../src/store/match-store.js');
-  return { matchStore: new MatchStore() };
+  const { MemoryEvidenceStore } = await import('../src/store/evidence-store.js');
+  return {
+    matchStore: new MatchStore(),
+    evidenceStore: new MemoryEvidenceStore(),
+  };
 });
 
 const secret = process.env.JWT_SECRET || 'test-secret';
@@ -200,7 +204,12 @@ describe('POST /api/oracle/submit-result — matchId validation', () => {
     const res = await request(createApp()).post('/api/oracle/submit-result')
       .set('Authorization', `Bearer ${makeToken()}`).send({ ...VALID_BODY, matchId: 0 });
     expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ verified: true, matchId: 0, result: 'Player1Wins' });
+    expect(res.body).toMatchObject({
+      decisionId: expect.any(Number),
+      verified: true,
+      matchId: 0,
+      result: 'Player1Wins',
+    });
   });
 
   it('rejects an invalid matchId before touching the match store', async () => {

@@ -10,6 +10,7 @@ const NUMERIC_FIELDS = new Set([
   'duration_ms',
   'count',
   'duplicate_count',
+  'decision_id',
   'store_count',
   'attempt',
   'attempts',
@@ -122,7 +123,10 @@ export function safeLogContext(
           Object.prototype.hasOwnProperty.call(STRING_FIELD_PATTERNS, key) ||
           key === 'error_event',
       )
-      .map(([key, value]) => [key, safeLogValue(key, value)]),
+      .map(([key, value]) => [
+        key,
+        key === 'error' ? safeErrorDetails(value) : safeLogValue(key, value),
+      ]),
   );
 }
 
@@ -346,8 +350,6 @@ class Logger {
     } else {
       this.errorWithDeduplication(context, message || '');
     }
-    this.log('error', { ...ctx, severity }, msg);
-    this.maybeAlert(severity, ctx, msg);
   }
 
   critical(context: LogContext | string, message?: string): void {

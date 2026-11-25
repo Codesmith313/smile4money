@@ -106,7 +106,11 @@ export async function submitWithRetry(
       await handler(submission);
       if (attempt > 0) {
         logger.info(
-          { matchId: submission.matchId, attempt },
+          {
+            matchId: submission.matchId,
+            decision_id: submission.decisionId,
+            attempt,
+          },
           'oracle_submit: success after retries'
         );
       }
@@ -119,6 +123,7 @@ export async function submitWithRetry(
         logger.warn(
           {
             matchId: submission.matchId,
+            decision_id: submission.decisionId,
             attempt,
             nextRetryDelayMs: nextDelay,
             error: lastError.message,
@@ -135,6 +140,7 @@ export async function submitWithRetry(
   logger.error(
     {
       matchId: submission.matchId,
+      decision_id: submission.decisionId,
       dlqId: dlqEntry.id,
       attempts: config.maxRetries + 1,
       lastError: lastError?.message,
@@ -162,7 +168,11 @@ export async function retryDlqEntry(
     const submission = entry.payload as OracleSubmission;
     await handler(submission);
     logger.info(
-      { dlqId: entry.id, totalAttempts: entry.attempts },
+      {
+        dlqId: entry.id,
+        decision_id: submission.decisionId,
+        totalAttempts: entry.attempts,
+      },
       'oracle_submit: DLQ entry resolved'
     );
     return true;
@@ -170,6 +180,7 @@ export async function retryDlqEntry(
     logger.warn(
       {
         dlqId: entry.id,
+        decision_id: (entry.payload as OracleSubmission).decisionId,
         attempt: entry.attempts,
         error: err instanceof Error ? err.message : String(err),
       },
@@ -205,7 +216,11 @@ export async function submitWithIdempotence(
     const alreadyExists = await existenceChecker(submission.matchId);
     if (alreadyExists) {
       logger.info(
-        { matchId: submission.matchId, gameId: submission.gameId },
+        {
+          matchId: submission.matchId,
+          gameId: submission.gameId,
+          decision_id: submission.decisionId,
+        },
         'oracle_submit: result already exists on-chain, skipping'
       );
       return undefined;
@@ -214,6 +229,7 @@ export async function submitWithIdempotence(
     logger.warn(
       {
         matchId: submission.matchId,
+        decision_id: submission.decisionId,
         error: err instanceof Error ? err.message : String(err),
       },
       'oracle_submit: existence check failed, proceeding with submission'
