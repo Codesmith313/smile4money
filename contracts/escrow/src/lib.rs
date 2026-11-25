@@ -184,7 +184,7 @@ impl EscrowContract {
     /// Return the configured match timeout duration in ledgers.
     ///
     /// This is the time an active match can remain without an oracle result
-    /// before either player may call [`claim_timeout`](EscrowContract::claim_timeout).
+    /// before any account may call [`enforce_timeout`](EscrowContract::enforce_timeout).
     /// Defaults to [`DEFAULT_TIMEOUT_LEDGERS`] (~7 days / `120_960` ledgers at the
     /// Stellar 5 s/ledger average) if no explicit value was passed to
     /// [`initialize`](EscrowContract::initialize).
@@ -272,6 +272,100 @@ impl EscrowContract {
         if balance < payout_total + ESCROW_RESERVE_BUFFER_STROOPS {
             return Err(Error::InsufficientReserve);
         }
+        Ok(())
+    }
+
+    fn store_match(env: &Env, m: &Match) {
+        let storage = env.storage().persistent();
+        let match_key = DataKey::Match(m.id);
+        let game_id_key = DataKey::GameId(m.game_id.clone());
+
+        storage.set(&match_key, m);
+        storage.extend_ttl(&match_key, MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+        storage.set(&game_id_key, &m.id);
+        storage.extend_ttl(&game_id_key, MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+    }
+
+    fn publish_state_transition(
+        env: &Env,
+        m: &Match,
+        from_state: Option<MatchState>,
+        to_state: MatchState,
+        player1_amount: u128,
+        player2_amount: u128,
+    ) {
+        env.events().publish(
+            (Symbol::new(env, "match"), Symbol::new(env, "transition")),
+            (
+                m.id,
+                from_state,
+                to_state,
+                m.player1.clone(),
+                m.player2.clone(),
+                m.stake_amount,
+                player1_amount,
+                player2_amount,
+            ),
+        );
+    }
+
+    fn cancel_timed_out_match(
+        env: &Env,
+        match_id: u64,
+        caller: Option<Address>,
+    ) -> Result<(), Error> {
+        Self::validate_match_id(env, match_id)?;
+
+        let mut m: Match = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Match(match_id))
+            .ok_or(Error::MatchNotFound)?;
+
+        if m.state != MatchState::Active {
+            return Err(Error::InvalidState);
+        }
+
+        if let Some(ref caller) = caller {
+            caller.require_auth();
+            if caller != &m.player1 && caller != &m.player2 {
+                return Err(Error::Unauthorized);
+            }
+        }
+
+        let activated = m.activated_ledger.ok_or(Error::InvalidState)?;
+        let current = env.ledger().sequence();
+        let timeout = Self::get_timeout_ledgers(env);
+        if current.saturating_sub(activated) <= timeout {
+            return Err(Error::TimeoutNotReached);
+        }
+
+        let client = token::Client::new(env, &m.token);
+        let refund_total = m.stake_amount * 2;
+        Self::ensure_reserve_for_payout(env, &m.token, refund_total as i128)?;
+        client.transfer(&env.current_contract_address(), &m.player1, m.stake_amount as i128);
+        client.transfer(&env.current_contract_address(), &m.player2, m.stake_amount as i128);
+
+        m.state = MatchState::Cancelled;
+        m.cancelled_ledger = Some(current);
+        Self::store_match(env, &m);
+        Self::bump_instance_ttl(env);
+
+        Self::publish_state_transition(
+            env,
+            &m,
+            Some(MatchState::Active),
+            MatchState::Cancelled,
+            m.stake_amount,
+            m.stake_amount,
+        );
+        if let Some(caller) = caller {
+            env.events().publish(
+                (Symbol::new(env, "match"), symbol_short!("timeout")),
+                (match_id, caller),
+            );
+        }
+
         Ok(())
     }
 
@@ -578,24 +672,19 @@ impl EscrowContract {
             completed_ledger: None,
         };
 
-        env.storage().persistent().set(&DataKey::Match(id), &m);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Match(id),
-            MATCH_TTL_LEDGERS,
-            MATCH_TTL_LEDGERS,
-        );
-        env.storage()
-            .persistent()
-            .set(&DataKey::GameId(m.game_id.clone()), &id);
-        env.storage().persistent().extend_ttl(
-            &DataKey::GameId(m.game_id.clone()),
-            MATCH_TTL_LEDGERS,
-            MATCH_TTL_LEDGERS,
-        );
+        Self::store_match(&env, &m);
         let next_id = id.checked_add(1).ok_or(Error::Overflow)?;
         env.storage().instance().set(&DataKey::MatchCount, &next_id);
         Self::bump_instance_ttl(&env);
 
+        Self::publish_state_transition(
+            &env,
+            &m,
+            None,
+            MatchState::Pending,
+            0,
+            0,
+        );
         env.events().publish(
             (Symbol::new(&env, "match"), symbol_short!("created")),
             (id, event_player1, event_player2, stake_amount, event_game_id),
@@ -683,6 +772,14 @@ impl EscrowContract {
             // Record the ledger at which the match became active for timeout tracking.
             m.state = MatchState::Active;
             m.activated_ledger = Some(env.ledger().sequence());
+            Self::publish_state_transition(
+                &env,
+                &m,
+                Some(MatchState::Pending),
+                MatchState::Active,
+                0,
+                0,
+            );
             env.events().publish(
                 (Symbol::new(&env, "match"), symbol_short!("activated")),
                 match_id,
@@ -704,14 +801,7 @@ impl EscrowContract {
             (match_id, player, m.stake_amount, player_label),
         );
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Match(match_id), &m);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Match(match_id),
-            MATCH_TTL_LEDGERS,
-            MATCH_TTL_LEDGERS,
-        );
+        Self::store_match(&env, &m);
         Self::bump_instance_ttl(&env);
 
         Ok(())
@@ -770,22 +860,29 @@ impl EscrowContract {
             return Err(Error::NotFunded);
         }
 
+        let activated = m.activated_ledger.ok_or(Error::InvalidState)?;
+        let timeout = Self::get_timeout_ledgers(&env);
+        if env.ledger().sequence().saturating_sub(activated) > timeout {
+            return Err(Error::MatchTimedOut);
+        }
+
         // STATE TRANSITION: Active → PendingResult
         // The oracle's result enters a dispute window. No payout yet.
         m.state = MatchState::PendingResult;
         m.pending_result_ledger = Some(env.ledger().sequence());
         m.pending_winner = OptionalWinner::Some(winner.clone());
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Match(match_id), &m);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Match(match_id),
-            MATCH_TTL_LEDGERS,
-            MATCH_TTL_LEDGERS,
-        );
+        Self::store_match(&env, &m);
         Self::bump_instance_ttl(&env);
 
+        Self::publish_state_transition(
+            &env,
+            &m,
+            Some(MatchState::Active),
+            MatchState::PendingResult,
+            0,
+            0,
+        );
         env.events().publish(
             (Symbol::new(&env, "oracle"), symbol_short!("pending")),
             (match_id, winner, m.pending_result_ledger),
@@ -851,14 +948,7 @@ impl EscrowContract {
         }
         m.pending_winner = OptionalWinner::Some(new_winner.clone());
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Match(match_id), &m);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Match(match_id),
-            MATCH_TTL_LEDGERS,
-            MATCH_TTL_LEDGERS,
-        );
+        Self::store_match(&env, &m);
         Self::bump_instance_ttl(&env);
 
         env.events().publish(
@@ -961,16 +1051,22 @@ impl EscrowContract {
         // STATE TRANSITION: PendingResult → Completed
         m.state = MatchState::Completed;
         m.completed_ledger = Some(env.ledger().sequence());
-        env.storage()
-            .persistent()
-            .set(&DataKey::Match(match_id), &m);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Match(match_id),
-            MATCH_TTL_LEDGERS,
-            MATCH_TTL_LEDGERS,
-        );
+        Self::store_match(&env, &m);
         Self::bump_instance_ttl(&env);
 
+        let (player1_amount, player2_amount) = match &winner {
+            Winner::Player1 => (m.stake_amount * 2, 0),
+            Winner::Player2 => (0, m.stake_amount * 2),
+            Winner::Draw => (m.stake_amount, m.stake_amount),
+        };
+        Self::publish_state_transition(
+            &env,
+            &m,
+            Some(MatchState::PendingResult),
+            MatchState::Completed,
+            player1_amount,
+            player2_amount,
+        );
         env.events().publish(
             (Symbol::new(&env, "match"), symbol_short!("completed")),
             (match_id, winner, payout_amount),
@@ -979,12 +1075,10 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Reclaim funds when the oracle never submits a result within `TIMEOUT_LEDGERS`.
+    /// Reclaim funds when the oracle never submits a result within the configured timeout.
     ///
-    /// Either `player1` or `player2` may call this function if the match has been in the
-    /// `Active` state for longer than `TIMEOUT_LEDGERS` (~7 days) without an oracle result.
-    /// Both players receive their original `stake_amount` back. The match transitions to
-    /// `Cancelled`.
+    /// Either player may call this function after the timeout. Anyone may instead call
+    /// [`enforce_timeout`](EscrowContract::enforce_timeout) to trigger the same refund.
     ///
     /// # Arguments
     ///
@@ -995,64 +1089,18 @@ impl EscrowContract {
     ///
     /// * [`Error::Unauthorized`]       — caller is neither player.
     /// * [`Error::InvalidState`]       — match is not `Active`.
-    /// * [`Error::TimeoutNotReached`]  — `TIMEOUT_LEDGERS` have not yet elapsed since the
-    ///                                   match became `Active`; it is too early to reclaim.
+    /// * [`Error::MatchTimedOut`] — the configured timeout has not elapsed yet.
     pub fn claim_timeout(env: Env, match_id: u64, caller: Address) -> Result<(), Error> {
-        caller.require_auth();
+        Self::cancel_timed_out_match(&env, match_id, Some(caller))
+    }
 
-        Self::validate_match_id(&env, match_id)?;
-
-        let mut m: Match = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Match(match_id))
-            .ok_or(Error::MatchNotFound)?;
-
-        if m.state != MatchState::Active {
-            return Err(Error::InvalidState);
-        }
-
-        let is_player = caller == m.player1 || caller == m.player2;
-        if !is_player {
-            return Err(Error::Unauthorized);
-        }
-
-        let activated = m.activated_ledger.ok_or(Error::InvalidState)?;
-        let current = env.ledger().sequence();
-        let timeout = Self::get_timeout_ledgers(&env);
-        if current <= activated + timeout {
-            // Timeout period has not elapsed yet — reject with MatchTimedOut reused
-            // as "too early". We return MatchTimedOut here to keep error codes minimal;
-            // callers should interpret it as "timeout not yet reached".
-            return Err(Error::MatchTimedOut);
-        }
-
-        let client = token::Client::new(&env, &m.token);
-        let refund_total = m.stake_amount * 2;
-        Self::ensure_reserve_for_payout(&env, &m.token, refund_total)?;
-        // Refund both players their original stake
-        client.transfer(&env.current_contract_address(), &m.player1, &m.stake_amount);
-        client.transfer(&env.current_contract_address(), &m.player2, &m.stake_amount);
-
-        // STATE TRANSITION: Active → Cancelled (via timeout)
-        m.state = MatchState::Cancelled;
-        m.cancelled_ledger = Some(env.ledger().sequence());
-        env.storage()
-            .persistent()
-            .set(&DataKey::Match(match_id), &m);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Match(match_id),
-            MATCH_TTL_LEDGERS,
-            MATCH_TTL_LEDGERS,
-        );
-        Self::bump_instance_ttl(&env);
-
-        env.events().publish(
-            (Symbol::new(&env, "match"), symbol_short!("timeout")),
-            (match_id, caller),
-        );
-
-        Ok(())
+    /// Permissionlessly cancel an active match after its configured timeout.
+    ///
+    /// Soroban contracts cannot execute transactions without an invocation. A player, keeper,
+    /// or any other account may call this function after the timeout; the contract verifies the
+    /// deadline and refunds both players atomically.
+    pub fn enforce_timeout(env: Env, match_id: u64) -> Result<(), Error> {
+        Self::cancel_timed_out_match(&env, match_id, None)
     }
 
     /// Cancel a match and refund any deposits.
@@ -1122,18 +1170,20 @@ impl EscrowContract {
         }
 
         // STATE TRANSITION: Pending → Cancelled
+        let previous_state = m.state.clone();
         m.state = MatchState::Cancelled;
         m.cancelled_ledger = Some(env.ledger().sequence());
-        env.storage()
-            .persistent()
-            .set(&DataKey::Match(match_id), &m);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Match(match_id),
-            MATCH_TTL_LEDGERS,
-            MATCH_TTL_LEDGERS,
-        );
+        Self::store_match(&env, &m);
         Self::bump_instance_ttl(&env);
 
+        Self::publish_state_transition(
+            &env,
+            &m,
+            Some(previous_state),
+            MatchState::Cancelled,
+            player1_refund as u128,
+            player2_refund as u128,
+        );
         env.events().publish(
             (Symbol::new(&env, "match"), symbol_short!("cancelled")),
             (match_id, caller, player1_refund, player2_refund),

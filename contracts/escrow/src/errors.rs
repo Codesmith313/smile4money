@@ -37,7 +37,7 @@ pub use smile4money_common::SharedError;
 /// | 18   | NotPaused             |         | emergency_drain requires the contract to be paused   |
 /// | 19   | InsufficientAllowance |         | player has not approved sufficient token allowance   |
 /// | 20   | DisputeWindowActive   |         | finalize_result called before the dispute window has expired |
-/// | 21   | MatchTimedOut         |         | match has already timed out; use claim_timeout       |
+/// | 21   | MatchTimedOut         |         | match has timed out; enforce_timeout can refund players |
 /// | 22   | InvalidToken          |         | the provided token address does not match the initialized token |
 /// | 23   | InvalidAdmin          | ✓       | the new admin address is invalid                     |
 /// | 24   | StakeTooLow           |         | stake_amount is below the minimum allowed stake      |
@@ -45,6 +45,7 @@ pub use smile4money_common::SharedError;
 /// | 26   | InsufficientReserve   |         | contract balance too low to cover payout + Stellar minimum reserve |
 /// | 27   | InvalidAddress        |         | a player address is invalid (zero address / burn address) |
 /// | 28   | DisputeWindowExpired  |         | override_result called after the dispute window expired |
+/// | 35   | TimeoutNotReached     |         | active match timeout has not elapsed yet          |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -114,7 +115,7 @@ pub enum Error {
     /// [E020] `finalize_result` was called before the dispute window has fully elapsed.
     DisputeWindowActive = 20,
 
-    /// [E021] The match has timed out; players should call `claim_timeout`.
+    /// [E021] The match has timed out; call `enforce_timeout` to refund the players.
     MatchTimedOut = 21,
 
     /// [E022] The provided token address does not match the token set during `initialize`.
@@ -180,6 +181,9 @@ pub enum Error {
 
     /// [E034] `override_result` was called after the dispute window expired.
     DisputeWindowExpired = 34,
+
+    /// [E035] The active match timeout has not elapsed yet.
+    TimeoutNotReached = 35,
 }
 
 /// Convert a [`SharedError`] into an escrow [`Error`].
