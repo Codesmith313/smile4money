@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import type sqlite3 from "sqlite3";
 
 /** SQLite is supported on local storage in one backend process only. */
@@ -78,6 +79,274 @@ export async function runOptimize(db: sqlite3.Database): Promise<void> {
       else resolve();
     });
   });
+}
+
+/** Fields of the oracle configuration that may be updated via the admin API. */
+export interface OracleConfigPatch {
+  apiEndpoint?: string;
+  apiKey?: string;
+  apiSecret?: string;
+}
+
+/** Oracle configuration as exposed to read APIs; secrets are never included. */
+export interface OracleConfigView {
+  apiEndpoint: string | null;
+  hasApiKey: boolean;
+  hasApiSecret: boolean;
+  updatedAt: string | null;
+  updatedBy: string | null;
+}
+
+export interface OracleConfigAuditEntry {
+  actor: string;
+  changedFields: string[];
+  timestamp: string;
+}
+
+const ORACLE_CONFIG_TABLE = "oracle_config";
+const ORACLE_CONFIG_AUDIT_TABLE = "oracle_config_audit";
+const ORACLE_SECRET_FIELDS = ["apiKey", "apiSecret"] as const;
+const ORACLE_PLAIN_FIELDS = ["apiEndpoint"] as const;
+
+function encryptionKey(env = process.env): Buffer {
+  const raw = env.ORACLE_CONFIG_ENCRYPTION_KEY;
+  if (!raw) {
+    throw new Error("ORACLE_CONFIG_ENCRYPTION_KEY must be set");
+  }
+  const key = /^[0-9a-fA-F]{64}$/.test(raw)
+    ? Buffer.from(raw, "hex")
+    : Buffer.from(raw, "base64");
+  if (key.length !== 32) {
+    throw new Error(
+      "ORACLE_CONFIG_ENCRYPTION_KEY must decode to 32 bytes (AES-256)",
+    );
+  }
+  return key;
+}
+
+/** Encrypts a secret with AES-256-GCM; output is `iv:tag:ciphertext` (base64). */
+export function encryptSecret(
+  plaintext: string,
+  env = process.env,
+): string {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", encryptionKey(env), iv);
+  const ciphertext = Buffer.concat([
+    cipher.update(plaintext, "utf8"),
+    cipher.final(),
+  ]);
+  const tag = cipher.getAuthTag();
+  return [iv, tag, ciphertext].map((b) => b.toString("base64")).join(":");
+}
+
+/** Decrypts a value produced by {@link encryptSecret}. */
+export function decryptSecret(payload: string, env = process.env): string {
+  const parts = payload.split(":");
+  if (parts.length !== 3) {
+    throw new Error("Malformed encrypted secret");
+  }
+  const [iv, tag, ciphertext] = parts.map((p) => Buffer.from(p, "base64"));
+  const decipher = crypto.createDecipheriv(
+    "aes-256-gcm",
+    encryptionKey(env),
+    iv,
+  );
+  decipher.setAuthTag(tag);
+  return Buffer.concat([
+    decipher.update(ciphertext),
+    decipher.final(),
+  ]).toString("utf8");
+}
+
+/** Validates an oracle API endpoint; throws when it is not a usable URL. */
+export function validateOracleEndpoint(endpoint: string): string {
+  let url: URL;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    throw new Error("Oracle API endpoint must be a valid URL");
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error("Oracle API endpoint must use http or https");
+  }
+  if (!url.hostname) {
+    throw new Error("Oracle API endpoint must include a hostname");
+  }
+  return url.toString();
+}
+
+async function ensureOracleConfigTables(db: sqlite3.Database): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    db.exec(
+      `CREATE TABLE IF NOT EXISTS ${ORACLE_CONFIG_TABLE} (
+         key TEXT PRIMARY KEY,
+         value TEXT NOT NULL,
+         encrypted INTEGER NOT NULL DEFAULT 0,
+         updated_at TEXT NOT NULL,
+         updated_by TEXT NOT NULL
+       );
+       CREATE TABLE IF NOT EXISTS ${ORACLE_CONFIG_AUDIT_TABLE} (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         actor TEXT NOT NULL,
+         changed_fields TEXT NOT NULL,
+         timestamp TEXT NOT NULL
+       );`,
+      (err: Error | null) => {
+        if (err) reject(err);
+        else resolve();
+      },
+    );
+  });
+}
+
+function dbGet(
+  db: sqlite3.Database,
+  sql: string,
+  params: unknown[] = [],
+): Promise<Record<string, unknown> | undefined> {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err: Error | null, row: Record<string, unknown>) => {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
+}
+
+function dbAll(
+  db: sqlite3.Database,
+  sql: string,
+  params: unknown[] = [],
+): Promise<Record<string, unknown>[]> {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err: Error | null, rows: Record<string, unknown>[]) => {
+      if (err) reject(err);
+      else resolve(rows ?? []);
+    });
+  });
+}
+
+function dbRun(
+  db: sqlite3.Database,
+  sql: string,
+  params: unknown[] = [],
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, (err: Error | null) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+/**
+ * Reads the oracle configuration. Secret values are never returned; callers
+ * only learn whether a credential is present.
+ */
+export async function getOracleConfig(
+  db: sqlite3.Database,
+): Promise<OracleConfigView> {
+  await ensureOracleConfigTables(db);
+  const rows = await dbAll(
+    db,
+    `SELECT key, value, updated_at, updated_by FROM ${ORACLE_CONFIG_TABLE}`,
+  );
+  const byKey = new Map(rows.map((row) => [String(row.key), row]));
+  const endpoint = byKey.get("apiEndpoint");
+  const apiKey = byKey.get("apiKey");
+  const apiSecret = byKey.get("apiSecret");
+  const latest = rows.reduce<Record<string, unknown> | undefined>(
+    (acc, row) =>
+      !acc || String(row.updated_at) > String(acc.updated_at) ? row : acc,
+    undefined,
+  );
+  return {
+    apiEndpoint: endpoint ? String(endpoint.value) : null,
+    hasApiKey: Boolean(apiKey),
+    hasApiSecret: Boolean(apiSecret),
+    updatedAt: latest ? String(latest.updated_at) : null,
+    updatedBy: latest ? String(latest.updated_by) : null,
+  };
+}
+
+/**
+ * Applies a patch to the oracle configuration, encrypting secret values at
+ * rest and recording an audit row for the change. Returns the updated view.
+ */
+export async function setOracleConfig(
+  db: sqlite3.Database,
+  patch: OracleConfigPatch,
+  actor: string,
+  env = process.env,
+): Promise<OracleConfigView> {
+  if (!actor || !actor.trim()) {
+    throw new Error("An actor is required to update oracle configuration");
+  }
+  await ensureOracleConfigTables(db);
+  const changedFields: string[] = [];
+  const now = new Date().toISOString();
+
+  for (const field of ORACLE_PLAIN_FIELDS) {
+    const value = patch[field];
+    if (value === undefined) continue;
+    const normalized = validateOracleEndpoint(value);
+    await dbRun(
+      db,
+      `INSERT INTO ${ORACLE_CONFIG_TABLE} (key, value, encrypted, updated_at, updated_by)
+       VALUES (?, ?, 0, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value=excluded.value, encrypted=0,
+         updated_at=excluded.updated_at, updated_by=excluded.updated_by`,
+      [field, normalized, now, actor],
+    );
+    changedFields.push(field);
+  }
+
+  for (const field of ORACLE_SECRET_FIELDS) {
+    const value = patch[field];
+    if (value === undefined) continue;
+    if (!value) {
+      throw new Error(`Oracle ${field} must not be empty`);
+    }
+    const encrypted = encryptSecret(value, env);
+    await dbRun(
+      db,
+      `INSERT INTO ${ORACLE_CONFIG_TABLE} (key, value, encrypted, updated_at, updated_by)
+       VALUES (?, ?, 1, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value=excluded.value, encrypted=1,
+         updated_at=excluded.updated_at, updated_by=excluded.updated_by`,
+      [field, encrypted, now, actor],
+    );
+    changedFields.push(field);
+  }
+
+  if (changedFields.length === 0) {
+    throw new Error("No oracle configuration fields supplied");
+  }
+
+  await dbRun(
+    db,
+    `INSERT INTO ${ORACLE_CONFIG_AUDIT_TABLE} (actor, changed_fields, timestamp)
+     VALUES (?, ?, ?)`,
+    [actor, JSON.stringify(changedFields), now],
+  );
+
+  return getOracleConfig(db);
+}
+
+/** Returns the audit trail of oracle configuration changes, newest first. */
+export async function getOracleConfigAudit(
+  db: sqlite3.Database,
+): Promise<OracleConfigAuditEntry[]> {
+  await ensureOracleConfigTables(db);
+  const rows = await dbAll(
+    db,
+    `SELECT actor, changed_fields, timestamp FROM ${ORACLE_CONFIG_AUDIT_TABLE}
+     ORDER BY id DESC`,
+  );
+  return rows.map((row) => ({
+    actor: String(row.actor),
+    changedFields: JSON.parse(String(row.changed_fields)) as string[],
+    timestamp: String(row.timestamp),
+  }));
 }
 
 /**

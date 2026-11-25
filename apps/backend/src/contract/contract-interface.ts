@@ -14,7 +14,7 @@ import { Address, nativeToScVal, xdr } from '@stellar/stellar-sdk';
 import type { MatchResult } from '../fetchers/lichess.js';
 
 /** `specHash` of the fixture this module was last reviewed against. */
-export const CONTRACT_INTERFACE_SPEC_HASH = '40b1543545c2d06c';
+export const CONTRACT_INTERFACE_SPEC_HASH = '7c1e9a4b2f8d3e05';
 
 /**
  * Escrow contract error codes (`contracts/escrow/src/errors.rs`). Must match
@@ -59,6 +59,12 @@ export const ESCROW_ERRORS = {
   InvalidStakeAmount: 32,
   ActiveMatchExists: 33,
   DisputeWindowExpired: 28,
+  TokenWhitelistEmpty: 34,
+  TokenAlreadyWhitelisted: 35,
+  TokenNotWhitelisted: 36,
+  CannotRemoveDefaultToken: 37,
+  TokenBalanceOverflow: 38,
+  UnknownToken: 39,
 } as const;
 
 /** Leaderboard contract error codes (`contracts/leaderboard/src/types.rs`). */
@@ -119,6 +125,10 @@ export function unitEnumToScVal(variant: string): xdr.ScVal {
 /** Escrow methods the backend invokes, with their argument order. */
 export const BACKEND_ESCROW_METHODS = {
   submit_result: ['match_id', 'game_id', 'winner', 'caller'],
+  add_token: ['token'],
+  remove_token: ['token'],
+  get_escrow_balance: ['match_id'],
+  get_escrow_balance_by_token: ['match_id', 'token'],
 } as const;
 
 export interface SubmitResultArgs {
@@ -137,4 +147,132 @@ export function serializeSubmitResultArgs(args: SubmitResultArgs): xdr.ScVal[] {
     unitEnumToScVal(toEscrowWinner(args.result)),
     new Address(args.caller).toScVal(),
   ];
+}
+
+export interface AddTokenArgs {
+  /** The token contract address (C...). */
+  token: string;
+}
+
+/** Arguments for `add_token(token: Address)`. */
+export function serializeAddTokenArgs(args: AddTokenArgs): xdr.ScVal[] {
+  return [new Address(args.token).toScVal()];
+}
+
+export interface RemoveTokenArgs {
+  /** The token contract address (C...). */
+  token: string;
+}
+
+/** Arguments for `remove_token(token: Address)`. */
+export function serializeRemoveTokenArgs(args: RemoveTokenArgs): xdr.ScVal[] {
+  return [new Address(args.token).toScVal()];
+}
+
+export interface GetEscrowBalanceArgs {
+  matchId: number | bigint;
+}
+
+/** Arguments for `get_escrow_balance(match_id: u64)`. */
+export function serializeGetEscrowBalanceArgs(args: GetEscrowBalanceArgs): xdr.ScVal[] {
+  return [nativeToScVal(BigInt(args.matchId), { type: 'u64' })];
+}
+
+export interface GetEscrowBalanceByTokenArgs {
+  matchId: number | bigint;
+  /** The token contract address (C...). */
+  token: string;
+}
+
+/** Arguments for `get_escrow_balance_by_token(match_id: u64, token: Address)`. */
+export function serializeGetEscrowBalanceByTokenArgs(
+  args: GetEscrowBalanceByTokenArgs,
+): xdr.ScVal[] {
+  return [nativeToScVal(BigInt(args.matchId), { type: 'u64' }), new Address(args.token).toScVal()];
+}
+
+/**
+ * Per-token escrow balances returned by `get_escrow_balance`, keyed by token
+ * contract address. Each token's balance is tracked independently.
+ */
+export type TokenBalances = Record<string, bigint>;
+
+/**
+ * Decode the `Map<Address, i128>` returned by `get_escrow_balance` into a
+ * {@link TokenBalances} record. Accepts either a raw `xdr.ScVal` or an already
+ * converted value (e.g. from a Soroban RPC `scValToNative` call).
+ */
+export function decodeTokenBalances(value: xdr.ScVal | unknown): TokenBalances {
+  const balances: TokenBalances = {};
+  const entries = extractMapEntries(value);
+  for (const [key, amount] of entries) {
+    balances[tokenKeyToString(key)] = toBigInt(amount);
+  }
+  return balances;
+}
+
+/** Sum the balances across all tokens in a {@link TokenBalances} record. */
+export function totalTokenBalance(balances: TokenBalances): bigint {
+  let total = 0n;
+  for (const amount of Object.values(balances)) total += amount;
+  return total;
+}
+
+function extractMapEntries(value: xdr.ScVal | unknown): Array<[unknown, unknown]> {
+  if (value instanceof xdr.ScVal) {
+    switch (value.switch()) {
+      case xdr.ScValType.scvMap(): {
+        const map = value.map();
+        return map ? map.map((entry) => [entry.key(), entry.val()]) : [];
+      }
+      case xdr.ScValType.scvVec(): {
+        const vec = value.vec();
+        return vec ? vec.map((entry) => extractMapEntry(entry)) : [];
+      }
+      default:
+        return [];
+    }
+  }
+  if (value instanceof Map) return Array.from(value.entries());
+  if (Array.isArray(value)) return value.map((entry) => extractMapEntry(entry));
+  if (value && typeof value === 'object') return Object.entries(value);
+  return [];
+}
+
+function extractMapEntry(entry: unknown): [unknown, unknown] {
+  if (entry instanceof xdr.ScVal) {
+    const entries = extractMapEntries(entry);
+    if (entries.length === 1) return entries[0];
+  }
+  if (Array.isArray(entry) && entry.length === 2) return [entry[0], entry[1]];
+  return [entry, 0n];
+}
+
+function tokenKeyToString(key: unknown): string {
+  if (key instanceof xdr.ScVal) {
+    if (key.switch() === xdr.ScValType.scvAddress()) {
+      return Address.fromScVal(key).toString();
+    }
+    return key.value()?.toString() ?? '';
+  }
+  if (key && typeof key === 'object' && 'toString' in key) return String(key);
+  return String(key);
+}
+
+function toBigInt(amount: unknown): bigint {
+  if (typeof amount === 'bigint') return amount;
+  if (amount instanceof xdr.ScVal) {
+    const native = amount.value();
+    if (typeof native === 'bigint') return native;
+    if (native && typeof native === 'object' && 'toString' in native) {
+      return BigInt(native.toString());
+    }
+    return 0n;
+  }
+  if (typeof amount === 'number') return BigInt(Math.trunc(amount));
+  if (typeof amount === 'string' && amount.length > 0) return BigInt(amount);
+  if (amount && typeof amount === 'object' && 'toString' in amount) {
+    return BigInt(amount.toString());
+  }
+  return 0n;
 }

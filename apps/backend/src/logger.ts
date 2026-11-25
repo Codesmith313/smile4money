@@ -34,6 +34,13 @@ const NUMERIC_FIELDS = new Set([
   'migration_version',
   'query_duration_ms',
   'slow_query_threshold_ms',
+  'latency_ms',
+  'p50_ms',
+  'p95_ms',
+  'p99_ms',
+  'success_rate',
+  'submissions_per_hour',
+  'sample_count',
 ]);
 const ENUM_FIELDS: Record<string, readonly string[]> = {
   method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
@@ -45,6 +52,9 @@ const ENUM_FIELDS: Record<string, readonly string[]> = {
   replay_result: ['success', 'failed'],
   stall_state: ['stalled', 'progressing'],
   integrity_status: ['ok', 'failed'],
+  operation: ['submit_result', 'has_result', 'fetch_result'],
+  config_field: ['endpoint', 'credential'],
+  alert: ['degraded', 'ok'],
   auth_failure_reason: [
     'missing_header',
     'invalid_payload',
@@ -527,8 +537,6 @@ class Logger {
     } else {
       this.errorWithDeduplication(context, message || '');
     }
-    this.log('error', { ...ctx, severity }, msg);
-    this.maybeAlert(severity, ctx, msg);
   }
 
   critical(context: LogContext | string, message?: string): void {
