@@ -110,3 +110,6 @@ pub const LICHESS_GAME_ID_LEN: usize = 8;
 
 /// Longest Chess.com game ID accepted (numeric, no leading zero), #2062.
 pub const CHESSCOM_GAME_ID_MAX_LEN: usize = 20;
+
+/// Longest pause/unpause reason accepted, in bytes (#2061).
+pub const MAX_PAUSE_REASON_LEN: u32 = 256;

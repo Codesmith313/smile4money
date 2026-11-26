@@ -225,6 +225,16 @@ pub enum Error {
     /// [E047] `set_stake_limits` was given a range that isn't
     /// `0 < min <= max <= MAX_STAKE`.
     InvalidStakeLimits = 47,
+
+    /// [E048] `pause`/`unpause` needs a reason of 1-256 bytes (#2061).
+    InvalidPauseReason = 48,
+
+    /// [E049] Computed payouts don't match the outcome: a winner must get
+    /// exactly 2 × stake and each drawing player exactly 1 × stake (#2065).
+    PayoutMismatch = 49,
+
+    /// [E050] `retry_payout` was called for a match whose payout hasn't failed.
+    NoFailedPayout = 50,
 }
 
 /// Convert a [`SharedError`] into an escrow [`Error`].

@@ -91,6 +91,11 @@ pub enum MatchState {
     /// `cancel_match`) or timed out from the [`Active`](MatchState::Active)
     /// state (via `enforce_timeout`).
     Cancelled,
+
+    /// The result is final but at least one payout transfer failed (#2066).
+    /// The funds are still held by the escrow; `retry_payout` finishes the
+    /// payout and moves the match to `Completed`.
+    PayoutFailed,
 }
 
 /// The chess platform on which the game is being played.
@@ -575,6 +580,9 @@ pub enum DataKey {
 
     /// The admin-configured [`StakeLimits`] (#2059).
     StakeLimits,
+
+    /// The [`PayoutRecord`] of a match whose payout failed (#2066).
+    Payout(u64),
 }
 
 /// The name `lib.rs` uses for [`Role`].
@@ -609,3 +617,21 @@ pub struct DisputeEvidenceRecord {
     pub timestamp_ledger: u32,
 }
 
+/// Who is owed what for a finalized match, and what has been paid (#2066).
+///
+/// Written when a payout transfer fails, so a retry pays only what is still
+/// outstanding and never pays anyone twice.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutRecord {
+    pub player1_amount: i128,
+    pub player2_amount: i128,
+    pub player1_paid: bool,
+    pub player2_paid: bool,
+    /// Payout attempts so far, including the first one in `finalize_result`.
+    pub attempts: u32,
+    /// Ledger timestamp of the first failed attempt.
+    pub first_failed_at: u64,
+    /// Ledger timestamp of the latest attempt.
+    pub last_attempt_at: u64,
+}

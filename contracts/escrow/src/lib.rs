@@ -66,7 +66,7 @@ mod types;
 pub use constants::*;
 
 use errors::Error;
-use soroban_sdk::{contract, contractimpl, symbol_short, token, vec, Address, BytesN, Env, String, Symbol, TryFromVal, Vec};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, vec, Address, BytesN, Env, String, Symbol, Vec};
 
 /// Topic symbol for the event emitted when the contract is paused.
 const CONTRACT_PAUSED: Symbol = symbol_short!("paused");
@@ -74,7 +74,7 @@ const CONTRACT_PAUSED: Symbol = symbol_short!("paused");
 const CONTRACT_UNPAUSED: Symbol = symbol_short!("unpaused");
 use types::{
     AdminRole, DataKey, DisputeEvidenceRecord, Match, MatchState, OptionalWinner, PendingDrain,
-    Permission, Platform, StakeLimits, Winner,
+    PayoutRecord, Permission, Platform, StakeLimits, Winner,
 };
 
 fn is_zero_address(env: &Env, addr: &Address) -> bool {
@@ -248,12 +248,14 @@ impl EscrowContract {
     /// Pause the contract, blocking new match creation and deposits while
     /// allowing in-flight matches to settle.
     ///
-    /// Requires [`Permission::Pause`]. Emits a `ContractPaused` event carrying the
-    /// admin address and the current ledger sequence number so the action can be
-    /// detected and audited on-chain.
-    pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
+    /// Requires [`Permission::Pause`] and a `reason` of 1-256 bytes (#2061).
+    ///
+    /// Emits `("paused", admin)` with data `(reason, timestamp, ledger)`. The
+    /// admin address is a topic, so indexers can filter pause events by admin.
+    pub fn pause(env: Env, caller: Address, reason: String) -> Result<(), Error> {
         Self::require_permission(&env, &caller, Permission::Pause)?;
         caller.require_auth();
+        Self::check_pause_reason(&reason)?;
         if Self::is_paused(&env) {
             return Ok(());
         }
@@ -261,19 +263,27 @@ impl EscrowContract {
         Self::bump_instance_ttl(&env);
         env.events().publish(
             (CONTRACT_PAUSED, caller.clone()),
-            env.ledger().sequence(),
+            (reason, env.ledger().timestamp(), env.ledger().sequence()),
         );
+        Ok(())
+    }
+
+    fn check_pause_reason(reason: &String) -> Result<(), Error> {
+        if reason.len() == 0 || reason.len() > MAX_PAUSE_REASON_LEN {
+            return Err(Error::InvalidPauseReason);
+        }
         Ok(())
     }
 
     /// Unpause the contract, re-enabling normal operation.
     ///
-    /// Requires [`Permission::Unpause`]. Emits a `ContractUnpaused` event carrying
-    /// the admin address and the current ledger sequence number so the action can
-    /// be detected and audited on-chain.
-    pub fn unpause(env: Env, caller: Address) -> Result<(), Error> {
+    /// Requires [`Permission::Unpause`] and a `reason` of 1-256 bytes (#2061).
+    ///
+    /// Emits `("unpaused", admin)` with data `(reason, timestamp, ledger)`.
+    pub fn unpause(env: Env, caller: Address, reason: String) -> Result<(), Error> {
         Self::require_permission(&env, &caller, Permission::Unpause)?;
         caller.require_auth();
+        Self::check_pause_reason(&reason)?;
         if !Self::is_paused(&env) {
             return Ok(());
         }
@@ -281,7 +291,7 @@ impl EscrowContract {
         Self::bump_instance_ttl(&env);
         env.events().publish(
             (CONTRACT_UNPAUSED, caller.clone()),
-            env.ledger().sequence(),
+            (reason, env.ledger().timestamp(), env.ledger().sequence()),
         );
         Ok(())
     }
@@ -1181,57 +1191,180 @@ impl EscrowContract {
             OptionalWinner::None => return Err(Error::InvalidState),
         };
 
-        let client = token::Client::new(&env, &m.token);
-
-        let payout_amount: i128 = match &winner {
-            Winner::Draw => stake_i128(&m),
-            _ => stake_i128(&m) * 2,
-        };
-
-        let total_payout = match &winner {
-            Winner::Draw => payout_amount * 2,
-            _ => payout_amount,
-        };
-        Self::ensure_reserve_for_payout(&env, &m.token, total_payout)?;
-
-        match &winner {
-            Winner::Player1 => {
-                client.transfer(&env.current_contract_address(), &m.player1, &payout_amount)
-            }
-            Winner::Player2 => {
-                client.transfer(&env.current_contract_address(), &m.player2, &payout_amount)
-            }
-            Winner::Draw => {
-                client.transfer(&env.current_contract_address(), &m.player1, &payout_amount);
-                client.transfer(&env.current_contract_address(), &m.player2, &payout_amount);
-            }
-        }
-
-        // STATE TRANSITION: PendingResult → Completed
-        m.state = MatchState::Completed;
-        m.completed_ledger = Some(env.ledger().sequence());
-        Self::store_match(&env, &m);
-        Self::bump_instance_ttl(&env);
-
-        let (player1_amount, player2_amount) = match &winner {
-            Winner::Player1 => (m.stake_amount * 2, 0),
-            Winner::Player2 => (0, m.stake_amount * 2),
-            Winner::Draw => (m.stake_amount, m.stake_amount),
-        };
-        Self::publish_state_transition(
-            &env,
-            &m,
-            Some(MatchState::PendingResult),
-            MatchState::Completed,
+        // #2065: compute and validate the amounts before anything moves.
+        let (player1_amount, player2_amount) = payout_amounts(&winner, stake_i128(&m));
+        validate_payout(&winner, stake_i128(&m), player1_amount, player2_amount)?;
+        let mut record = PayoutRecord {
             player1_amount,
             player2_amount,
-        );
-        env.events().publish(
-            (Symbol::new(&env, "match"), symbol_short!("completed")),
-            (match_id, winner, payout_amount),
-        );
-
+            player1_paid: player1_amount == 0,
+            player2_paid: player2_amount == 0,
+            attempts: 0,
+            first_failed_at: 0,
+            last_attempt_at: 0,
+        };
+        // #2063: the escrow must hold the whole payout before the first
+        // transfer, so a shortfall changes nothing (see `payout_shortfall`).
+        Self::ensure_reserve_for_payout(&env, &m.token, player1_amount + player2_amount)?;
+        Self::attempt_payout(&env, &mut m, &mut record, &winner, MatchState::PendingResult);
         Ok(())
+    }
+
+    /// Retry a failed payout (#2066). Anyone may call it (an operator or a
+    /// keeper bot): funds only ever go to the recorded payees, and only
+    /// amounts not yet paid are sent. Returns `true` once the match is
+    /// `Completed`, `false` if a transfer failed again (the match stays
+    /// `PayoutFailed`, funds stay in escrow, and the attempt is logged).
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::NoFailedPayout`] — the match isn't `PayoutFailed`.
+    /// * [`Error::InsufficientReserve`] — the escrow can't cover what is still
+    ///   owed; nothing is sent.
+    pub fn retry_payout(env: Env, match_id: u64) -> Result<bool, Error> {
+        Self::validate_match_id(&env, match_id)?;
+        let mut m: Match = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Match(match_id))
+            .ok_or(Error::MatchNotFound)?;
+        if m.state != MatchState::PayoutFailed {
+            return Err(Error::NoFailedPayout);
+        }
+        let mut record: PayoutRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Payout(match_id))
+            .ok_or(Error::NoFailedPayout)?;
+        let winner = match m.pending_winner.clone() {
+            OptionalWinner::Some(w) => w,
+            OptionalWinner::None => return Err(Error::InvalidState),
+        };
+        Self::ensure_reserve_for_payout(&env, &m.token, outstanding(&record))?;
+        Self::attempt_payout(&env, &mut m, &mut record, &winner, MatchState::PayoutFailed);
+        Ok(m.state == MatchState::Completed)
+    }
+
+    /// The payout record of a match whose payout failed, if any (#2066).
+    pub fn get_payout_record(env: Env, match_id: u64) -> Option<PayoutRecord> {
+        env.storage().persistent().get(&DataKey::Payout(match_id))
+    }
+
+    /// How many more token units the escrow needs before this match can be
+    /// paid out, including the reserve buffer; `0` if it can pay now (#2063).
+    ///
+    /// Contract errors can't carry data, so this is how a client turns an
+    /// `InsufficientReserve` error into an exact shortfall.
+    pub fn payout_shortfall(env: Env, match_id: u64) -> Result<i128, Error> {
+        let m: Match = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Match(match_id))
+            .ok_or(Error::MatchNotFound)?;
+        let owed = match m.state {
+            MatchState::PayoutFailed => env
+                .storage()
+                .persistent()
+                .get::<DataKey, PayoutRecord>(&DataKey::Payout(match_id))
+                .map(|r| outstanding(&r))
+                .unwrap_or(0),
+            MatchState::PendingResult | MatchState::Active => stake_i128(&m) * 2,
+            _ => 0,
+        };
+        if owed == 0 {
+            return Ok(0);
+        }
+        let balance = token::Client::new(&env, &m.token).balance(&env.current_contract_address());
+        Ok((owed + ESCROW_RESERVE_BUFFER_STROOPS - balance).max(0))
+    }
+
+    /// Try every unpaid transfer in `record` once. On full success the match
+    /// becomes `Completed`; otherwise it is `PayoutFailed` and the record is
+    /// stored for `retry_payout`. Failed transfers don't revert the call, so
+    /// the funds stay in escrow and the attempt is logged on-chain.
+    fn attempt_payout(
+        env: &Env,
+        m: &mut Match,
+        record: &mut PayoutRecord,
+        winner: &Winner,
+        from: MatchState,
+    ) {
+        let client = token::Client::new(env, &m.token);
+        let escrow = env.current_contract_address();
+        let now = env.ledger().timestamp();
+        record.attempts += 1;
+        record.last_attempt_at = now;
+
+        if !record.player1_paid {
+            record.player1_paid = matches!(
+                client.try_transfer(&escrow, &m.player1, &record.player1_amount),
+                Ok(Ok(()))
+            );
+        }
+        if !record.player2_paid {
+            record.player2_paid = matches!(
+                client.try_transfer(&escrow, &m.player2, &record.player2_amount),
+                Ok(Ok(()))
+            );
+        }
+        let done = record.player1_paid && record.player2_paid;
+
+        if !done {
+            if record.first_failed_at == 0 {
+                record.first_failed_at = now;
+            }
+            let key = DataKey::Payout(m.id);
+            env.storage().persistent().set(&key, record);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+            if m.state != MatchState::PayoutFailed {
+                m.state = MatchState::PayoutFailed;
+                Self::store_match(env, m);
+                Self::publish_state_transition(env, m, Some(from), MatchState::PayoutFailed, 0, 0);
+            }
+            Self::bump_instance_ttl(env);
+            env.events().publish(
+                (Symbol::new(env, "payout"), symbol_short!("failed")),
+                (
+                    m.id,
+                    record.attempts,
+                    now,
+                    record.player1_paid,
+                    record.player2_paid,
+                ),
+            );
+            return;
+        }
+
+        // STATE TRANSITION: PendingResult | PayoutFailed → Completed
+        m.state = MatchState::Completed;
+        m.completed_ledger = Some(env.ledger().sequence());
+        Self::store_match(env, m);
+        env.storage().persistent().remove(&DataKey::Payout(m.id));
+        Self::bump_instance_ttl(env);
+        Self::publish_state_transition(
+            env,
+            m,
+            Some(from),
+            MatchState::Completed,
+            record.player1_amount as u128,
+            record.player2_amount as u128,
+        );
+        if record.attempts > 1 {
+            env.events().publish(
+                (Symbol::new(env, "payout"), symbol_short!("retried")),
+                (m.id, record.attempts, now),
+            );
+        }
+        let winner_amount = match winner {
+            Winner::Draw => record.player1_amount,
+            _ => record.player1_amount + record.player2_amount,
+        };
+        env.events().publish(
+            (Symbol::new(env, "match"), symbol_short!("completed")),
+            (m.id, winner.clone(), winner_amount),
+        );
     }
 
     /// Reclaim funds when the oracle never submits a result within the configured timeout.
@@ -1883,6 +2016,39 @@ impl EscrowContract {
     }
 }
 
+/// What each player receives for `winner` (#2065): the winner 2 × stake and
+/// the loser nothing; on a draw, each player their own stake back.
+fn payout_amounts(winner: &Winner, stake: i128) -> (i128, i128) {
+    match winner {
+        Winner::Player1 => (stake * 2, 0),
+        Winner::Player2 => (0, stake * 2),
+        Winner::Draw => (stake, stake),
+    }
+}
+
+/// Checks computed payouts against the outcome before any transfer (#2065).
+///
+/// A mismatch can only come from a bug or corrupted state, so it aborts
+/// the whole call with `PayoutMismatch`. Contract errors roll back events, so
+/// the discrepancy is logged as a diagnostic (visible in simulation and in
+/// the failed transaction's diagnostics) rather than as a contract event.
+fn validate_payout(winner: &Winner, stake: i128, player1: i128, player2: i128) -> Result<(), Error> {
+    let expected = match winner {
+        Winner::Player1 => (stake * 2, 0),
+        Winner::Player2 => (0, stake * 2),
+        Winner::Draw => (stake, stake),
+    };
+    if stake <= 0 || (player1, player2) != expected || player1 + player2 != stake * 2 {
+        return Err(Error::PayoutMismatch);
+    }
+    Ok(())
+}
+
+/// The amount a payout record still owes.
+fn outstanding(r: &PayoutRecord) -> i128 {
+    (if r.player1_paid { 0 } else { r.player1_amount }) + (if r.player2_paid { 0 } else { r.player2_amount })
+}
+
 /// A match's stake as the `i128` token amounts use. `Match::stake_amount` is
 /// stored as `u128` but validated to `MIN_STAKE..=MAX_STAKE` at creation, far
 /// below `i128::MAX`, so the conversion is lossless.
@@ -1892,3 +2058,6 @@ fn stake_i128(m: &Match) -> i128 {
 
 #[cfg(test)]
 mod tests_stake_rules;
+
+#[cfg(test)]
+mod tests_payouts;
