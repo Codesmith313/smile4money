@@ -74,7 +74,7 @@ const CONTRACT_PAUSED: Symbol = symbol_short!("paused");
 const CONTRACT_UNPAUSED: Symbol = symbol_short!("unpaused");
 use types::{
     AdminRole, DataKey, DisputeEvidenceRecord, Match, MatchState, OptionalWinner, PendingDrain,
-    PayoutRecord, Permission, Platform, StakeLimits, Winner,
+    FeeConfig, FeePolicy, PayoutEntry, PayoutRecord, Permission, Platform, StakeLimits, Winner,
 };
 
 fn is_zero_address(env: &Env, addr: &Address) -> bool {
@@ -855,10 +855,6 @@ impl EscrowContract {
         if m.state == MatchState::Completed {
             return Err(Error::MatchCompleted);
         }
-        if m.state != MatchState::Pending {
-            return Err(Error::InvalidState);
-        }
-
         let is_p1 = player == m.player1;
         let is_p2 = player == m.player2;
 
@@ -877,8 +873,13 @@ impl EscrowContract {
             m.player2_deposited
         };
 
+        // #2064: a player who has deposited always gets AlreadyFunded, even
+        // once the match is Active, so the error says what actually happened.
         if already_deposited {
             return Err(Error::AlreadyFunded);
+        }
+        if m.state != MatchState::Pending {
+            return Err(Error::InvalidState);
         }
 
         let client = token::Client::new(&env, &m.token);
@@ -1194,9 +1195,14 @@ impl EscrowContract {
         // #2065: compute and validate the amounts before anything moves.
         let (player1_amount, player2_amount) = payout_amounts(&winner, stake_i128(&m));
         validate_payout(&winner, stake_i128(&m), player1_amount, player2_amount)?;
+        // #2067: fix the fee for each payout now, so a later config change
+        // can't alter a match already being paid.
+        let fees = Self::fee_config(&env);
         let mut record = PayoutRecord {
             player1_amount,
             player2_amount,
+            player1_fee: player_fee_share(&fees, player1_amount),
+            player2_fee: player_fee_share(&fees, player2_amount),
             player1_paid: player1_amount == 0,
             player2_paid: player2_amount == 0,
             attempts: 0,
@@ -1278,6 +1284,201 @@ impl EscrowContract {
         Ok((owed + ESCROW_RESERVE_BUFFER_STROOPS - balance).max(0))
     }
 
+    /// Pay one player `gross` minus `fee_share` (#2067, #2069), send the fee
+    /// to the collector, and append the payout to the player's history
+    /// (#2068). Returns whether the player is now paid.
+    ///
+    /// If the fee is at least the gross amount, the player receives the most
+    /// that is left (possibly nothing): a partial payout, logged with its
+    /// shortfall and reason and added to the platform's running total.
+    fn pay_one(
+        env: &Env,
+        client: &token::Client,
+        match_id: u64,
+        player: &Address,
+        gross: i128,
+        fee_share: i128,
+    ) -> bool {
+        let escrow = env.current_contract_address();
+        let fee = fee_share.clamp(0, gross);
+        let net = gross - fee;
+        if net > 0 && !matches!(client.try_transfer(&escrow, player, &net), Ok(Ok(()))) {
+            return false;
+        }
+        if fee > 0 {
+            // The collector is admin-controlled; a failure here reverts the
+            // whole call, so a player is never paid without the fee settling.
+            let collector = Self::fee_config(env).collector;
+            client.transfer(&escrow, &collector, &fee);
+        }
+
+        let now = env.ledger().timestamp();
+        let ledger = env.ledger().sequence();
+        env.events().publish(
+            (Symbol::new(env, "payout"), symbol_short!("paid"), player.clone()),
+            (match_id, gross, fee, net, now),
+        );
+        if net < gross {
+            // #2069: the player got less than the outcome's amount.
+            let shortfall = gross - net;
+            let reason = if fee_share >= gross {
+                symbol_short!("fee_all")
+            } else {
+                symbol_short!("fee")
+            };
+            let total: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalShortfall)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::TotalShortfall, &(total + shortfall));
+            env.events().publish(
+                (Symbol::new(env, "payout"), symbol_short!("shortfall"), player.clone()),
+                (match_id, shortfall, reason, fee_share, now),
+            );
+        }
+
+        // #2068: append-only payout ledger per address.
+        let storage = env.storage().persistent();
+        let len_key = DataKey::PayoutHistoryLen(player.clone());
+        let n: u32 = storage.get(&len_key).unwrap_or(0);
+        let entry_key = DataKey::PayoutHistory(player.clone(), n);
+        storage.set(
+            &entry_key,
+            &PayoutEntry {
+                match_id,
+                gross,
+                fee,
+                net,
+                timestamp: now,
+                ledger,
+            },
+        );
+        storage.set(&len_key, &(n + 1));
+        storage.extend_ttl(&entry_key, MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+        storage.extend_ttl(&len_key, MATCH_TTL_LEDGERS, MATCH_TTL_LEDGERS);
+        true
+    }
+
+    fn fee_config(env: &Env) -> FeeConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeConfig)
+            .unwrap_or_else(|| FeeConfig {
+                fee_per_payout: 0,
+                policy: FeePolicy::PlatformCovers,
+                collector: env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::SafeAddress)
+                    .unwrap_or_else(|| env.current_contract_address()),
+            })
+    }
+
+    /// The payout fee settings (#2067). Default: no fee, platform covers it.
+    pub fn get_fee_config(env: Env) -> FeeConfig {
+        Self::fee_config(&env)
+    }
+
+    /// Set the payout fee and who bears it (#2067). Requires
+    /// [`Permission::TokenManagement`]. Applies to matches finalized after
+    /// the change; `collector` receives deducted fees. A fee outside
+    /// `0..=MAX_STAKE` is rejected with [`Error::InvalidAmount`].
+    pub fn set_fee_config(
+        env: Env,
+        caller: Address,
+        fee_per_payout: i128,
+        policy: FeePolicy,
+        collector: Address,
+    ) -> Result<(), Error> {
+        Self::require_permission(&env, &caller, Permission::TokenManagement)?;
+        caller.require_auth();
+        if !(0..=MAX_STAKE).contains(&fee_per_payout) {
+            // The error enum is at Soroban's 50-variant limit, so reuse InvalidAmount.
+            return Err(Error::InvalidAmount);
+        }
+        let config = FeeConfig {
+            fee_per_payout,
+            policy,
+            collector,
+        };
+        env.storage().instance().set(&DataKey::FeeConfig, &config);
+        Self::bump_instance_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "admin"), symbol_short!("fee_cfg")),
+            (caller, config),
+        );
+        Ok(())
+    }
+
+    /// What each player of `match_id` would receive if it were paid out now
+    /// under the current fee config: `(gross, fee, net)` for player 1, then
+    /// player 2 (#2067: fee accounting visible to players before payout).
+    pub fn quote_payout(env: Env, match_id: u64) -> Result<Vec<i128>, Error> {
+        let m: Match = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Match(match_id))
+            .ok_or(Error::MatchNotFound)?;
+        let (g1, g2, f1, f2) = match env
+            .storage()
+            .persistent()
+            .get::<DataKey, PayoutRecord>(&DataKey::Payout(match_id))
+        {
+            Some(r) => (r.player1_amount, r.player2_amount, r.player1_fee, r.player2_fee),
+            None => {
+                let winner = match m.pending_winner.clone() {
+                    OptionalWinner::Some(w) => w,
+                    OptionalWinner::None => return Err(Error::InvalidState),
+                };
+                let (g1, g2) = payout_amounts(&winner, stake_i128(&m));
+                let fees = Self::fee_config(&env);
+                (g1, g2, player_fee_share(&fees, g1), player_fee_share(&fees, g2))
+            }
+        };
+        let (f1, f2) = (f1.clamp(0, g1), f2.clamp(0, g2));
+        Ok(vec![&env, g1, f1, g1 - f1, g2, f2, g2 - f2])
+    }
+
+    /// Total by which payouts fell short of their gross amount because of
+    /// fees, across all matches (#2069).
+    pub fn get_total_shortfall(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalShortfall)
+            .unwrap_or(0)
+    }
+
+    /// Number of payouts recorded for `address` (#2068).
+    pub fn get_payout_history_len(env: Env, address: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PayoutHistoryLen(address))
+            .unwrap_or(0)
+    }
+
+    /// Up to `limit` (max 50) payouts to `address`, oldest first, starting at
+    /// index `start` (#2068).
+    pub fn get_payout_history(env: Env, address: Address, start: u32, limit: u32) -> Vec<PayoutEntry> {
+        let len = Self::get_payout_history_len(env.clone(), address.clone());
+        let end = start.saturating_add(limit.min(50)).min(len);
+        let mut out = Vec::new(&env);
+        let mut i = start;
+        while i < end {
+            if let Some(e) = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PayoutHistory(address.clone(), i))
+            {
+                out.push_back(e);
+            }
+            i += 1;
+        }
+        out
+    }
+
     /// Try every unpaid transfer in `record` once. On full success the match
     /// becomes `Completed`; otherwise it is `PayoutFailed` and the record is
     /// stored for `retry_payout`. Failed transfers don't revert the call, so
@@ -1296,15 +1497,23 @@ impl EscrowContract {
         record.last_attempt_at = now;
 
         if !record.player1_paid {
-            record.player1_paid = matches!(
-                client.try_transfer(&escrow, &m.player1, &record.player1_amount),
-                Ok(Ok(()))
+            record.player1_paid = Self::pay_one(
+                env,
+                &client,
+                m.id,
+                &m.player1,
+                record.player1_amount,
+                record.player1_fee,
             );
         }
         if !record.player2_paid {
-            record.player2_paid = matches!(
-                client.try_transfer(&escrow, &m.player2, &record.player2_amount),
-                Ok(Ok(()))
+            record.player2_paid = Self::pay_one(
+                env,
+                &client,
+                m.id,
+                &m.player2,
+                record.player2_amount,
+                record.player2_fee,
             );
         }
         let done = record.player1_paid && record.player2_paid;
@@ -2044,6 +2253,19 @@ fn validate_payout(winner: &Winner, stake: i128, player1: i128, player2: i128) -
     Ok(())
 }
 
+/// The part of `fee_per_payout` a player bears for a payout of `gross`
+/// under the policy (#2067). Not yet capped at `gross`; see `pay_one`.
+fn player_fee_share(fees: &FeeConfig, gross: i128) -> i128 {
+    if gross <= 0 {
+        return 0;
+    }
+    match fees.policy {
+        FeePolicy::PlatformCovers => 0,
+        FeePolicy::PlayerCovers => fees.fee_per_payout,
+        FeePolicy::Split => fees.fee_per_payout / 2,
+    }
+}
+
 /// The amount a payout record still owes.
 fn outstanding(r: &PayoutRecord) -> i128 {
     (if r.player1_paid { 0 } else { r.player1_amount }) + (if r.player2_paid { 0 } else { r.player2_amount })
@@ -2061,3 +2283,6 @@ mod tests_stake_rules;
 
 #[cfg(test)]
 mod tests_payouts;
+
+#[cfg(test)]
+mod tests_fees_history;

@@ -583,6 +583,18 @@ pub enum DataKey {
 
     /// The [`PayoutRecord`] of a match whose payout failed (#2066).
     Payout(u64),
+
+    /// The admin's [`FeeConfig`] for payouts (#2067).
+    FeeConfig,
+
+    /// Running total of payout shortfalls caused by fees (#2069).
+    TotalShortfall,
+
+    /// Number of [`PayoutEntry`]s recorded for an address (#2068).
+    PayoutHistoryLen(Address),
+
+    /// The `n`th [`PayoutEntry`] of an address, written once (#2068).
+    PayoutHistory(Address, u32),
 }
 
 /// The name `lib.rs` uses for [`Role`].
@@ -624,8 +636,12 @@ pub struct DisputeEvidenceRecord {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PayoutRecord {
+    /// Gross amounts owed by the outcome (2× / 1× stake), before fees.
     pub player1_amount: i128,
     pub player2_amount: i128,
+    /// Fee deducted from each payout, fixed when the match is finalized (#2067).
+    pub player1_fee: i128,
+    pub player2_fee: i128,
     pub player1_paid: bool,
     pub player2_paid: bool,
     /// Payout attempts so far, including the first one in `finalize_result`.
@@ -634,4 +650,46 @@ pub struct PayoutRecord {
     pub first_failed_at: u64,
     /// Ledger timestamp of the latest attempt.
     pub last_attempt_at: u64,
+}
+
+/// Who bears the per-payout fee (#2067).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeePolicy {
+    /// The platform absorbs it; players receive the full amount.
+    PlatformCovers,
+    /// The whole fee is deducted from the player's payout.
+    PlayerCovers,
+    /// Half (rounded down) is deducted from the player; the platform covers the rest.
+    Split,
+}
+
+/// Payout fee settings (#2067). Network fees are paid in XLM by whoever
+/// submits the transaction; this recovers that cost, in the stake token,
+/// from each payout transfer according to `policy`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeConfig {
+    /// Fee per payout transfer, in the token's smallest unit.
+    pub fee_per_payout: i128,
+    pub policy: FeePolicy,
+    /// Where deducted fees are sent.
+    pub collector: Address,
+}
+
+/// One completed payout to an address, for audit and tax reporting (#2068).
+/// Written once and never modified.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutEntry {
+    pub match_id: u64,
+    /// Amount owed by the outcome, before fees.
+    pub gross: i128,
+    /// Fee deducted (`gross - net`).
+    pub fee: i128,
+    /// Amount actually transferred to the address.
+    pub net: i128,
+    /// Ledger timestamp (seconds) and sequence of the transfer.
+    pub timestamp: u64,
+    pub ledger: u32,
 }
